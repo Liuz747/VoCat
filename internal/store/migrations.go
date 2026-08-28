@@ -414,6 +414,17 @@ func migrationStatements(version int) []string {
 				AND TRIM(at_port) = ''
 				AND TRIM(modem_imei) = ''`,
 		}
+	case 23:
+		return []string{
+			// SMS subscription identity is historical data. It must live on the
+			// message instead of being reconstructed from the device's current SIM.
+			`ALTER TABLE sms_messages
+				ADD COLUMN iccid TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE sms_messages
+				ADD COLUMN local_phone TEXT NOT NULL DEFAULT ''`,
+			`CREATE INDEX IF NOT EXISTS sms_messages_subscription_thread_idx
+				ON sms_messages(modem_imei, iccid, imsi, peer, message_time DESC, id DESC)`,
+		}
 	default:
 		return nil
 	}

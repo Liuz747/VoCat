@@ -295,6 +295,7 @@ export interface SMSContact {
   deviceId: string;
   deviceName?: string;
   modemImei?: string;
+  iccid?: string;
   imsi: string;
   localPhone?: string;
   peer: string;
@@ -314,6 +315,7 @@ export interface SMSMessage {
   messageId?: string;
   deviceId: string;
   modemImei?: string;
+  iccid?: string;
   imsi: string;
   peer: string;
   direction: "inbound" | "outbound" | "received" | "sent";

@@ -106,6 +106,58 @@ func TestNative410DoesNotUseModemSMSStorage(t *testing.T) {
 	}
 }
 
+func TestSyncModemSMSDoesNotRelabelStoredMessageAfterProfileSwitch(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	const (
+		deviceID = "ec20-1"
+		imei     = "867394042309830"
+	)
+	if err := database.UpsertDevice(ctx, store.Device{
+		ID: deviceID, Name: "EC20", DeviceType: store.DeviceTypePCIeEC20EC25,
+		ModemIMEI: imei, SMSEnabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	receivedAt := time.Unix(1_700_000_000, 0).UTC()
+	storedMessage := device.SMSMessage{
+		Index: 7, Storage: "ME", StorageStatus: device.SMSStatusReceivedUnread,
+		Direction: device.SMSDirectionReceived, From: "JETPAC", Text: "hello",
+		ServiceCenterTimestamp: &receivedAt, RawPDU: "001122334455",
+	}
+	server := &Server{store: database, logger: regionTestLogger()}
+	server.devices = fakeDeviceController{
+		entry: device.Device{ID: deviceID, Discovered: true, Snapshot: &device.Snapshot{
+			DeviceID: deviceID, IMEI: imei, ICCID: "iccid-a", IMSI: "imsi-a",
+			Phone: device.PhoneNumber{Number: "+441111"},
+		}},
+		smsMessages: []device.SMSMessage{storedMessage},
+	}
+	server.syncModemSMS(ctx, deviceID)
+
+	server.devices = fakeDeviceController{
+		entry: device.Device{ID: deviceID, Discovered: true, Snapshot: &device.Snapshot{
+			DeviceID: deviceID, IMEI: imei, ICCID: "iccid-b", IMSI: "imsi-b",
+			Phone: device.PhoneNumber{Number: "+442222"},
+		}},
+		smsMessages: []device.SMSMessage{storedMessage},
+	}
+	server.syncModemSMS(ctx, deviceID)
+
+	messages, err := database.ListSMSMessages(ctx, store.SMSFilter{DeviceID: deviceID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 || messages[0].ICCID != "iccid-a" ||
+		messages[0].IMSI != "imsi-a" || messages[0].LocalPhone != "+441111" {
+		t.Fatalf("message identity after profile B rescan = %#v", messages)
+	}
+}
+
 func TestSMSThreadConfiguredDeviceUsesStableIMEI(t *testing.T) {
 	ctx := context.Background()
 	database, err := store.Open(ctx, ":memory:")

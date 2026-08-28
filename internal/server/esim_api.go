@@ -401,6 +401,11 @@ func (s *Server) handleEsimSwitch(w http.ResponseWriter, r *http.Request, config
 		writeError(w, http.StatusBadRequest, "invalid_request", "iccid is required")
 		return
 	}
+	// Keep the subscription identity used by the periodic SM/ME scanner stable
+	// for the entire profile transition. syncModemSMS takes the same lock and
+	// validates its before/after snapshots before persisting any message.
+	s.smsSyncMu.Lock()
+	defer s.smsSyncMu.Unlock()
 	dataRuntime := s.cellularDataRuntime()
 	s.clearPublicIP(configuredID)
 	desiredData := true

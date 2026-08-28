@@ -657,7 +657,7 @@ func TestSMSPersistenceAndDerivedThreads(t *testing.T) {
 	if len(contacts) != 2 || contacts[0].Peer != "95533" ||
 		contacts[0].UnreadCount != 1 || contacts[1].Peer != "10086" ||
 		contacts[1].MessageCount != 2 || contacts[1].UnreadCount != 1 ||
-		contacts[1].LocalPhone != "+8613800138000" {
+		contacts[1].LocalPhone != "" {
 		t.Fatalf("unexpected derived contacts: %+v", contacts)
 	}
 	marked, err := database.MarkSMSThreadRead(ctx, "ec20-1", "46000", "10086")

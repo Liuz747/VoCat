@@ -77,3 +77,35 @@ func (s *Store) PhoneAssociation(
 	value.UpdatedAt = time.Unix(updatedAt, 0).UTC()
 	return value, nil
 }
+
+// PhoneNumberForICCID returns the best durable number associated with one SIM.
+// A user override wins over an IMS-published association, matching the device
+// overview while keeping the lookup scoped to the historical ICCID.
+func (s *Store) PhoneNumberForICCID(ctx context.Context, iccid string) (string, error) {
+	iccid = strings.TrimSpace(iccid)
+	if iccid == "" {
+		return "", ErrNotFound
+	}
+	var number string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT number
+		FROM (
+			SELECT custom_phone_number AS number, 0 AS priority
+			FROM card_policies
+			WHERE iccid = ? AND TRIM(custom_phone_number) <> ''
+			UNION ALL
+			SELECT number, 1 AS priority
+			FROM phone_associations
+			WHERE iccid = ? AND TRIM(number) <> ''
+		)
+		ORDER BY priority
+		LIMIT 1
+	`, iccid, iccid).Scan(&number)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("read phone number for ICCID %q: %w", iccid, err)
+	}
+	return strings.TrimSpace(number), nil
+}

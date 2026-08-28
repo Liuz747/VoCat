@@ -75,6 +75,9 @@ func saveSMSMessage(
 ) (SMSMessage, error) {
 	value.DeviceID = strings.TrimSpace(value.DeviceID)
 	value.ModemIMEI = strings.TrimSpace(value.ModemIMEI)
+	value.ICCID = strings.TrimSpace(value.ICCID)
+	value.IMSI = strings.TrimSpace(value.IMSI)
+	value.LocalPhone = strings.TrimSpace(value.LocalPhone)
 	value.Peer = strings.TrimSpace(value.Peer)
 	value.Direction = strings.ToLower(strings.TrimSpace(value.Direction))
 	if value.DeviceID == "" {
@@ -115,6 +118,17 @@ func saveSMSMessage(
 			hardwareKey,
 			value.MessageID,
 		))
+		if errors.Is(existingErr, ErrNotFound) {
+			// A legacy row may predate stable modem IMEI persistence. Its original
+			// device/message unique key can still conflict after the modem gains an
+			// IMEI, so resolve that identity before entering the upsert as well.
+			existing, existingErr = scanSMSMessage(executor.QueryRowContext(
+				ctx,
+				smsMessageSelect+` WHERE device_id = ? AND message_id = ?`,
+				value.DeviceID,
+				value.MessageID,
+			))
+		}
 		if existingErr != nil && !errors.Is(existingErr, ErrNotFound) {
 			return SMSMessage{}, fmt.Errorf("read existing concatenated SMS: %w", existingErr)
 		}
@@ -127,6 +141,10 @@ func saveSMSMessage(
 			return SMSMessage{}, fmt.Errorf("merge concatenated SMS segment: %w", mergeErr)
 		}
 		if existingErr == nil {
+			// A storage rescan can happen after an eSIM profile switch. The first
+			// durable subscription identity belongs to the delivery; never replace
+			// it with whichever profile happens to be active for a later segment.
+			preserveSMSSubscriptionIdentity(&value, existing)
 			if !changed {
 				if value.Read != existing.Read {
 					if _, err := executor.ExecContext(ctx, `UPDATE sms_messages SET is_read = ?, updated_at = ? WHERE id = ?`, boolInt(value.Read), now.Unix(), existing.ID); err != nil {
@@ -173,6 +191,38 @@ func saveSMSMessage(
 		value.Body = mergedBody
 		extra = mergedExtra
 	}
+	if value.MessageID != "" {
+		hardwareKey := smsHardwareKey(value.ModemIMEI, value.DeviceID)
+		existing, existingErr := scanSMSMessage(executor.QueryRowContext(
+			ctx,
+			smsMessageSelect+` WHERE
+				COALESCE(NULLIF(modem_imei, ''), 'device:' || device_id) = ?
+				AND message_id = ?`,
+			hardwareKey,
+			value.MessageID,
+		))
+		if errors.Is(existingErr, ErrNotFound) {
+			existing, existingErr = scanSMSMessage(executor.QueryRowContext(
+				ctx,
+				smsMessageSelect+` WHERE device_id = ? AND message_id = ?`,
+				value.DeviceID,
+				value.MessageID,
+			))
+		}
+		if existingErr != nil && !errors.Is(existingErr, ErrNotFound) {
+			return SMSMessage{}, fmt.Errorf("read existing SMS identity: %w", existingErr)
+		}
+		if existingErr == nil {
+			preserveSMSSubscriptionIdentity(&value, existing)
+			value.ID = existing.ID
+			value.CreatedAt = existing.CreatedAt
+			value.Read = value.Read || existing.Read
+			if !existing.Timestamp.IsZero() &&
+				(value.Timestamp.IsZero() || existing.Timestamp.Before(value.Timestamp)) {
+				value.Timestamp = existing.Timestamp
+			}
+		}
+	}
 	if value.Timestamp.IsZero() {
 		value.Timestamp = now
 	}
@@ -186,13 +236,18 @@ func saveSMSMessage(
 	if value.ID > 0 {
 		result, err := executor.ExecContext(ctx, `
 			UPDATE sms_messages SET
-				message_id = ?, device_id = ?, modem_imei = ?, imsi = ?, peer = ?,
+				message_id = ?, device_id = ?, modem_imei = ?,
+				iccid = CASE WHEN iccid <> '' THEN iccid ELSE ? END,
+				imsi = CASE WHEN imsi <> '' THEN imsi ELSE ? END,
+				local_phone = CASE WHEN local_phone <> '' THEN local_phone ELSE ? END,
+				peer = ?,
 				direction = ?, body = ?, message_time = ?, status = ?,
 				source = ?, parts_total = ?, delivery_state = ?, is_read = ?,
 				extra_json = ?, updated_at = ?
 			WHERE id = ?
 		`,
-			value.MessageID, value.DeviceID, value.ModemIMEI, value.IMSI, value.Peer,
+			value.MessageID, value.DeviceID, value.ModemIMEI,
+			value.ICCID, value.IMSI, value.LocalPhone, value.Peer,
 			value.Direction, value.Body, value.Timestamp.Unix(), value.Status,
 			value.Source, value.PartsTotal, value.DeliveryState,
 			boolInt(value.Read), string(extra), value.UpdatedAt.Unix(), value.ID,
@@ -208,17 +263,29 @@ func saveSMSMessage(
 
 	result, err := executor.ExecContext(ctx, `
 		INSERT INTO sms_messages (
-			message_id, device_id, modem_imei, imsi, peer, direction, body, message_time,
+			message_id, device_id, modem_imei, iccid, imsi, local_phone,
+			peer, direction, body, message_time,
 			status, source, parts_total, delivery_state, is_read, extra_json,
 			created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT DO UPDATE SET
 			device_id = excluded.device_id,
 			modem_imei = CASE
 				WHEN excluded.modem_imei <> '' THEN excluded.modem_imei
 				ELSE sms_messages.modem_imei
 			END,
-			imsi = excluded.imsi,
+			iccid = CASE
+				WHEN sms_messages.iccid <> '' THEN sms_messages.iccid
+				ELSE excluded.iccid
+			END,
+			imsi = CASE
+				WHEN sms_messages.imsi <> '' THEN sms_messages.imsi
+				ELSE excluded.imsi
+			END,
+			local_phone = CASE
+				WHEN sms_messages.local_phone <> '' THEN sms_messages.local_phone
+				ELSE excluded.local_phone
+			END,
 			peer = excluded.peer,
 			direction = excluded.direction,
 			body = excluded.body,
@@ -234,7 +301,8 @@ func saveSMSMessage(
 			extra_json = excluded.extra_json,
 			updated_at = excluded.updated_at
 	`,
-		value.MessageID, value.DeviceID, value.ModemIMEI, value.IMSI, value.Peer,
+		value.MessageID, value.DeviceID, value.ModemIMEI,
+		value.ICCID, value.IMSI, value.LocalPhone, value.Peer,
 		value.Direction, value.Body, value.Timestamp.Unix(), value.Status,
 		value.Source, value.PartsTotal, value.DeliveryState,
 		boolInt(value.Read), string(extra), value.CreatedAt.Unix(),
@@ -594,6 +662,7 @@ func (s *Store) ListSMSContacts(ctx context.Context, filter SMSFilter) ([]SMSCon
 			SELECT
 				m.*,
 				COALESCE(NULLIF(m.modem_imei, ''), 'device:' || m.device_id) AS hardware_key,
+				COALESCE(NULLIF(m.iccid, ''), NULLIF('imsi:' || m.imsi, 'imsi:'), 'unknown') AS subscription_key,
 				COALESCE((
 					SELECT current_device.id
 					FROM devices current_device
@@ -605,20 +674,20 @@ func (s *Store) ListSMSContacts(ctx context.Context, filter SMSFilter) ([]SMSCon
 			FROM sms_messages m` + where + `
 		), ranked AS (
 			SELECT
-				m.id, m.resolved_device_id, m.modem_imei, m.imsi, m.peer,
-				m.body, m.message_time, m.direction,
+				m.id, m.resolved_device_id, m.modem_imei, m.iccid, m.imsi,
+				m.local_phone, m.peer, m.body, m.message_time, m.direction,
 				ROW_NUMBER() OVER (
-					PARTITION BY m.hardware_key, m.imsi, m.peer
+					PARTITION BY m.hardware_key, m.subscription_key, m.peer
 					ORDER BY m.message_time DESC, m.id DESC
 				) AS row_number,
 				SUM(CASE
 					WHEN m.direction IN ('inbound', 'received') AND m.is_read = 0
 					THEN 1 ELSE 0
 				END) OVER (
-					PARTITION BY m.hardware_key, m.imsi, m.peer
+					PARTITION BY m.hardware_key, m.subscription_key, m.peer
 				) AS unread_count,
 				COUNT(*) OVER (
-					PARTITION BY m.hardware_key, m.imsi, m.peer
+					PARTITION BY m.hardware_key, m.subscription_key, m.peer
 				) AS message_count
 			FROM resolved m
 		)
@@ -626,8 +695,9 @@ func (s *Store) ListSMSContacts(ctx context.Context, filter SMSFilter) ([]SMSCon
 			r.resolved_device_id,
 			COALESCE(d.name, ''),
 			r.modem_imei,
+			r.iccid,
 			r.imsi,
-			COALESCE(NULLIF(dr.phone_number, ''), NULLIF(vr.local_phone, ''), ''),
+			COALESCE(NULLIF(r.local_phone, ''), NULLIF(cp.custom_phone_number, ''), NULLIF(pa.number, ''), ''),
 			r.peer,
 			r.peer,
 			r.body,
@@ -638,8 +708,8 @@ func (s *Store) ListSMSContacts(ctx context.Context, filter SMSFilter) ([]SMSCon
 			r.message_count
 		FROM ranked r
 		LEFT JOIN devices d ON d.id = r.resolved_device_id
-		LEFT JOIN device_runtime dr ON dr.device_id = r.resolved_device_id
-		LEFT JOIN vowifi_runtime vr ON vr.device_id = r.resolved_device_id
+		LEFT JOIN card_policies cp ON r.iccid <> '' AND cp.iccid = r.iccid
+		LEFT JOIN phone_associations pa ON r.iccid <> '' AND pa.iccid = r.iccid
 		WHERE r.row_number = 1
 		ORDER BY r.message_time DESC, r.id DESC
 		LIMIT ?`
@@ -655,7 +725,7 @@ func (s *Store) ListSMSContacts(ctx context.Context, filter SMSFilter) ([]SMSCon
 		var value SMSContact
 		var timestamp int64
 		if err := rows.Scan(
-			&value.DeviceID, &value.DeviceName, &value.ModemIMEI, &value.IMSI,
+			&value.DeviceID, &value.DeviceName, &value.ModemIMEI, &value.ICCID, &value.IMSI,
 			&value.LocalPhone, &value.Peer, &value.DisplayName,
 			&value.LastMessage, &timestamp, &value.Direction,
 			&value.LastSMSID, &value.UnreadCount, &value.MessageCount,
@@ -672,7 +742,8 @@ func (s *Store) ListSMSContacts(ctx context.Context, filter SMSFilter) ([]SMSCon
 }
 
 const smsMessageSelect = `
-	SELECT id, message_id, device_id, modem_imei, imsi, peer, direction, body,
+	SELECT id, message_id, device_id, modem_imei, iccid, imsi, local_phone,
+		peer, direction, body,
 		message_time, status, source, parts_total, delivery_state, is_read,
 		extra_json, created_at, updated_at
 	FROM sms_messages`
@@ -683,7 +754,8 @@ func scanSMSMessage(row rowScanner) (SMSMessage, error) {
 	var read int
 	var extra string
 	err := row.Scan(
-		&value.ID, &value.MessageID, &value.DeviceID, &value.ModemIMEI, &value.IMSI,
+		&value.ID, &value.MessageID, &value.DeviceID, &value.ModemIMEI,
+		&value.ICCID, &value.IMSI, &value.LocalPhone,
 		&value.Peer, &value.Direction, &value.Body, &messageTime,
 		&value.Status, &value.Source, &value.PartsTotal,
 		&value.DeliveryState, &read, &extra, &createdAt, &updatedAt,
@@ -703,8 +775,8 @@ func scanSMSMessage(row rowScanner) (SMSMessage, error) {
 }
 
 func smsWhere(filter SMSFilter, prefix string) (string, []any) {
-	clauses := make([]string, 0, 6)
-	args := make([]any, 0, 6)
+	clauses := make([]string, 0, 7)
+	args := make([]any, 0, 7)
 	if filter.DeviceID != "" {
 		clauses = append(clauses, prefix+`device_id = ?`)
 		args = append(args, filter.DeviceID)
@@ -712,6 +784,10 @@ func smsWhere(filter SMSFilter, prefix string) (string, []any) {
 	if filter.ModemIMEI != "" {
 		clauses = append(clauses, prefix+`modem_imei = ?`)
 		args = append(args, filter.ModemIMEI)
+	}
+	if filter.ICCID != "" {
+		clauses = append(clauses, prefix+`iccid = ?`)
+		args = append(args, filter.ICCID)
 	}
 	if filter.IMSI != "" {
 		clauses = append(clauses, prefix+`imsi = ?`)
@@ -737,6 +813,34 @@ func smsWhere(filter SMSFilter, prefix string) (string, []any) {
 		return "", args
 	}
 	return " WHERE " + strings.Join(clauses, " AND "), args
+}
+
+func preserveSMSSubscriptionIdentity(observed *SMSMessage, existing SMSMessage) {
+	identityMatches := true
+	switch {
+	case strings.TrimSpace(existing.ICCID) != "":
+		identityMatches = strings.TrimSpace(observed.ICCID) == strings.TrimSpace(existing.ICCID)
+		observed.ICCID = strings.TrimSpace(existing.ICCID)
+		if strings.TrimSpace(existing.IMSI) != "" {
+			observed.IMSI = strings.TrimSpace(existing.IMSI)
+		}
+	case strings.TrimSpace(existing.IMSI) != "":
+		identityMatches = false
+		observed.IMSI = strings.TrimSpace(existing.IMSI)
+		// A legacy message has no ICCID. Its IMSI may already have been replaced
+		// by an old build's storage rescan, so even an apparent IMSI match is not
+		// evidence that the current ICCID received it. Keep the ICCID unknown.
+		observed.ICCID = ""
+	default:
+		identityMatches = false
+		observed.ICCID = ""
+		observed.IMSI = ""
+	}
+	if strings.TrimSpace(existing.LocalPhone) != "" {
+		observed.LocalPhone = strings.TrimSpace(existing.LocalPhone)
+	} else if !identityMatches {
+		observed.LocalPhone = ""
+	}
 }
 
 func smsHardwareKey(modemIMEI, deviceID string) string {

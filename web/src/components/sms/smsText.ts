@@ -5,6 +5,7 @@ import { tl, useI18n } from "../../lib/i18n";
 export interface SmsThread {
   key: string;
   modemImei: string;
+  iccid: string;
   imsi: string;
   peer: string;
   deviceId: string;
@@ -81,9 +82,12 @@ export function dayLabel(ts: number): string {
 export function deriveThread(c: SMSContact): SmsThread {
   const lastMessage = String(c.lastContent ?? c.lastMessage ?? "").slice(0, 80);
   const modemImei = String(c.modemImei || "").trim();
+	const iccid = String(c.iccid || "").trim();
+	const subscriptionKey = iccid || (c.imsi ? `imsi:${c.imsi}` : "unknown");
   return {
-    key: `${modemImei || `device:${c.deviceId}`}|${c.imsi}|${c.peer}`,
+		key: `${modemImei || `device:${c.deviceId}`}|${subscriptionKey}|${c.peer}`,
     modemImei,
+		iccid,
     imsi: c.imsi,
     peer: c.peer,
     deviceId: c.deviceId,

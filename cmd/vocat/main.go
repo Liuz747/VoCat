@@ -844,6 +844,7 @@ func newVoWiFiOrchestrator(
 		AutoTransportFallback: true,
 		OnIncomingCall:        onIncomingCall,
 		OnSMS: func(ctx context.Context, message ims.ReceivedSMS) error {
+			localPhone, _ := database.PhoneNumberForICCID(ctx, message.ICCID)
 			extra, _ := json.Marshal(map[string]any{
 				"transport":                "ims",
 				"encoding":                 message.Encoding,
@@ -874,7 +875,9 @@ func newVoWiFiOrchestrator(
 				MessageID:  messageID,
 				DeviceID:   message.DeviceID,
 				ModemIMEI:  deviceConfig.ModemIMEI,
+				ICCID:      message.ICCID,
 				IMSI:       message.IMSI,
+				LocalPhone: localPhone,
 				Peer:       message.From,
 				Direction:  "inbound",
 				Body:       message.Text,
@@ -920,6 +923,7 @@ func newVoWiFiOrchestrator(
 			return nil
 		},
 		OnUSSD: func(ctx context.Context, message ims.ReceivedUSSD) error {
+			localPhone, _ := database.PhoneNumberForICCID(ctx, message.ICCID)
 			extra, _ := json.Marshal(map[string]any{
 				"transport":   "ims-ussd",
 				"dcs":         message.DCS,
@@ -931,7 +935,9 @@ func newVoWiFiOrchestrator(
 				MessageID:  message.MessageID,
 				DeviceID:   message.DeviceID,
 				ModemIMEI:  deviceConfig.ModemIMEI,
+				ICCID:      message.ICCID,
 				IMSI:       message.IMSI,
+				LocalPhone: localPhone,
 				Peer:       message.From,
 				Direction:  "inbound",
 				Body:       message.Text,

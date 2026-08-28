@@ -169,7 +169,9 @@ type SMSMessage struct {
 	MessageID     string
 	DeviceID      string
 	ModemIMEI     string
+	ICCID         string
 	IMSI          string
+	LocalPhone    string
 	Peer          string
 	Direction     string
 	Body          string
@@ -187,6 +189,7 @@ type SMSMessage struct {
 type SMSFilter struct {
 	DeviceID  string
 	ModemIMEI string
+	ICCID     string
 	IMSI      string
 	Peer      string
 	Since     time.Time
@@ -215,6 +218,7 @@ type SMSContact struct {
 	DeviceID      string
 	DeviceName    string
 	ModemIMEI     string
+	ICCID         string
 	IMSI          string
 	LocalPhone    string
 	Peer          string

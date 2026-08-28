@@ -43,6 +43,7 @@ type smsCenterReader interface {
 type ReceivedSMS struct {
 	MessageID              string
 	DeviceID               string
+	ICCID                  string
 	IMSI                   string
 	From                   string
 	Text                   string
@@ -60,6 +61,7 @@ type ReceivedSMS struct {
 // ReceivedSMSStatus is network delivery evidence for one submitted SMS part.
 type ReceivedSMSStatus struct {
 	DeviceID               string
+	ICCID                  string
 	IMSI                   string
 	To                     string
 	MessageReference       int
@@ -81,6 +83,7 @@ type ReceivedSMSStatus struct {
 type ReceivedUSSD struct {
 	MessageID    string
 	DeviceID     string
+	ICCID        string
 	IMSI         string
 	From         string
 	Text         string
@@ -505,6 +508,7 @@ func (session *Session) processSMSMessage(request *sipRequest) {
 	case message.Direction == device.SMSDirectionStatusReport:
 		status := ReceivedSMSStatus{
 			DeviceID:               session.request.DeviceID,
+			ICCID:                  session.request.Identity.ICCID,
 			IMSI:                   session.request.Identity.IMSI,
 			To:                     message.To,
 			MessageReference:       intPtrValue(message.MessageReference),
@@ -549,6 +553,7 @@ func (session *Session) processSMSMessage(request *sipRequest) {
 			// visible even when its TPDU and text happen to be identical.
 			MessageID:              fmt.Sprintf("ims:%s:%d", callID, rpdu.reference),
 			DeviceID:               session.request.DeviceID,
+			ICCID:                  session.request.Identity.ICCID,
 			IMSI:                   session.request.Identity.IMSI,
 			From:                   message.From,
 			Text:                   message.Text,
@@ -731,6 +736,7 @@ func (session *Session) processUSSIMessage(request *sipRequest) {
 	received := ReceivedUSSD{
 		MessageID: fmt.Sprintf("ims-ussd:%s", callID),
 		DeviceID:  session.request.DeviceID,
+		ICCID:     session.request.Identity.ICCID,
 		IMSI:      session.request.Identity.IMSI,
 		From:      firstURI(request.value("P-Asserted-Identity")),
 		Text:      text,

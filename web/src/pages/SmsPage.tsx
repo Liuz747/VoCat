@@ -292,8 +292,9 @@ export default function SmsPage() {
     if (device !== "all") query.deviceId = device;
     else {
       query.modemImei = thread.modemImei;
-      query.imsi = thread.imsi;
     }
+		if (thread.iccid) query.iccid = thread.iccid;
+		else query.imsi = thread.imsi;
     try {
       const list = sortMessages(await getThread(query));
       if (id !== threadReqId.current) return false;
@@ -419,8 +420,9 @@ export default function SmsPage() {
       if (device !== "all") query.deviceId = device;
       else {
         query.modemImei = thread.modemImei;
-        query.imsi = thread.imsi;
       }
+			if (thread.iccid) query.iccid = thread.iccid;
+			else query.imsi = thread.imsi;
       const older = sortMessages(await getThread(query));
       setMessagesState([...older, ...messagesRef.current]);
       setHasMoreState(older.length === THREAD_PAGE);
@@ -538,8 +540,8 @@ export default function SmsPage() {
       try {
         const q: DeleteThreadQuery =
           deviceRef.current !== "all"
-            ? { deviceId: deviceRef.current, peer: t.peer }
-            : { deviceId: "all", modemImei: t.modemImei, imsi: t.imsi, peer: t.peer };
+						? { deviceId: deviceRef.current, iccid: t.iccid || undefined, imsi: t.iccid ? undefined : t.imsi, peer: t.peer }
+						: { deviceId: "all", modemImei: t.modemImei, iccid: t.iccid || undefined, imsi: t.iccid ? undefined : t.imsi, peer: t.peer };
         await deleteThread(q);
         message.success(tl("已删除对话"));
         if (keyRef.current === t.key) clearSelection(true);
