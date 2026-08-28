@@ -46,7 +46,6 @@ func (s *Server) handleSMSContacts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	deviceID := normalizeSMSDeviceFilter(r.URL.Query().Get("device_id"))
-	s.syncModemSMS(r.Context(), deviceID)
 	filter := s.smsStoreFilter(r.Context(), deviceID, "")
 	filter.Limit = queryLimit(r, 100)
 	contacts, err := s.store.ListSMSContacts(r.Context(), filter)
@@ -88,7 +87,6 @@ func (s *Server) handleSMSThread(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		s.syncModemSMS(r.Context(), deviceID)
 		filter := s.smsStoreFilter(r.Context(), deviceID, modemIMEI)
 		filter.IMSI = imsi
 		filter.Peer = peer
@@ -619,7 +617,13 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 		// though subsequent live SMS is delivered by SIP MESSAGE.
 		if s.vowifi != nil {
 			state, stateErr := s.vowifi.State(config.ID)
-			if shouldDeferModemSMSSync(state, stateErr) {
+			deferSync := shouldDeferModemSMSSync(state, stateErr)
+			if !deferSync && stateErr == nil && state.Enabled && state.Phase == vowifi.PhaseFailed {
+				if controller, ok := s.vowifi.(VoWiFiSMSSyncController); ok {
+					deferSync = controller.ModemSMSSyncBlocked(config.ID)
+				}
+			}
+			if deferSync {
 				continue
 			}
 		}
@@ -854,11 +858,15 @@ func shouldDeferModemSMSSync(state vowifi.State, stateErr error) bool {
 	if stateErr != nil || !state.Enabled {
 		return false
 	}
-	// SMSReady is a quiescent runtime state: SIM/AKA setup has finished and
-	// reading stored messages cannot race the eSIM/VoWiFi startup sequence.
-	// Failed is also safe because the orchestrator has restored cellular radio
-	// operation before publishing the terminal failure state.
-	return state.Phase != vowifi.PhaseSMSReady && state.Phase != vowifi.PhaseFailed
+	// Setup phases own the UICC/AT path. Once IMS SMS is stable, allow the modem
+	// storage catch-up scan. A failed phase is also eligible unless the runtime's
+	// separate busy/retry signal says an automatic recovery currently owns AT.
+	switch state.Phase {
+	case vowifi.PhaseSMSReady, vowifi.PhaseFailed:
+		return false
+	default:
+		return true
+	}
 }
 
 // StartSMSSyncLoop periodically persists inbound cellular SMS even when no

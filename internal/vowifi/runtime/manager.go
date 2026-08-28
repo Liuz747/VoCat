@@ -231,6 +231,16 @@ func (manager *Manager) State(deviceID string) (vowifi.State, error) {
 	return item.orchestrator.State(), nil
 }
 
+// ModemSMSSyncBlocked reports whether the desired VoWiFi lifecycle still owns
+// the modem command path. The HTTP layer consults this signal for PhaseFailed,
+// including the small handoff window before an automatic retry is scheduled.
+func (manager *Manager) ModemSMSSyncBlocked(deviceID string) bool {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	item := manager.entries[deviceID]
+	return item != nil && (item.busy || item.autoRetryPending)
+}
+
 // RequestEnabled queues an enable or disable transaction and returns
 // immediately. Callers observe progress through State; provider errors are
 // persisted in the orchestrator state instead of being lost with an HTTP
@@ -529,18 +539,25 @@ func (manager *Manager) runOperations(
 		if !shouldRetry && state.Phase != vowifi.PhaseFailed {
 			item.retryFailures = 0
 		}
-		manager.mu.Unlock()
 		if shouldRetry {
-			manager.scheduleAutoRetry(deviceID, item)
+			// Mark the retry pending before releasing the lifecycle lock. This
+			// closes the handoff window in which AT+CMGL could otherwise start
+			// after busy becomes false but before the retry is visible.
+			manager.scheduleAutoRetryLocked(deviceID, item)
 		}
+		manager.mu.Unlock()
 		return
 	}
 }
 
 func (manager *Manager) scheduleAutoRetry(deviceID string, item *entry) {
 	manager.mu.Lock()
+	manager.scheduleAutoRetryLocked(deviceID, item)
+	manager.mu.Unlock()
+}
+
+func (manager *Manager) scheduleAutoRetryLocked(deviceID string, item *entry) {
 	if manager.closed || item.busy || item.autoRetryPending || !item.desiredEnabled {
-		manager.mu.Unlock()
 		return
 	}
 	delay := manager.retryInitial
@@ -557,7 +574,6 @@ func (manager *Manager) scheduleAutoRetry(deviceID string, item *entry) {
 	item.retryFailures++
 	item.autoRetryPending = true
 	manager.wg.Add(1)
-	manager.mu.Unlock()
 
 	manager.logger.Info(
 		"VoWiFi automatic retry scheduled",

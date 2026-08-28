@@ -499,7 +499,36 @@ USE_PROCD=1
 PROCD_TERM_TIMEOUT=40
 PROGRAM=/opt/vocat/bin/vocat
 ENV_FILE=/etc/vocat/env
+MODEM_RECOVERY_SCRIPT=/usr/bin/modem_network_recover_detection.sh
+MODEM_LOCK_DIR=/var/run/modem
+MODEM_LOCK_FILE=$MODEM_LOCK_DIR/auto_dial_lock
+MODEM_LOCK_OWNER=/var/run/vocat.modem_control_lock
+acquire_modem_control() {
+    [ -x "$MODEM_RECOVERY_SCRIPT" ] || return 0
+    mkdir -p "$MODEM_LOCK_DIR" || return 1
+    if [ ! -e "$MODEM_LOCK_FILE" ]; then
+        if ! printf '%s\n' lock > "$MODEM_LOCK_FILE"; then
+            rm -f "$MODEM_LOCK_FILE"
+            return 1
+        fi
+        if ! : > "$MODEM_LOCK_OWNER"; then
+            rm -f "$MODEM_LOCK_FILE"
+            return 1
+        fi
+    fi
+}
+release_modem_control() {
+    [ -e "$MODEM_LOCK_OWNER" ] || return 0
+    rm -f "$MODEM_LOCK_FILE" "$MODEM_LOCK_OWNER"
+}
 start_service() {
+    if ! acquire_modem_control; then
+        logger -t vocat "cannot acquire GL.iNet modem recovery lock"
+        # rc.common's rc_procd ignores start_service's return value and would
+        # otherwise submit an empty service definition. Exit before its
+        # unconditional procd_close_service call and preserve the failure status.
+        exit 1
+    fi
     procd_open_instance
     procd_set_param command "$PROGRAM" serve
     procd_set_param env VOCAT_DATABASE_PATH=/opt/vocat/data/vocat.db
@@ -513,6 +542,7 @@ start_service() {
     procd_set_param stderr 1
     procd_close_instance
 }
+service_stopped() { release_modem_control; }
 service_triggers() { procd_add_reload_trigger vocat; }
 EOF
     chmod 0755 "$OPENWRT_INIT_PATH"

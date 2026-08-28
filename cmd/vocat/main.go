@@ -40,6 +40,20 @@ import (
 	"vocat/web"
 )
 
+const (
+	flightModeTransitionTimeout = 45 * time.Second
+	deviceStartupTimeout        = 4 * time.Minute
+)
+
+func deviceStartupContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), deviceStartupTimeout)
+}
+
+func startupFlightModeContext(parent context.Context) (context.Context, context.CancelFunc) {
+	// Bound each EC20 CFUN transition inside the larger device-startup budget.
+	return context.WithTimeout(parent, flightModeTransitionTimeout)
+}
+
 func main() {
 	logs := loghub.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}), 2000)
 	logger := slog.New(logs)
@@ -211,14 +225,20 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 	if err != nil {
 		return fmt.Errorf("create device manager: %w", err)
 	}
-	if err := deviceManager.Start(startupContext); err != nil {
+	// Device startup has a separate budget because EC20 CFUN transitions can
+	// temporarily remove the USB serial transport, and OpenStick 410 deliberately
+	// delays its persisted VoWiFi policy after a cold boot. Do not reuse the short
+	// database/configuration deadline for this hardware lifecycle.
+	deviceStartupContext, cancelDeviceStartup := deviceStartupContext(startupContext)
+	defer cancelDeviceStartup()
+	if err := deviceManager.Start(deviceStartupContext); err != nil {
 		logger.Warn("device discovery is not available at startup", "error", err)
 	}
-	if err := provisionDiscoveredDevices(startupContext, database, deviceManager); err != nil {
+	if err := provisionDiscoveredDevices(deviceStartupContext, database, deviceManager); err != nil {
 		logger.Warn("automatic first-run device provisioning failed", "error", err)
 	}
-	configureDeviceBackends(startupContext, logger, database, deviceManager)
-	restoreDefaultCellularRadios(startupContext, logger, database, deviceManager)
+	configureDeviceBackends(deviceStartupContext, logger, database, deviceManager)
+	restoreDefaultCellularRadios(deviceStartupContext, logger, database, deviceManager)
 	defer func() {
 		stopContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -240,7 +260,7 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 	var onIncomingCall func(context.Context, ims.ReceivedCall) error
 
 	vowifiManager, err := configureVoWiFiRuntime(
-		startupContext,
+		deviceStartupContext,
 		logger,
 		database,
 		deviceManager,
@@ -361,9 +381,13 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 
 	select {
 	case err := <-serverError:
+		cancelDeviceStartup()
 		_ = protocolMux.Close()
 		return err
 	case <-signalContext.Done():
+		// Stop delayed OpenStick 410 startup work before the deferred VoWiFi
+		// manager shutdown begins, so it cannot enqueue a late enable request.
+		cancelDeviceStartup()
 		logger.Info("shutdown signal received")
 	}
 	// Long-lived SSE and polling handlers use this context. Stop them before
@@ -462,7 +486,7 @@ func restoreDefaultCellularRadios(
 				continue
 			}
 		}
-		restoreContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+		restoreContext, cancel := startupFlightModeContext(ctx)
 		_, err = manager.SetFlight(restoreContext, entry.ID, false)
 		cancel()
 		if err != nil {
@@ -757,9 +781,15 @@ func protectVoWiFiStartupRadioWithRetry(
 	attempts int,
 	delay time.Duration,
 ) error {
+	if attempts <= 0 {
+		return nil
+	}
+	retryBudget := time.Duration(attempts)*flightModeTransitionTimeout + time.Duration(attempts-1)*delay
+	retryContext, cancelRetry := context.WithTimeout(ctx, retryBudget)
+	defer cancelRetry()
 	var lastErr error
 	for attempt := 0; attempt < attempts; attempt++ {
-		flightContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+		flightContext, cancel := context.WithTimeout(retryContext, flightModeTransitionTimeout)
 		_, lastErr = manager.SetFlight(flightContext, physicalID, true)
 		cancel()
 		if lastErr == nil {
@@ -770,11 +800,11 @@ func protectVoWiFiStartupRadioWithRetry(
 		}
 		timer := time.NewTimer(delay)
 		select {
-		case <-ctx.Done():
+		case <-retryContext.Done():
 			if !timer.Stop() {
 				<-timer.C
 			}
-			return errors.Join(lastErr, ctx.Err())
+			return errors.Join(lastErr, retryContext.Err())
 		case <-timer.C:
 		}
 	}
@@ -1132,7 +1162,7 @@ func enforceDefaultSafeCardPolicy(
 		logger.Warn("default card policy: read policy", "iccid", iccid, "error", err)
 		return
 	}
-	flightContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+	flightContext, cancel := context.WithTimeout(ctx, flightModeTransitionTimeout)
 	_, err := manager.SetFlight(flightContext, physicalID, true)
 	cancel()
 	if err != nil {
@@ -1250,7 +1280,7 @@ func reconcileCardPolicies(
 			state, stateErr := vowifiManager.State(config.ID)
 			if policy.VoWiFiEnabled {
 				if !entry.Snapshot.FlightMode {
-					flightContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+					flightContext, cancel := context.WithTimeout(ctx, flightModeTransitionTimeout)
 					_, _ = manager.SetFlight(flightContext, entry.ID, true)
 					cancel()
 				}
@@ -1272,7 +1302,7 @@ func reconcileCardPolicies(
 				continue
 			}
 			if policy.AirplaneEnabled != entry.Snapshot.FlightMode {
-				flightContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+				flightContext, cancel := context.WithTimeout(ctx, flightModeTransitionTimeout)
 				_, _ = manager.SetFlight(flightContext, entry.ID, policy.AirplaneEnabled)
 				cancel()
 			}
@@ -1322,7 +1352,7 @@ func enforceCardRegion(
 	}
 	if reason := device.RegionBlockReason(imsi); reason != "" {
 		if !snapshot.FlightMode {
-			flightContext, cancelFlight := context.WithTimeout(ctx, 30*time.Second)
+			flightContext, cancelFlight := context.WithTimeout(ctx, flightModeTransitionTimeout)
 			_, err := manager.SetFlight(flightContext, id, true)
 			cancelFlight()
 			if err != nil && ctx.Err() == nil {
