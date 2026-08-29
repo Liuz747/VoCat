@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -817,6 +819,34 @@ type vowifiDeviceAdapter interface {
 	vowifi.RadioController
 }
 
+// receivedIMSSMSMessageID returns a session-independent, subscription-scoped
+// identity for an IMS SMS.
+func receivedIMSSMSMessageID(message ims.ReceivedSMS) string {
+	if message.Concat == nil || message.Concat.Total <= 1 {
+		return message.MessageID
+	}
+	subscriptionID := firstNonEmpty(
+		strings.TrimSpace(message.ICCID),
+		strings.TrimSpace(message.IMSI),
+	)
+	if subscriptionID == "" {
+		// Without a subscription identity, reusing the concat reference after an
+		// eSIM switch is indistinguishable from a later segment. Keep the IMS
+		// delivery identity instead of risking a cross-profile merge.
+		return message.MessageID
+	}
+	// A segment of a carrier-split long SMS over IMS. Address the whole
+	// message by the configured device rather than the current IMS session's
+	// reported IMEI, and include the subscription so a later eSIM profile cannot
+	// reuse the same sender/reference tuple and merge into the old message.
+	fingerprint := sha256.Sum256([]byte(subscriptionID))
+	deviceSubscription := message.DeviceID + ":subscription:" + hex.EncodeToString(fingerprint[:])
+	return store.StableConcatMessageID(
+		"ims", "", deviceSubscription, message.From,
+		message.Concat.Reference, message.Concat.Total,
+	)
+}
+
 func newVoWiFiOrchestrator(
 	deviceConfig store.Device,
 	database *store.Store,
@@ -845,6 +875,7 @@ func newVoWiFiOrchestrator(
 		OnIncomingCall:        onIncomingCall,
 		OnSMS: func(ctx context.Context, message ims.ReceivedSMS) error {
 			localPhone, _ := database.PhoneNumberForICCID(ctx, message.ICCID)
+			modemIMEI := firstNonEmpty(message.ModemIMEI, deviceConfig.ModemIMEI)
 			extra, _ := json.Marshal(map[string]any{
 				"transport":                "ims",
 				"encoding":                 message.Encoding,
@@ -861,20 +892,11 @@ func newVoWiFiOrchestrator(
 			if message.Concat != nil && message.Concat.Total > 0 {
 				partsTotal = message.Concat.Total
 			}
-			messageID := message.MessageID
-			if message.Concat != nil && message.Concat.Total > 1 {
-				// A segment of a carrier-split long SMS over IMS. Address the whole
-				// message with a stable id so SaveSMSMessage folds every segment
-				// into one progressively merged row instead of one row per segment.
-				messageID = store.StableConcatMessageID(
-					"ims", deviceConfig.ModemIMEI, message.DeviceID, message.From,
-					message.Concat.Reference, message.Concat.Total,
-				)
-			}
+			messageID := receivedIMSSMSMessageID(message)
 			_, saveErr := database.SaveSMSMessage(ctx, store.SMSMessage{
 				MessageID:  messageID,
 				DeviceID:   message.DeviceID,
-				ModemIMEI:  deviceConfig.ModemIMEI,
+				ModemIMEI:  modemIMEI,
 				ICCID:      message.ICCID,
 				IMSI:       message.IMSI,
 				LocalPhone: localPhone,
@@ -893,7 +915,7 @@ func newVoWiFiOrchestrator(
 		OnSMSStatus: func(ctx context.Context, report ims.ReceivedSMSStatus) error {
 			deliveryReport := store.SMSDeliveryReport{
 				DeviceID:          report.DeviceID,
-				ModemIMEI:         deviceConfig.ModemIMEI,
+				ModemIMEI:         firstNonEmpty(report.ModemIMEI, deviceConfig.ModemIMEI),
 				IMSI:              report.IMSI,
 				Peer:              report.To,
 				Source:            "ims",
