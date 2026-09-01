@@ -45,6 +45,7 @@ import (
 const (
 	flightModeTransitionTimeout = 45 * time.Second
 	deviceStartupTimeout        = 4 * time.Minute
+	stableModemWaitTimeout      = 45 * time.Second
 )
 
 func deviceStartupContext(parent context.Context) (context.Context, context.CancelFunc) {
@@ -233,6 +234,16 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 	// database/configuration deadline for this hardware lifecycle.
 	deviceStartupContext, cancelDeviceStartup := deviceStartupContext(startupContext)
 	defer cancelDeviceStartup()
+	stableModemContext, cancelStableModem := context.WithTimeout(deviceStartupContext, stableModemWaitTimeout)
+	if err := deviceManager.WaitForStableModem(
+		stableModemContext,
+		20*time.Second,
+		time.Second,
+		20*time.Second,
+	); err != nil {
+		logger.Warn("wait for stable modem enumeration", "error", err)
+	}
+	cancelStableModem()
 	if err := deviceManager.Start(deviceStartupContext); err != nil {
 		logger.Warn("device discovery is not available at startup", "error", err)
 	}
@@ -250,14 +261,6 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 	}()
 	pollContext, cancelPolling := context.WithCancel(context.Background())
 	defer cancelPolling()
-	go pollDeviceSnapshots(pollContext, deviceLogger, database, deviceManager)
-	go collectCellularTraffic(pollContext, logger, database)
-	go persistLogsToStore(pollContext, logger, logs, database)
-	if !developerEnabled {
-		go disableAllDeveloperCellularData(pollContext, logger, database, deviceManager)
-	} else {
-		go watchDeveloperDisable(pollContext, logger, database, deviceManager, exportProxyManager, legacyExportProxyConfig)
-	}
 
 	var onIncomingCall func(context.Context, ims.ReceivedCall) error
 
@@ -276,6 +279,18 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 	)
 	if err != nil {
 		return fmt.Errorf("configure VoWiFi runtime: %w", err)
+	}
+	// Start background consumers only after the synchronous radio/VoWiFi
+	// startup sequence. A snapshot refresh also takes the device operation
+	// mutex; starting it earlier can strand cold boot forever behind a serial
+	// read from an unstable USB enumeration.
+	go pollDeviceSnapshots(pollContext, deviceLogger, database, deviceManager)
+	go collectCellularTraffic(pollContext, logger, database)
+	go persistLogsToStore(pollContext, logger, logs, database)
+	if !developerEnabled {
+		go disableAllDeveloperCellularData(pollContext, logger, database, deviceManager)
+	} else {
+		go watchDeveloperDisable(pollContext, logger, database, deviceManager, exportProxyManager, legacyExportProxyConfig)
 	}
 	go reconcileCardPolicies(pollContext, logger, database, deviceManager, vowifiManager)
 	defer func() {
@@ -442,6 +457,9 @@ func configureDeviceBackends(
 		}
 		if err := manager.SetBackend(entry.ID, config.DeviceBackend); err != nil {
 			logger.Warn("configure device backend", "device_id", config.ID, "backend", config.DeviceBackend, "error", err)
+		}
+		if err := manager.SetESIMTransport(entry.ID, config.ESIMTransport); err != nil {
+			logger.Warn("configure eSIM transport", "device_id", config.ID, "transport", config.ESIMTransport, "error", err)
 		}
 	}
 }

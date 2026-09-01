@@ -55,9 +55,9 @@ type Session struct {
 // PoisonedClient is implemented by Session. A poisoned session has hit a
 // transport-fatal error (a failed write/drain/read or a closed serial line);
 // the underlying fd is wedged and every subsequent command reuses the corpse.
-// AT-level failures (CommandError, command timeout) do NOT poison — the
-// transport is still healthy there, so reopening would only destroy a good
-// session over a transient +CME ERROR.
+// AT-level failures (CommandError) do not poison. A command deadline that has
+// to close a blocked transport does poison, because the fd was wedged and must
+// be reopened before the next operation.
 type PoisonedClient interface {
 	Poisoned() bool
 }
@@ -315,7 +315,7 @@ func (session *Session) waitPromptLocked(
 			return err
 		}
 		buffer := make([]byte, 1024)
-		count, err := session.transport.Read(buffer)
+		count, err := readTransportContext(ctx, session.transport, buffer)
 		if count > 0 {
 			session.readBuf = append(session.readBuf, buffer[:count]...)
 			continue
@@ -449,7 +449,7 @@ func (session *Session) readLineLocked(ctx context.Context) (string, error) {
 			return "", err
 		}
 		buffer := make([]byte, 1024)
-		count, err := session.transport.Read(buffer)
+		count, err := readTransportContext(ctx, session.transport, buffer)
 		if count > 0 {
 			session.readBuf = append(session.readBuf, buffer[:count]...)
 			continue
@@ -462,6 +462,27 @@ func (session *Session) readLineLocked(ctx context.Context) (string, error) {
 			return "", fmt.Errorf("read serial response: %w", err)
 		}
 	}
+}
+
+// readTransportContext checks cancellation around one bounded transport read.
+// It must not close a transport from another goroutine: some serial libraries
+// wait in Close for the active reader while that reader is itself stuck in a
+// blocking read(2), deadlocking the session and every caller queued behind it.
+// Linux serial transports therefore keep their fd non-blocking and enforce the
+// configured read timeout with poll(2).
+func readTransportContext(
+	ctx context.Context,
+	transport Transport,
+	buffer []byte,
+) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	count, err := transport.Read(buffer)
+	if contextErr := ctx.Err(); contextErr != nil {
+		return 0, contextErr
+	}
+	return count, err
 }
 
 func popLine(buffer *[]byte) (string, bool) {
