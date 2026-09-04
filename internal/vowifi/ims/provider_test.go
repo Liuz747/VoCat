@@ -601,7 +601,7 @@ func TestIMSProfileUserAgentUsesUnifiedHeaderValue(t *testing.T) {
 
 func TestSipInstanceIDUsesGSMAFormWhenIMEIIsAvailable(t *testing.T) {
 	identity := vowifi.SIMIdentity{IMEI: "353024112557010"}
-	if got := sipInstanceID(identity, "00000000-0000-4000-8000-000000000001"); got != "urn:gsma:imei:353024112557010-0" {
+	if got := sipInstanceID(identity, "00000000-0000-4000-8000-000000000001"); got != "urn:gsma:imei:35302411-255701-0" {
 		t.Fatalf("sipInstanceID() = %q", got)
 	}
 	if got := sipInstanceID(vowifi.SIMIdentity{IMEI: "not-an-imei"}, "00000000-0000-4000-8000-000000000001"); got != "urn:uuid:00000000-0000-4000-8000-000000000001" {
@@ -613,13 +613,13 @@ func TestGSMAContactFormatUsesAddressAndDeviceInstance(t *testing.T) {
 	session := &Session{
 		identity:   identitySet{user: "234105776448519"},
 		transport:  "tcp",
-		instanceID: "urn:gsma:imei:353024112557010-0",
+		instanceID: "urn:gsma:imei:35302411-255701-0",
 	}
 	got := session.buildContact("[2001:db8::1]:49686", vowifi.IMSRegisterOptions{
 		ContactFormat:    vowifi.IMSContactFormatGSMA,
 		ContactExtraTags: []string{"+g.3gpp.mid-call", "+g.3gpp.smsip"},
 	})
-	want := `<sip:[2001:db8::1]:49686>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.mid-call;+g.3gpp.smsip;+sip.instance="<urn:gsma:imei:353024112557010-0>"`
+	want := `<sip:[2001:db8::1]:49686>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.mid-call;+g.3gpp.smsip;+sip.instance="<urn:gsma:imei:35302411-255701-0>"`
 	if got != want {
 		t.Fatalf("GSMA Contact = %q, want %q", got, want)
 	}

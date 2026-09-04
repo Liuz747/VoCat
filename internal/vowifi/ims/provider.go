@@ -1099,7 +1099,10 @@ func sipInstanceID(identity vowifi.SIMIdentity, fallback string) string {
 			}
 		}
 		if valid {
-			return "urn:gsma:imei:" + imei + "-0"
+			// RFC 7254 / GSMA IR.92: urn:gsma:imei:<TAC 8 digits>-<SNR 6 digits>-<spare>.
+			// Real handsets (iPhone, Android IMS stacks) emit the dashed form; a
+			// 15-digit run without separators is not a valid GSMA IMEI URN.
+			return "urn:gsma:imei:" + imei[:8] + "-" + imei[8:14] + "-" + imei[14:]
 		}
 	}
 	return "urn:uuid:" + strings.TrimSpace(fallback)

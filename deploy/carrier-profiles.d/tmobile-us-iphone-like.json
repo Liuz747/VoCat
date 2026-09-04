@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "id": "tmobile-us-iphone-like",
+      "match_any": [
+        { "home_plmns": ["310240"] },
+        { "home_plmns": ["310260"] }
+      ],
+      "ims": {
+        "user_agent": "iOS/18.2.1 iPhone (iPhone15,4)",
+        "pani_enabled": true,
+        "register_options": {
+          "contact_format": "standard",
+          "contact_extra_tags": [
+            "video",
+            "+g.3gpp.mid-call",
+            "+g.3gpp.srvcc-alerting",
+            "+g.3gpp.ps2cs-srvcc-orig-pre-alerting"
+          ],
+          "supported_header": "path, gruu, sec-agree",
+          "allow_header": "INVITE, ACK, CANCEL, BYE, UPDATE, REFER, NOTIFY, MESSAGE, PRACK, OPTIONS, INFO",
+          "p_preferred_identity": true,
+          "accept_contact_tags": [
+            "*;+g.3gpp.smsip",
+            "*;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\""
+          ]
+        }
+      }
+    }
+  ]
+}
