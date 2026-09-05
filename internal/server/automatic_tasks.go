@@ -947,23 +947,23 @@ func (s *Server) handleAutomaticTaskRunNow(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) decodeAutomaticTask(r *http.Request, id int64) (store.AutomaticTask, error) {
 	var request struct {
-		Name         string               `json:"name"`
-		Enabled      bool                 `json:"enabled"`
-		DeviceID     string               `json:"device_id"`
-		ProfileICCID string               `json:"profile_iccid"`
-		ProfileAID   string               `json:"profile_aid"`
-		TaskType     string               `json:"task_type"`
-		Environment  string               `json:"environment"`
-		IntervalDays int                  `json:"interval_days"`
-		IntervalSeconds int               `json:"interval_seconds"`
-		StartDate    string               `json:"start_date"`
-		EndDate      string               `json:"end_date"`
-		EndTime      string               `json:"end_time"`
-		RunTime      string               `json:"run_time"`
-		Timezone     string               `json:"timezone"`
-		RetryCount   int                  `json:"retry_count"`
-		Notify       bool                 `json:"notify"`
-		Payload      automaticTaskPayload `json:"payload"`
+		Name            string               `json:"name"`
+		Enabled         bool                 `json:"enabled"`
+		DeviceID        string               `json:"device_id"`
+		ProfileICCID    string               `json:"profile_iccid"`
+		ProfileAID      string               `json:"profile_aid"`
+		TaskType        string               `json:"task_type"`
+		Environment     string               `json:"environment"`
+		IntervalDays    int                  `json:"interval_days"`
+		IntervalSeconds int                  `json:"interval_seconds"`
+		StartDate       string               `json:"start_date"`
+		EndDate         string               `json:"end_date"`
+		EndTime         string               `json:"end_time"`
+		RunTime         string               `json:"run_time"`
+		Timezone        string               `json:"timezone"`
+		RetryCount      int                  `json:"retry_count"`
+		Notify          bool                 `json:"notify"`
+		Payload         automaticTaskPayload `json:"payload"`
 	}
 	if err := s.decodeJSON(nilResponseWriter{}, r, &request); err != nil {
 		return store.AutomaticTask{}, err

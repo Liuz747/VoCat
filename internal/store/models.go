@@ -137,22 +137,22 @@ type AutomaticTask struct {
 	IntervalDays int    `json:"interval_days"`
 	// IntervalSeconds > 0 makes the schedule advance by minutes instead of
 	// IntervalDays (used by profile rotation tasks).
-	IntervalSeconds int             `json:"interval_seconds"`
+	IntervalSeconds int `json:"interval_seconds"`
 	// EndAt, when set, disables the task once its next run would start at or
 	// after this instant (one-off start/end window for rotation tasks).
-	EndAt time.Time `json:"end_at,omitempty"`
-	StartDate       string          `json:"start_date"`
-	RunTime         string          `json:"run_time"`
-	Timezone        string          `json:"timezone"`
-	Payload         json.RawMessage `json:"payload"`
-	RetryCount      int             `json:"retry_count"`
-	Notify          bool            `json:"notify"`
-	NextRunAt       time.Time       `json:"next_run_at"`
-	LastRunAt       time.Time       `json:"last_run_at,omitempty"`
-	LastStatus      string          `json:"last_status"`
-	LastError       string          `json:"last_error"`
-	CreatedAt       time.Time       `json:"created_at"`
-	UpdatedAt       time.Time       `json:"updated_at"`
+	EndAt      time.Time       `json:"end_at,omitempty"`
+	StartDate  string          `json:"start_date"`
+	RunTime    string          `json:"run_time"`
+	Timezone   string          `json:"timezone"`
+	Payload    json.RawMessage `json:"payload"`
+	RetryCount int             `json:"retry_count"`
+	Notify     bool            `json:"notify"`
+	NextRunAt  time.Time       `json:"next_run_at"`
+	LastRunAt  time.Time       `json:"last_run_at,omitempty"`
+	LastStatus string          `json:"last_status"`
+	LastError  string          `json:"last_error"`
+	CreatedAt  time.Time       `json:"created_at"`
+	UpdatedAt  time.Time       `json:"updated_at"`
 }
 
 type AutomaticTaskRun struct {

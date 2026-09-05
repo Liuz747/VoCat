@@ -370,7 +370,7 @@ func TestRotationTaskDisablesItselfAfterEndAt(t *testing.T) {
 		Name: "rotate", Enabled: true, DeviceID: "ec20", ProfileICCID: "one",
 		TaskType: "profile_rotation", Environment: "vowifi", IntervalDays: 1, IntervalSeconds: 30,
 		StartDate: "2026-08-10", RunTime: "12:00", Timezone: "Asia/Shanghai",
-		Payload: []byte(`{"profiles":[{"iccid":"one"},{"iccid":"two"}]}`),
+		Payload:   []byte(`{"profiles":[{"iccid":"one"},{"iccid":"two"}]}`),
 		NextRunAt: now.Add(-time.Minute), EndAt: now.Add(10 * time.Minute),
 	})
 	if err != nil {

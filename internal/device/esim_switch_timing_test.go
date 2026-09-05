@@ -71,9 +71,9 @@ func TestWaitForSIMReadyAfterSwitchGivesUpAtDeadline(t *testing.T) {
 
 func TestParseQINISTATPhonebookReady(t *testing.T) {
 	for _, test := range []struct {
-		response    modem.Response
-		wantReady   bool
-		wantKnown   bool
+		response  modem.Response
+		wantReady bool
+		wantKnown bool
 	}{
 		{okResponse("+QINISTAT: 7"), true, true},
 		{okResponse("+QINISTAT: 3"), false, true},

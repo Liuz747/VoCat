@@ -174,7 +174,7 @@ func (manager *Manager) readSnapshot(
 		}
 		snapshot.GID1 = encodeSIMGroupID(manager.readTransparentSIMFile(ctx, client, 28478))
 		snapshot.GID2 = encodeSIMGroupID(manager.readTransparentSIMFile(ctx, client, 28479))
-	stepTimer.step("sim_files")
+		stepTimer.step("sim_files")
 		snapshot.IdentityFilesRead = true
 	}
 	if response, ok := optional("AT+CSQ"); ok {
@@ -220,7 +220,7 @@ func (manager *Manager) readSnapshot(
 	stepTimer.step("at_radio_and_registration")
 	if strings.EqualFold(backend, "qmi") {
 		registration, found := readPlatformRegistration(ctx, candidate)
-	stepTimer.step("qmi_registration")
+		stepTimer.step("qmi_registration")
 		if found {
 			snapshot.RegistrationStatus = registration.Status
 			snapshot.RegistrationSource = "QMI NAS"

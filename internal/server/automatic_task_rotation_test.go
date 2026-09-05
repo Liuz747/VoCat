@@ -138,7 +138,9 @@ func (c *rotationVoWiFiController) RequestEnabled(_ string, enabled bool) (vowif
 	}
 	return c.state, nil
 }
-func (c *rotationVoWiFiController) RequestReconnect(string) (vowifi.State, error) { return c.state, nil }
+func (c *rotationVoWiFiController) RequestReconnect(string) (vowifi.State, error) {
+	return c.state, nil
+}
 
 func TestAutomaticProfileSwitchStopsVoWiFiBeforeEnablingNextProfile(t *testing.T) {
 	ctx := context.Background()
@@ -154,7 +156,7 @@ func TestAutomaticProfileSwitchStopsVoWiFiBeforeEnablingNextProfile(t *testing.T
 	switched := "8901240527185779025"
 	devices := rotationSwitchController{
 		fakeDeviceController: fakeDeviceController{entry: device.Device{ID: "ec20", Discovered: true, Snapshot: &device.Snapshot{ICCID: "8901240527185779025"}}},
-		log: &log, switched: &switched,
+		log:                  &log, switched: &switched,
 	}
 	vowifiController := &rotationVoWiFiController{state: vowifi.State{Enabled: true, Active: true, Phase: vowifi.PhaseSMSReady}, log: &log}
 	server := &Server{store: database, devices: devices, vowifi: vowifiController, logger: regionTestLogger()}
