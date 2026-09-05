@@ -1912,6 +1912,30 @@ func (s *Server) writeDeviceError(w http.ResponseWriter, err error) {
 	}
 }
 
+// backfillModemIMEI records a modem's IMEI on its configured device the first
+// time the hardware reports one. Records created before the modem answered
+// carry an empty IMEI and can then only be matched by USB path and Linux node
+// names; the node names are recycled on re-enumeration, which is how a runtime
+// once bound to another modem (DEVICE-REPORT §25.15). The IMEI is the only
+// identifier that also survives moving the modem to a different port. It is
+// never overwritten: a changed IMEI means different hardware, which is the
+// user's decision to make.
+func (s *Server) backfillModemIMEI(ctx context.Context, config store.Device, entry device.Device) {
+	if config.ModemIMEI != "" || entry.Snapshot == nil {
+		return
+	}
+	imei := strings.TrimSpace(entry.Snapshot.IMEI)
+	if imei == "" {
+		return
+	}
+	config.ModemIMEI = imei
+	if err := s.store.UpsertDevice(ctx, config); err != nil {
+		s.logger.Warn("could not record the modem IMEI on its device", "device_id", config.ID, "error", err)
+		return
+	}
+	s.logger.Info("recorded the modem IMEI on its device", "device_id", config.ID)
+}
+
 func (s *Server) deviceSummaries() []map[string]any {
 	configs, err := s.store.ListDevices(context.Background())
 	if err != nil {
@@ -1922,6 +1946,7 @@ func (s *Server) deviceSummaries() []map[string]any {
 	for _, config := range configs {
 		entry, _, present := s.physicalForConfig(config)
 		if present {
+			s.backfillModemIMEI(context.Background(), config, entry)
 			result = append(result, s.configuredDeviceSummary(config, &entry))
 		} else {
 			result = append(result, s.configuredDeviceSummary(config, nil))
