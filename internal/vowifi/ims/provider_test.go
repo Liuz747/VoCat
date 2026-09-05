@@ -462,8 +462,13 @@ func serveRegistration(listener *net.UDPConn, nonce string, confirmSMS bool) err
 			if headers["expires"] == "0" {
 				return errors.New("refresh REGISTER used zero expiry")
 			}
-			if headers["authorization"] != "" {
-				return errors.New("refresh reused the one-time AKAv1 RES")
+			// TS 24.229 §5.1.1.4: the protected re-REGISTER carries an
+			// Authorization header derived from the last challenge (nc+1).
+			if headers["authorization"] == "" {
+				return errors.New("refresh REGISTER omitted Authorization")
+			}
+			if !strings.Contains(headers["authorization"], "nc=00000002") {
+				return fmt.Errorf("refresh Authorization did not increment nc: %q", headers["authorization"])
 			}
 			contact := headers["contact"]
 			extraContacts := []string(nil)
@@ -494,6 +499,10 @@ func serveRegistration(listener *net.UDPConn, nonce string, confirmSMS bool) err
 		}
 		if headers["expires"] != "0" {
 			return fmt.Errorf("deregister Expires = %q, want 0", headers["expires"])
+		}
+		// TS 24.229 §5.1.1.6: the de-REGISTER is authenticated as well.
+		if headers["authorization"] == "" {
+			return errors.New("de-register REGISTER omitted Authorization")
 		}
 		if _, err := listener.WriteToUDP(
 			testResponse(200, "OK", callID, headers["cseq"], nil),
@@ -717,8 +726,8 @@ func serveRefreshFailure(listener *net.UDPConn, nonce string) error {
 			}
 			continue
 		}
-		if headers["authorization"] != "" {
-			return errors.New("refresh reused the one-time AKAv1 RES")
+		if headers["authorization"] == "" {
+			return errors.New("refresh REGISTER omitted Authorization")
 		}
 		if _, err := listener.WriteToUDP(
 			testResponse(503, "Service Unavailable", callID, headers["cseq"], nil),

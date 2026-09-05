@@ -595,6 +595,8 @@ type Session struct {
 	callID             string
 	fromTag            string
 	instanceID         string
+	lastRegister       []byte
+	deregisterAll      bool
 	pani               string
 	paniResolved       bool
 	cseq               uint32
@@ -649,11 +651,8 @@ func newSession(
 	if err != nil {
 		return nil, err
 	}
-	instanceURI := "urn:uuid:" + instanceID
 	profile := vowifi.ResolveCarrierProfile(request.Identity)
-	if profile.IMSRegisterOptions.ContactFormat == vowifi.IMSContactFormatGSMA {
-		instanceURI = sipInstanceID(request.Identity, instanceID)
-	}
+	instanceURI := sessionInstanceURI(profile.IMSRegisterOptions, request.Identity, instanceID)
 	refreshContext, refreshCancel := context.WithCancel(context.Background())
 	session := &Session{
 		provider:           provider,
@@ -763,7 +762,7 @@ func (session *Session) abort() {
 func (session *Session) establish(ctx context.Context) error {
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	response, err := session.register(ctx, int(session.provider.config.RegistrationExpiry/time.Second))
+	response, err := session.register(ctx, session.registrationExpirySeconds())
 	if err != nil {
 		session.evidence.RegistrationState = "failed"
 		return err
@@ -834,7 +833,18 @@ func safeSIPDiagnostic(value string) string {
 	return value
 }
 
+// registrationExpirySeconds returns the Expires value for an initial or refresh
+// REGISTER: the carrier profile's register_options.expiry_seconds when set,
+// otherwise the provider default. De-registration always passes 0 directly.
+func (session *Session) registrationExpirySeconds() int {
+	if seconds := vowifi.ResolveCarrierProfile(session.request.Identity).IMSRegisterOptions.ExpirySeconds; seconds > 0 {
+		return seconds
+	}
+	return int(session.provider.config.RegistrationExpiry / time.Second)
+}
+
 func (session *Session) register(ctx context.Context, expires int) (*sipResponse, error) {
+	minExpiresApplied := false
 	for challenges := 0; challenges <= maxAuthenticationChallenges; challenges++ {
 		cseq := session.cseq
 		session.cseq++
@@ -862,11 +872,23 @@ func (session *Session) register(ctx context.Context, expires int) (*sipResponse
 		if err != nil {
 			return nil, err
 		}
+		session.lastRegister = request
 		response, err := session.exchange(ctx, request, cseq)
 		if err != nil {
 			return nil, err
 		}
 		session.evidence.LastSIPCode = response.StatusCode
+		if response.StatusCode == 423 && expires > 0 && !minExpiresApplied {
+			// RFC 3261 §10.3: the registrar wants a longer interval. Resend once
+			// with its Min-Expires. This round did not consume an authentication
+			// challenge, so give it back to the loop budget.
+			if minimum, err := strconv.Atoi(strings.TrimSpace(response.value("Min-Expires"))); err == nil && minimum > expires {
+				expires = minimum
+				minExpiresApplied = true
+				challenges--
+				continue
+			}
+		}
 		if response.StatusCode != 401 && response.StatusCode != 407 {
 			return response, nil
 		}
@@ -874,7 +896,14 @@ func (session *Session) register(ctx context.Context, expires int) (*sipResponse
 			break
 		}
 		if session.securityActive {
-			return nil, errors.New("ims: protected registration was challenged again")
+			// The registrar may re-authenticate at any time (TS 24.229
+			// §5.1.1.5.1). Run AKA again over the existing association instead
+			// of giving up; giving up is what turned every refresh into a full
+			// runtime rebuild.
+			session.provider.config.Logger.Info("IMS registrar re-challenged a protected REGISTER; re-authenticating",
+				"device_id", session.request.DeviceID,
+				"sip_status", response.StatusCode,
+				"expires", expires)
 		}
 		challenge, err := challengeFromResponse(response)
 		if err != nil {
@@ -892,7 +921,12 @@ func (session *Session) register(ctx context.Context, expires int) (*sipResponse
 		if err != nil {
 			return nil, err
 		}
-		if len(material.auts) == 0 && useSecurity {
+		if len(material.auts) == 0 && useSecurity && session.securityActive {
+			// Keep the current IPsec association; renegotiating it mid-session
+			// would drop the protected transport the response must arrive on.
+			session.provider.config.Logger.Warn("IMS registrar offered a new security agreement over the protected association; keeping the current one",
+				"device_id", session.request.DeviceID)
+		} else if len(material.auts) == 0 && useSecurity {
 			if err := session.activateIPSec(ctx, agreement, material.ck, material.ik); err != nil {
 				clearAKAMaterial(&material)
 				return nil, err
@@ -950,9 +984,10 @@ func (session *Session) buildRegister(
 ) ([]byte, error) {
 	profile := vowifi.ResolveCarrierProfile(session.request.Identity)
 	registerOptions := profile.IMSRegisterOptions
-	if registerOptions.ExpirySeconds != 0 {
-		expires = registerOptions.ExpirySeconds
-	}
+	// The carrier profile's expiry_seconds is applied by the callers through
+	// registrationExpirySeconds(). It must not be applied here: Close() sends
+	// REGISTER with Expires: 0, and overriding that value turned an intended
+	// de-registration into a refresh whenever a profile set expiry_seconds.
 	branch, err := randomHex(12)
 	if err != nil {
 		return nil, err
@@ -963,13 +998,15 @@ func (session *Session) buildRegister(
 	requestURI := "sip:" + session.identity.domain
 	routeURI := "sip:" + session.endpoint.address() + ";transport=" + session.transport + ";lr"
 	contact := session.buildContact(contactAddress, registerOptions)
-
-	defaultSupported := "path, gruu"
-	defaultAllow := "REGISTER, INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE, SUBSCRIBE, NOTIFY"
-	supported := defaultSupported
-	if registerOptions.SupportedHeader != nil {
-		supported = *registerOptions.SupportedHeader
+	if session.deregisterAll && expires == 0 {
+		// RFC 3261 §10.2.2: "Contact: *" with "Expires: 0" removes every binding
+		// of the address-of-record, including the ones left behind by crashed
+		// or killed sessions whose own de-registration never happened.
+		contact = "*"
 	}
+
+	defaultAllow := "REGISTER, INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE, SUBSCRIBE, NOTIFY"
+	supported := supportedHeaderValue(registerOptions)
 	allow := defaultAllow
 	if registerOptions.AllowHeader != nil {
 		allow = *registerOptions.AllowHeader
@@ -1054,6 +1091,15 @@ func (session *Session) buildContact(contactAddress string, registerOptions vowi
 	base := fmt.Sprintf("<sip:%s@%s;transport=%s>", session.identity.user, contactAddress, session.transport)
 	instanceID := session.instanceID
 	icsiRef := "urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
+	// RFC 5626 §6: with both +sip.instance and reg-id the registrar keys the
+	// binding by (instance-id, reg-id) and replaces it on re-registration. Our
+	// contact address is the tunnel-internal IPv6 + IPsec port, which changes
+	// on every restart, so without reg-id each restart added a new binding and
+	// the stale one kept receiving MT requests until it expired.
+	regID := ""
+	if registerOptions.OutboundRegID > 0 {
+		regID = fmt.Sprintf(";reg-id=%d", registerOptions.OutboundRegID)
+	}
 
 	switch registerOptions.ContactFormat {
 	case vowifi.IMSContactFormatATT:
@@ -1062,8 +1108,8 @@ func (session *Session) buildContact(contactAddress string, registerOptions vowi
 			extra += ";" + tag
 		}
 		return fmt.Sprintf(
-			`%s%s;audio;+g.3gpp.smsip;+g.3gpp.icsi-ref="%s";+sip.instance="<%s>"`,
-			base, extra, icsiRef, instanceID,
+			`%s%s;audio;+g.3gpp.smsip;+g.3gpp.icsi-ref="%s";+sip.instance="<%s>"%s`,
+			base, extra, icsiRef, instanceID, regID,
 		)
 	case vowifi.IMSContactFormatGSMA:
 		extra := ""
@@ -1071,8 +1117,8 @@ func (session *Session) buildContact(contactAddress string, registerOptions vowi
 			extra += ";" + tag
 		}
 		return fmt.Sprintf(
-			`<sip:%s>;+g.3gpp.icsi-ref="%s"%s;+sip.instance="<%s>"`,
-			contactAddress, icsiRef, extra, instanceID,
+			`<sip:%s>;+g.3gpp.icsi-ref="%s"%s;+sip.instance="<%s>"%s`,
+			contactAddress, icsiRef, extra, instanceID, regID,
 		)
 	default:
 		extra := ""
@@ -1080,14 +1126,53 @@ func (session *Session) buildContact(contactAddress string, registerOptions vowi
 			extra += ";" + tag
 		}
 		return fmt.Sprintf(
-			`%s;+sip.instance="<%s>";+g.3gpp.smsip;audio;+g.3gpp.icsi-ref="%s"%s`,
-			base, instanceID, icsiRef, extra,
+			`%s;+sip.instance="<%s>"%s;+g.3gpp.smsip;audio;+g.3gpp.icsi-ref="%s"%s`,
+			base, instanceID, regID, icsiRef, extra,
 		)
 	}
 }
 
+// supportedHeaderValue returns the REGISTER Supported header: the profile
+// override or the default, plus "outbound" whenever reg-id is in use (RFC 5626
+// requires the UA to announce the outbound extension it relies on).
+func supportedHeaderValue(registerOptions vowifi.IMSRegisterOptions) string {
+	supported := "path, gruu"
+	if registerOptions.SupportedHeader != nil {
+		supported = *registerOptions.SupportedHeader
+	}
+	if registerOptions.OutboundRegID > 0 {
+		hasOutbound := false
+		for _, token := range strings.Split(supported, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "outbound") {
+				hasOutbound = true
+				break
+			}
+		}
+		if !hasOutbound {
+			if strings.TrimSpace(supported) == "" {
+				supported = "outbound"
+			} else {
+				supported += ", outbound"
+			}
+		}
+	}
+	return supported
+}
+
 // sipInstanceID uses the standardized GSMA device-instance URI when a valid
 // modem identity is available and keeps the generated UUID as the fallback.
+// sessionInstanceURI picks the +sip.instance value. The GSMA IMEI URN is used
+// for the GSMA contact format and whenever outbound reg-id is enabled: RFC 5626
+// keys bindings by (instance-id, reg-id), so a per-process random UUID would
+// make every restart a brand-new binding and defeat the replacement. Otherwise
+// the historical per-session UUID is kept.
+func sessionInstanceURI(options vowifi.IMSRegisterOptions, identity vowifi.SIMIdentity, fallbackUUID string) string {
+	if options.ContactFormat == vowifi.IMSContactFormatGSMA || options.OutboundRegID > 0 {
+		return sipInstanceID(identity, fallbackUUID)
+	}
+	return "urn:uuid:" + fallbackUUID
+}
+
 func sipInstanceID(identity vowifi.SIMIdentity, fallback string) string {
 	imei := strings.TrimSpace(identity.IMEI)
 	if len(imei) == 15 {
@@ -1387,6 +1472,12 @@ func (session *Session) applyRegistrationEvidence(response *sipResponse) error {
 			}
 		}
 	}
+	session.provider.config.Logger.Info("IMS registrar contact bindings",
+		"device_id", session.request.DeviceID,
+		"bindings", len(contacts),
+		"instance_ids", contactInstanceIDs(contacts),
+		"expires", contactExpires(contacts),
+		"this_session_matched", registeredContact != "")
 	expiry := registrationExpiry(response, contacts, session.provider.config.RegistrationExpiry)
 	if expiry <= 0 {
 		session.evidence.Registered = false
@@ -1409,8 +1500,82 @@ func (session *Session) applyRegistrationEvidence(response *sipResponse) error {
 		SecurityMode:         session.effectiveSecurityMode(),
 		SecurityVerified:     session.securityActive,
 	}
-	session.clearAuthentication()
+	// Keep the authentication state. TS 24.229 §5.1.1.4 / §5.1.1.6 require the
+	// protected re-REGISTER (refresh) and the de-REGISTER to carry an
+	// Authorization header built from the last challenge (nc incremented,
+	// integrity-protected=yes). Clearing it here made every refresh go out
+	// unauthenticated: the registrar answered 401, register() refused a second
+	// challenge on the protected association, the orchestrator tore the whole
+	// runtime down and re-registered, and the network kept the previous
+	// binding (7200 s) next to the new one. De-registration was rejected with
+	// 400 for the same reason. The material is cleared on close and on
+	// refresh failure.
 	return nil
+}
+
+// contactInstanceIDs extracts the +sip.instance URN of every Contact binding the
+// registrar reported for this IMPU ("-" when a binding has none). More than one
+// binding right after a restart means the network kept the previous
+// registration next to the new one instead of replacing it; RFC 5626 only
+// replaces bindings that carry the same instance-id.
+func contactInstanceIDs(contacts []string) []string {
+	ids := make([]string, 0, len(contacts))
+	for _, contact := range contacts {
+		index := strings.Index(strings.ToLower(contact), "+sip.instance=")
+		if index < 0 {
+			ids = append(ids, "-")
+			continue
+		}
+		value := contact[index+len("+sip.instance="):]
+		value = strings.SplitN(value, ";", 2)[0]
+		ids = append(ids, strings.Trim(strings.TrimSpace(value), `"<>`))
+	}
+	return ids
+}
+
+// contactExpires lists the expires parameter of each Contact binding (-1 when
+// absent) so the log shows when a stale binding will disappear.
+func contactExpires(contacts []string) []int {
+	values := make([]int, 0, len(contacts))
+	for _, contact := range contacts {
+		if seconds, ok := parameterSeconds(contact, "expires"); ok {
+			values = append(values, seconds)
+		} else {
+			values = append(values, -1)
+		}
+	}
+	return values
+}
+
+// redactSIPRequestForLog returns the start line and headers of an outgoing SIP
+// request in a form safe for logs: the body is dropped, Authorization /
+// Proxy-Authorization values are replaced (they carry AKA digest material), and
+// the IMSI-derived user part of every SIP/tel URI keeps only its last 4 digits.
+func redactSIPRequestForLog(raw []byte, privateUsers ...string) string {
+	text := string(raw)
+	if index := strings.Index(text, "\r\n\r\n"); index >= 0 {
+		text = text[:index]
+	}
+	lines := strings.Split(text, "\r\n")
+	for i, line := range lines {
+		name, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(name)) {
+		case "authorization", "proxy-authorization":
+			lines[i] = name + ": <redacted>"
+			continue
+		}
+		_ = value
+		for _, user := range privateUsers {
+			user = strings.TrimSpace(user)
+			if len(user) > 4 {
+				lines[i] = strings.ReplaceAll(lines[i], user, "…"+user[len(user)-4:])
+			}
+		}
+	}
+	return strings.Join(lines, " | ")
 }
 
 func (session *Session) refreshLoop() {
@@ -1463,7 +1628,7 @@ func (session *Session) refreshOnce(ctx context.Context) error {
 	case !session.evidence.Registered:
 		return vowifi.ErrIMSNotRegistered
 	}
-	response, err := session.register(ctx, int(session.provider.config.RegistrationExpiry/time.Second))
+	response, err := session.register(ctx, session.registrationExpirySeconds())
 	if err != nil {
 		session.failRefresh()
 		return fmt.Errorf("ims: refresh registration: %w", err)
@@ -1607,6 +1772,10 @@ func (session *Session) smsCapabilityReady() bool {
 	return false
 }
 
+// deregisterAllOverride forces "Contact: *" de-registration regardless of the
+// carrier profile. Tests use it; operators use the profile option.
+var deregisterAllOverride = false
+
 func (session *Session) Close(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1626,11 +1795,32 @@ func (session *Session) Close(ctx context.Context) error {
 	}
 	var unregisterErr error
 	if session.evidence.Registered && ctx.Err() == nil {
+		session.deregisterAll = deregisterAllOverride ||
+			vowifi.ResolveCarrierProfile(session.request.Identity).IMSRegisterOptions.DeregisterAllOnClose
 		response, err := session.register(ctx, 0)
 		if err != nil {
 			unregisterErr = err
-		} else if response.StatusCode != 200 {
-			unregisterErr = fmt.Errorf("ims: SIP deregistration returned %d", response.StatusCode)
+		} else if response.StatusCode == 200 {
+			session.provider.config.Logger.Info("IMS de-registration accepted",
+				"device_id", session.request.DeviceID,
+				"all_bindings", session.deregisterAll,
+				"remaining_bindings", len(splitHeaderValues(response.values("Contact"))))
+		} else {
+			// Keep the registrar's reason phrase and Reason/Warning headers: a
+			// rejected de-registration leaves the old Contact binding alive on
+			// the S-CSCF until it expires, and MT SMS may be routed into it.
+			unregisterErr = registrationRejectionError(response, "de-registration")
+		}
+		if unregisterErr != nil {
+			status := 0
+			if response != nil {
+				status = response.StatusCode
+			}
+			session.provider.config.Logger.Warn("IMS de-registration rejected",
+				"device_id", session.request.DeviceID,
+				"sip_status", status,
+				"error", unregisterErr,
+				"request_headers", redactSIPRequestForLog(session.lastRegister, session.identity.user, session.identity.private))
 		}
 	}
 	session.closed = true

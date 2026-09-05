@@ -66,3 +66,43 @@ test("accepts state updates only from the latest profile request", () => {
   guard.invalidate();
   assert.equal(guard.isCurrent(second), false);
 });
+
+const {
+  toggleRotationProfile,
+  moveRotationProfile,
+  estimateRotationCycleSeconds,
+} = await import(moduleURL);
+
+const a = { iccid: "8901240527185779025", aidHex: "A0", label: "+18602628552 · 8901240527185779025" };
+const b = { iccid: "8901240527185778332", aidHex: "A0", label: "+18609847994 · 8901240527185778332" };
+const c = { iccid: "8901240527185778316", aidHex: "A0", label: "+19592010936 · 8901240527185778316" };
+
+test("toggling appends a profile in click order and removes it again", () => {
+  const once = toggleRotationProfile([], b);
+  const twice = toggleRotationProfile(once, a);
+  assert.deepEqual(twice.map((p) => p.iccid), [b.iccid, a.iccid]);
+  assert.deepEqual(toggleRotationProfile(twice, b).map((p) => p.iccid), [a.iccid]);
+});
+
+test("moving a profile reorders the rotation and clamps at the ends", () => {
+  const list = [a, b, c];
+  assert.deepEqual(moveRotationProfile(list, c.iccid, -1).map((p) => p.iccid), [a.iccid, c.iccid, b.iccid]);
+  assert.deepEqual(moveRotationProfile(list, a.iccid, -1).map((p) => p.iccid), [a.iccid, b.iccid, c.iccid]);
+  assert.deepEqual(moveRotationProfile(list, c.iccid, 1).map((p) => p.iccid), [a.iccid, b.iccid, c.iccid]);
+  assert.deepEqual(moveRotationProfile(list, "missing", 1).map((p) => p.iccid), [a.iccid, b.iccid, c.iccid]);
+});
+
+test("cycle estimate counts one switch plus one dwell per profile", () => {
+  assert.equal(estimateRotationCycleSeconds(3, 30), 3 * (10 + 30));
+  assert.equal(estimateRotationCycleSeconds(0, 30), 0);
+});
+
+const { splitLocalDateTime } = await import(moduleURL);
+
+test("splitLocalDateTime maps an instant to local date/time inputs and treats the zero time as unset", () => {
+  const instant = new Date(2030, 0, 2, 9, 30); // local wall clock
+  assert.deepEqual(splitLocalDateTime(instant.toISOString()), { date: "2030-01-02", time: "09:30" });
+  assert.deepEqual(splitLocalDateTime("0001-01-01T00:00:00Z"), { date: "", time: "" });
+  assert.deepEqual(splitLocalDateTime(""), { date: "", time: "" });
+  assert.deepEqual(splitLocalDateTime("garbage"), { date: "", time: "" });
+});

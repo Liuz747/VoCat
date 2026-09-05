@@ -218,10 +218,13 @@ func (manager *Manager) reconcileEC20MBNAfterProfileSwitch(ctx context.Context, 
 
 	manager.lockESIM()
 	defer manager.unlockESIM()
+	timer := newProfileSwitchTimer(manager.logger, id, expectedICCID, nil)
 	if err := manager.waitForESIMRecovery(ctx, id); err != nil {
 		return err
 	}
+	timer.stage("mbn_wait_recovery")
 	snapshot, err := manager.Refresh(ctx, id)
+	timer.stage("mbn_snapshot_refresh")
 	if err != nil {
 		return fmt.Errorf("read new profile identity before MBN validation: %w", err)
 	}
@@ -240,6 +243,10 @@ func (manager *Manager) reconcileEC20MBNAfterProfileSwitch(ctx context.Context, 
 	commandContext, cancelCommand := context.WithTimeout(ctx, manager.longTimeout)
 	changed, previous, err := reconcileMBNSelection(commandContext, client, hplmn)
 	cancelCommand()
+	timer.stage("mbn_selection_check")
+	if manager.logger != nil {
+		manager.logger.Info("EC20 MBN check after eSIM profile switch", "device_id", id, "hplmn", hplmn, "current_mbn", previous, "changed", changed, "error", err)
+	}
 	if err != nil || !changed {
 		state.opMu.Unlock()
 		if err != nil {

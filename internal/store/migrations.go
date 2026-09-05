@@ -425,6 +425,85 @@ func migrationStatements(version int) []string {
 			`CREATE INDEX IF NOT EXISTS sms_messages_subscription_thread_idx
 				ON sms_messages(modem_imei, iccid, imsi, peer, message_time DESC, id DESC)`,
 		}
+	case 24:
+		// Profile rotation tasks need a new task_type value and a minute-level
+		// interval. SQLite cannot alter a CHECK constraint, so both automatic-task
+		// tables are rebuilt. Migrations run inside a transaction with
+		// foreign_keys=ON, so the child run table is rebuilt first and the old
+		// parent is only dropped once nothing references it, preserving history.
+		return []string{
+			`CREATE TABLE automatic_tasks_v24 (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				name TEXT NOT NULL,
+				enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+				device_id TEXT NOT NULL,
+				profile_iccid TEXT NOT NULL,
+				profile_aid TEXT NOT NULL DEFAULT '',
+				task_type TEXT NOT NULL CHECK (task_type IN ('sms', 'call', 'public_ip', 'profile_rotation')),
+				environment TEXT NOT NULL CHECK (environment IN ('vowifi', 'cellular')),
+				interval_days INTEGER NOT NULL CHECK (interval_days BETWEEN 1 AND 365),
+				interval_seconds INTEGER NOT NULL DEFAULT 0 CHECK (interval_seconds BETWEEN 0 AND 86400),
+				start_date TEXT NOT NULL,
+				run_time TEXT NOT NULL,
+				timezone TEXT NOT NULL DEFAULT 'Local',
+				payload_json TEXT NOT NULL DEFAULT '{}',
+				retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count BETWEEN 0 AND 10),
+				notify INTEGER NOT NULL DEFAULT 0 CHECK (notify IN (0, 1)),
+				next_run_at INTEGER NOT NULL,
+				last_run_at INTEGER NOT NULL DEFAULT 0,
+				last_status TEXT NOT NULL DEFAULT '',
+				last_error TEXT NOT NULL DEFAULT '',
+				created_at INTEGER NOT NULL,
+				updated_at INTEGER NOT NULL,
+				FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+			)`,
+			`INSERT INTO automatic_tasks_v24 (
+				id, name, enabled, device_id, profile_iccid, profile_aid, task_type,
+				environment, interval_days, start_date, run_time, timezone, payload_json,
+				retry_count, notify, next_run_at, last_run_at, last_status, last_error,
+				created_at, updated_at
+			) SELECT
+				id, name, enabled, device_id, profile_iccid, profile_aid, task_type,
+				environment, interval_days, start_date, run_time, timezone, payload_json,
+				retry_count, notify, next_run_at, last_run_at, last_status, last_error,
+				created_at, updated_at
+			FROM automatic_tasks`,
+			`CREATE TABLE automatic_task_runs_v24 (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				task_id INTEGER NOT NULL,
+				device_id TEXT NOT NULL,
+				scheduled_at INTEGER NOT NULL,
+				started_at INTEGER NOT NULL DEFAULT 0,
+				finished_at INTEGER NOT NULL DEFAULT 0,
+				status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'success', 'failed')),
+				attempts INTEGER NOT NULL DEFAULT 0,
+				output TEXT NOT NULL DEFAULT '',
+				error TEXT NOT NULL DEFAULT '',
+				created_at INTEGER NOT NULL,
+				updated_at INTEGER NOT NULL,
+				FOREIGN KEY (task_id) REFERENCES automatic_tasks_v24(id) ON DELETE CASCADE
+			)`,
+			`INSERT INTO automatic_task_runs_v24 (
+				id, task_id, device_id, scheduled_at, started_at, finished_at, status,
+				attempts, output, error, created_at, updated_at
+			) SELECT
+				id, task_id, device_id, scheduled_at, started_at, finished_at, status,
+				attempts, output, error, created_at, updated_at
+			FROM automatic_task_runs`,
+			`DROP TABLE automatic_task_runs`,
+			`DROP TABLE automatic_tasks`,
+			`ALTER TABLE automatic_tasks_v24 RENAME TO automatic_tasks`,
+			`ALTER TABLE automatic_task_runs_v24 RENAME TO automatic_task_runs`,
+			`CREATE INDEX IF NOT EXISTS automatic_tasks_due_idx ON automatic_tasks(enabled, next_run_at, id)`,
+			`CREATE INDEX IF NOT EXISTS automatic_tasks_device_idx ON automatic_tasks(device_id, next_run_at, id)`,
+			`CREATE INDEX IF NOT EXISTS automatic_task_runs_task_idx ON automatic_task_runs(task_id, id DESC)`,
+			`CREATE INDEX IF NOT EXISTS automatic_task_runs_status_idx ON automatic_task_runs(status, id)`,
+		}
+	case 25:
+		return []string{
+			// One-off end instant for rotation tasks (0 = no end).
+			`ALTER TABLE automatic_tasks ADD COLUMN end_at INTEGER NOT NULL DEFAULT 0`,
+		}
 	default:
 		return nil
 	}

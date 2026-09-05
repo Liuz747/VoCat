@@ -4,6 +4,8 @@ import type { DeviceDetail } from "./types";
 import { useI18n } from "../../lib/i18n";
 import { deviceTypeImage } from "../../lib/deviceTypes";
 import { isVoWiFiInUse } from "./shared";
+import { Link } from "react-router-dom";
+import { rotationSequenceText, type RotationTaskSummary } from "./types";
 
 export interface DeviceDetailHeaderProps {
   device: DeviceDetail;
@@ -19,6 +21,7 @@ export interface DeviceDetailHeaderProps {
   onOpenSms: () => void;
 	wifiCallingOnly?: boolean;
 	modemControlOnly?: boolean;
+	rotationTask?: RotationTaskSummary;
 }
 
 export function DeviceDetailHeader(props: DeviceDetailHeaderProps) {
@@ -38,6 +41,11 @@ export function DeviceDetailHeader(props: DeviceDetailHeaderProps) {
                   {device.id}
                 </span>
               </div>
+              {props.rotationTask ? (
+                <div className="mt-0.5 truncate text-xs text-sky-600 dark:text-sky-300" title={t("此设备的 eSIM Profile 会被自动任务周期性切换，手动切换或改 VoWiFi 会在下一次轮询时被覆盖。")}>
+                  {t("轮询中")} · {props.rotationTask.name} · {rotationSequenceText(props.rotationTask)} · {t("停留 {seconds} 秒").replace("{seconds}", String(props.rotationTask.intervalSeconds))} · <Link to="/automatic-tasks" className="underline">{t("去自动任务页管理")}</Link>
+                </div>
+              ) : null}
             </div>
           </div>
         </div>

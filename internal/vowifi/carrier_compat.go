@@ -54,16 +54,27 @@ type CarrierProfile struct {
 // IMSRegisterOptions carries carrier-specific SIP REGISTER header values.
 // Pointer fields distinguish "use default" (nil) from "explicitly omit" ("").
 type IMSRegisterOptions struct {
-	ContactFormat       string
-	ExpirySeconds       int
-	ContactExtraTags    []string
-	SupportedHeader     *string
-	AllowHeader         *string
-	PPreferredIdentity  bool
-	PVisitedNetworkID   string
-	PAccessNetworkInfo  *string
-	CellularNetworkInfo string
-	AcceptContactTags   []string
+	ContactFormat string
+	ExpirySeconds int
+	// OutboundRegID > 0 adds ";reg-id=N" to the Contact and "outbound" to
+	// Supported (RFC 5626). Registrars that implement outbound then key the
+	// binding by (instance-id, reg-id) and REPLACE it on re-registration, so a
+	// restart with a new tunnel address does not leave the previous Contact
+	// binding alive until it expires. Registrars without outbound ignore both.
+	OutboundRegID int
+	// DeregisterAllOnClose makes Close() send "Contact: *" + "Expires: 0",
+	// removing every binding of the IMPU (RFC 3261 §10.2.2) instead of only
+	// this session\'s Contact. Use on hosts that are the only IMS device for
+	// the subscription: it also purges bindings orphaned by earlier crashes.
+	DeregisterAllOnClose bool
+	ContactExtraTags     []string
+	SupportedHeader      *string
+	AllowHeader          *string
+	PPreferredIdentity   bool
+	PVisitedNetworkID    string
+	PAccessNetworkInfo   *string
+	CellularNetworkInfo  string
+	AcceptContactTags    []string
 }
 
 const (
@@ -130,16 +141,18 @@ type carrierProfileIMS struct {
 }
 
 type carrierProfileRegisterOptions struct {
-	ContactFormat       string   `json:"contact_format,omitempty"`
-	ExpirySeconds       int      `json:"expiry_seconds,omitempty"`
-	ContactExtraTags    []string `json:"contact_extra_tags,omitempty"`
-	SupportedHeader     *string  `json:"supported_header,omitempty"`
-	AllowHeader         *string  `json:"allow_header,omitempty"`
-	PPreferredIdentity  bool     `json:"p_preferred_identity,omitempty"`
-	PVisitedNetworkID   string   `json:"p_visited_network_id,omitempty"`
-	PAccessNetworkInfo  *string  `json:"p_access_network_info,omitempty"`
-	CellularNetworkInfo string   `json:"cellular_network_info,omitempty"`
-	AcceptContactTags   []string `json:"accept_contact_tags,omitempty"`
+	ContactFormat        string   `json:"contact_format,omitempty"`
+	ExpirySeconds        int      `json:"expiry_seconds,omitempty"`
+	OutboundRegID        int      `json:"outbound_reg_id,omitempty"`
+	DeregisterAllOnClose bool     `json:"deregister_all_on_close,omitempty"`
+	ContactExtraTags     []string `json:"contact_extra_tags,omitempty"`
+	SupportedHeader      *string  `json:"supported_header,omitempty"`
+	AllowHeader          *string  `json:"allow_header,omitempty"`
+	PPreferredIdentity   bool     `json:"p_preferred_identity,omitempty"`
+	PVisitedNetworkID    string   `json:"p_visited_network_id,omitempty"`
+	PAccessNetworkInfo   *string  `json:"p_access_network_info,omitempty"`
+	CellularNetworkInfo  string   `json:"cellular_network_info,omitempty"`
+	AcceptContactTags    []string `json:"accept_contact_tags,omitempty"`
 }
 
 //go:embed carrier_profiles.json
@@ -341,6 +354,9 @@ func validCarrierProfileRule(rule carrierProfileRule) bool {
 	}
 	if rule.IMS.RegisterOptions.ExpirySeconds != 0 &&
 		(rule.IMS.RegisterOptions.ExpirySeconds < 60 || rule.IMS.RegisterOptions.ExpirySeconds > 86400) {
+		return false
+	}
+	if rule.IMS.RegisterOptions.OutboundRegID < 0 || rule.IMS.RegisterOptions.OutboundRegID > 65535 {
 		return false
 	}
 	if format := strings.ToLower(strings.TrimSpace(rule.IMS.RegisterOptions.ContactFormat)); format != "" &&
@@ -623,6 +639,12 @@ func applyRegisterOptions(base IMSRegisterOptions, rule carrierProfileRegisterOp
 	}
 	if rule.ExpirySeconds != 0 {
 		base.ExpirySeconds = rule.ExpirySeconds
+	}
+	if rule.OutboundRegID > 0 {
+		base.OutboundRegID = rule.OutboundRegID
+	}
+	if rule.DeregisterAllOnClose {
+		base.DeregisterAllOnClose = true
 	}
 	if len(rule.ContactExtraTags) > 0 {
 		base.ContactExtraTags = append([]string(nil), rule.ContactExtraTags...)

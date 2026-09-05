@@ -2,6 +2,7 @@ import type { DeviceListItem } from "../../types";
 import { Input, Select, Tag, ListSkeleton, EmptyState } from "../ui";
 import { isDeviceOnline, isRegistered, isVoWiFiInUse, lifecycleLabel } from "./shared";
 import { DeviceListItemCard } from "./DeviceListItemCard";
+import type { RotationTaskSummary } from "./types";
 import { tl, useI18n } from "../../lib/i18n";
 
 export type StatusFilter = "all" | "online" | "offline";
@@ -9,6 +10,7 @@ export type SortKey = "name" | "signal";
 export type SortDir = "asc" | "desc";
 
 export interface DeviceListPanelProps {
+  rotationDeviceIds?: Map<string, RotationTaskSummary>;
   loading: boolean;
   query: string;
   statusFilter: StatusFilter;
@@ -102,6 +104,7 @@ export function DeviceListPanel(props: DeviceListPanelProps) {
                 device={d}
                 selected={selectedId === d.id}
                 statusText={statusLine(d)}
+                rotationTask={props.rotationDeviceIds?.get(d.id)}
                 onSelect={props.onSelectDevice}
               />
             ))}

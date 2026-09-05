@@ -1131,3 +1131,56 @@ func TestHandleCellularDataRejectsDisableWhileExportProxyActive(t *testing.T) {
 		t.Fatal("roaming data was not turned off after the export proxy was disabled")
 	}
 }
+
+// Regression for the phantom-device bug seen on the ok-MINI-1900A host on
+// 2026-09-04: every EC20 in the batch reports the factory serial number
+// 0123456789ABCDEF, so the stored USB path is the only stable identity. When a
+// module was unplugged and another module later received the same ttyUSB /
+// cdc-wdm numbers, the stale record claimed the new module through the
+// allocation-order fallbacks and one physical modem showed up twice.
+func TestPhysicalMatchesConfigRejectsReusedControlNodesOnDifferentUSBPath(t *testing.T) {
+	config := store.Device{
+		ID:            "usb-2c7c-0123456789abcdef-1-1-3-4-1",
+		USBPath:       "/sys/bus/usb/devices/1-1.3.4.1",
+		ATPort:        "/dev/ttyUSB14",
+		ControlDevice: "/dev/cdc-wdm4",
+	}
+	entry := device.Device{
+		ID: "usb-2c7c-0123456789abcdef-1-1-3-4-2",
+		Candidate: modem.Candidate{
+			USBPath:    "/sys/bus/usb/devices/1-1.3.4.2",
+			ATPort:     modem.Port{Path: "/dev/ttyUSB14"},
+			QMIControl: "/dev/cdc-wdm4",
+		},
+		Discovered: true,
+	}
+	if physicalMatchesConfig(entry, config) {
+		t.Fatal("a modem on a different USB path matched through recycled ttyUSB/cdc-wdm numbers")
+	}
+
+	samePath := entry
+	samePath.Candidate.USBPath = config.USBPath
+	samePath.Candidate.ATPort = modem.Port{Path: "/dev/ttyUSB99"}
+	samePath.Candidate.QMIControl = "/dev/cdc-wdm9"
+	if !physicalMatchesConfig(samePath, config) {
+		t.Fatal("same USB path should still match after Linux renumbered the control nodes")
+	}
+}
+
+func TestFindDiscoveredDeviceRejectsReusedControlNodesOnDifferentUSBPath(t *testing.T) {
+	devices := []device.Device{
+		{ID: "other", Candidate: modem.Candidate{
+			USBPath:    "/sys/bus/usb/devices/1-1.3.4.2",
+			ATPort:     modem.Port{Path: "/dev/ttyUSB14"},
+			QMIControl: "/dev/cdc-wdm4",
+		}},
+	}
+	selected := findDiscoveredDevice(devices, deviceConfigPayload{
+		USBPath:       "/sys/bus/usb/devices/1-1.3.4.1",
+		ATPort:        "/dev/ttyUSB14",
+		ControlDevice: "/dev/cdc-wdm4",
+	})
+	if selected != nil {
+		t.Fatalf("selected = %#v, want nil because the requested USB path is not present", selected)
+	}
+}

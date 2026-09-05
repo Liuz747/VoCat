@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AddRegular,
+  ArrowDownRegular,
+  ArrowUpRegular,
   DeleteRegular,
   EditRegular,
   PlayRegular,
@@ -26,16 +28,27 @@ import { useI18n } from "../lib/i18n";
 import {
   buildAutomaticTaskProfileOptions,
   createAutomaticTaskProfileRequestGuard,
+  estimateRotationCycleSeconds,
+  moveRotationProfile,
   selectAutomaticTaskProfileOption,
+  splitLocalDateTime,
+  toggleRotationProfile,
 } from "../lib/automaticTaskProfiles";
 
-type TaskType = "sms" | "call" | "public_ip";
+type TaskType = "sms" | "call" | "public_ip" | "profile_rotation";
 type TaskEnvironment = "vowifi" | "cellular";
+
+interface RotationProfilePayload {
+  iccid: string;
+  aid?: string;
+  name?: string;
+}
 
 interface AutomaticTaskPayload {
   phone?: string;
   message?: string;
   durationSeconds?: number;
+  profiles?: RotationProfilePayload[];
 }
 
 interface AutomaticTask {
@@ -48,6 +61,8 @@ interface AutomaticTask {
   taskType: TaskType;
   environment: TaskEnvironment;
   intervalDays: number;
+  intervalSeconds: number;
+  endAt?: string;
   startDate: string;
   runTime: string;
   payload: AutomaticTaskPayload;
@@ -82,8 +97,14 @@ interface TaskForm {
   taskType: TaskType;
   environment: TaskEnvironment;
   intervalDays: number;
+  // Profile rotation: seconds a profile stays online after its tunnel is ready.
+  dwellSeconds: number;
+  rotationProfiles: ProfileOption[];
   startDate: string;
   runTime: string;
+  // Profile rotation only: optional one-off end; both empty = no end.
+  endDate: string;
+  endTime: string;
   retryCount: number;
   notify: boolean;
   phone: string;
@@ -119,8 +140,12 @@ function emptyForm(deviceId = ""): TaskForm {
     taskType: "sms",
     environment: "vowifi",
     intervalDays: 1,
+    dwellSeconds: 60,
+    rotationProfiles: [],
     startDate: localDate(),
     runTime: localTime(),
+    endDate: "",
+    endTime: "",
     retryCount: 1,
     notify: true,
     phone: "",
@@ -137,6 +162,26 @@ function formatDateTime(value?: string) {
 
 function currentDeviceICCID(device?: DeviceListItem) {
   return String(device?.modem?.iccid || device?.vowifiRuntime?.iccid || "").trim();
+}
+
+function rotationProfilesFromPayload(payload?: AutomaticTaskPayload): ProfileOption[] {
+  return (payload?.profiles || []).map((profile) => ({
+    iccid: profile.iccid,
+    aidHex: profile.aid || "",
+    label: `${profile.name || "Profile"} · ${profile.iccid}`,
+  }));
+}
+
+function shortProfileName(option: { label: string; iccid: string }) {
+  const name = option.label.split(" · ")[0]?.trim();
+  return name && name !== "Profile" ? name : `…${option.iccid.slice(-4)}`;
+}
+
+function formatDuration(seconds: number) {
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return rest ? `${minutes} min ${rest} s` : `${minutes} min`;
 }
 
 const fieldLabel = "mb-1.5 block text-sm font-semibold text-gray-700 dark:text-gray-200";
@@ -265,7 +310,11 @@ export default function AutomaticTasksPage() {
     setForm((current) => {
       if (current.deviceId !== deviceId) return current;
       const selected = selectAutomaticTaskProfileOption(options, requestedICCID);
-      return selected ? { ...current, profileIccid: selected.iccid, profileAid: selected.aidHex } : current;
+      // Keep the saved rotation order but refresh labels/AIDs from the live inventory.
+      const rotationProfiles = current.rotationProfiles.map((entry) =>
+        options.find((option) => option.iccid.trim() === entry.iccid.trim()) || entry);
+      const next = { ...current, rotationProfiles };
+      return selected ? { ...next, profileIccid: selected.iccid, profileAid: selected.aidHex } : next;
     });
     setProfileLoading(false);
   }, [t]);
@@ -292,8 +341,12 @@ export default function AutomaticTasksPage() {
       taskType: task.taskType,
       environment: task.environment,
       intervalDays: task.intervalDays,
+      dwellSeconds: task.intervalSeconds || 60,
+      rotationProfiles: rotationProfilesFromPayload(task.payload),
       startDate: task.startDate,
       runTime: task.runTime,
+      endDate: splitLocalDateTime(task.endAt || "").date,
+      endTime: splitLocalDateTime(task.endAt || "").time,
       retryCount: task.retryCount,
       notify: task.notify,
       phone: task.payload?.phone || "",
@@ -315,7 +368,7 @@ export default function AutomaticTasksPage() {
 	const selectedDevice = devices.find((device) => device.id === deviceId);
 	const reader = selectedDevice?.deviceType === "usb_sim_reader";
     setForm((current) => ({
-	  ...current, deviceId, profileIccid: "", profileAid: "",
+	  ...current, deviceId, profileIccid: "", profileAid: "", rotationProfiles: [],
 	  taskType: reader && current.taskType === "public_ip" ? "sms" : current.taskType,
 	  environment: reader || !advancedTasksAvailable ? "vowifi" : current.environment,
 	}));
@@ -332,19 +385,32 @@ export default function AutomaticTasksPage() {
     setForm((current) => ({
       ...current,
       taskType,
-      environment: taskType === "public_ip" ? "cellular" : current.environment,
+      environment: taskType === "public_ip" ? "cellular" : taskType === "profile_rotation" ? "vowifi" : current.environment,
     }));
+  }
+
+  function toggleRotation(option: ProfileOption) {
+    setForm((current) => ({ ...current, rotationProfiles: toggleRotationProfile(current.rotationProfiles, option) }));
+  }
+
+  function moveRotation(iccid: string, direction: -1 | 1) {
+    setForm((current) => ({ ...current, rotationProfiles: moveRotationProfile(current.rotationProfiles, iccid, direction) }));
   }
 
   async function save() {
     if (!form.name.trim()) return message.warning(t("请输入任务名称"));
     if (!form.deviceId) return message.warning(t("请选择设备"));
-    if (!form.profileIccid) return message.warning(t("请选择 SIM 卡或 eSIM Profile"));
+    const rotation = form.taskType === "profile_rotation";
+    if (rotation && form.rotationProfiles.length < 2) return message.warning(t("轮询至少需要勾选 2 个 eSIM Profile"));
+    if (rotation && (form.dwellSeconds < 5 || form.dwellSeconds > 86400)) return message.warning(t("停留时间需在 5–86400 秒之间"));
+    if (rotation && (!!form.endDate !== !!form.endTime)) return message.warning(t("结束日期和结束时间需同时填写，或都留空"));
+    if (rotation && form.endDate && new Date(`${form.endDate}T${form.endTime}`) <= new Date(`${form.startDate}T${form.runTime}`)) return message.warning(t("结束时间必须晚于开始时间"));
+    if (!rotation && !form.profileIccid) return message.warning(t("请选择 SIM 卡或 eSIM Profile"));
 	if (deviceByID.get(form.deviceId)?.deviceType === "usb_sim_reader" && (form.environment !== "vowifi" || form.taskType === "public_ip")) {
 	  return message.warning(t("USB SIM读卡器仅支持VoWiFi短信和通话任务"));
 	}
 	if (!advancedTasksAvailable && (form.environment !== "vowifi" || form.taskType === "public_ip")) return;
-    if (form.taskType !== "public_ip" && !form.phone.trim()) return message.warning(t("请输入号码"));
+    if (!rotation && form.taskType !== "public_ip" && !form.phone.trim()) return message.warning(t("请输入号码"));
     if (form.taskType === "sms" && !form.message.trim()) return message.warning(t("请输入短信内容"));
     setSaving(true);
     try {
@@ -352,21 +418,26 @@ export default function AutomaticTasksPage() {
         name: form.name,
         enabled: form.enabled,
         deviceId: form.deviceId,
-        profileIccid: form.profileIccid,
-        profileAid: form.profileAid,
+        profileIccid: rotation ? form.rotationProfiles[0].iccid : form.profileIccid,
+        profileAid: rotation ? form.rotationProfiles[0].aidHex : form.profileAid,
         taskType: form.taskType,
         environment: form.environment,
         intervalDays: Number(form.intervalDays),
+        intervalSeconds: rotation ? Number(form.dwellSeconds) : 0,
+        endDate: rotation ? form.endDate : "",
+        endTime: rotation ? form.endTime : "",
         startDate: form.startDate,
         runTime: form.runTime,
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
         retryCount: Number(form.retryCount),
         notify: form.notify,
-        payload: {
-          phone: form.phone,
-          message: form.message,
-          durationSeconds: Number(form.durationSeconds),
-        },
+        payload: rotation
+          ? { profiles: form.rotationProfiles.map((profile) => ({ iccid: profile.iccid, aid: profile.aidHex, name: shortProfileName(profile) })) }
+          : {
+            phone: form.phone,
+            message: form.message,
+            durationSeconds: Number(form.durationSeconds),
+          },
       };
       await api(form.id ? `/automatic-tasks/${form.id}` : "/automatic-tasks", {
         method: form.id ? "PUT" : "POST",
@@ -423,12 +494,30 @@ export default function AutomaticTasksPage() {
     }
   }
 
-  const taskTypeLabel = (value: TaskType) => ({ sms: t("发送短信"), call: t("拨打电话并自动挂断"), public_ip: t("获取漫游公网 IP") })[value];
+  const taskTypeLabel = (value: TaskType) => ({ sms: t("发送短信"), call: t("拨打电话并自动挂断"), public_ip: t("获取漫游公网 IP"), profile_rotation: t("轮询切换 eSIM Profile") })[value];
+  const isRotation = form.taskType === "profile_rotation";
+  const rotationCycleSeconds = estimateRotationCycleSeconds(form.rotationProfiles.length, Number(form.dwellSeconds) || 0);
+  const rotationSequence = (task: AutomaticTask) => {
+    const entries = rotationProfilesFromPayload(task.payload);
+    if (!entries.length) return null;
+    const active = currentDeviceICCID(deviceByID.get(task.deviceId));
+    return (
+      <div className="mt-1 flex flex-wrap items-center gap-1 text-xs">
+        {entries.map((entry, index) => (
+          <span key={entry.iccid} className="flex items-center gap-1">
+            {index > 0 ? <span className="text-gray-300">→</span> : null}
+            <span className={entry.iccid === active ? "rounded bg-emerald-100 px-1.5 py-0.5 font-semibold text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300" : "text-gray-500"} title={entry.iccid}>{shortProfileName(entry)}</span>
+          </span>
+        ))}
+      </div>
+    );
+  };
   const environmentLabel = (value: TaskEnvironment) => value === "vowifi" ? "VoWiFi" : t("基站直连");
 	const selectedTaskDeviceIsReader = deviceByID.get(form.deviceId)?.deviceType === "usb_sim_reader";
 	const taskTypeOptions = [
 	  { value: "sms", label: t("发送短信") },
 	  { value: "call", label: t("拨打电话并自动挂断") },
+	  ...(!selectedTaskDeviceIsReader ? [{ value: "profile_rotation", label: t("轮询切换 eSIM Profile") }] : []),
 	  ...(advancedTasksAvailable && !selectedTaskDeviceIsReader ? [{ value: "public_ip", label: t("开启漫游流量并获取一次公网 IP") }] : []),
 	];
 	const environmentOptions = selectedTaskDeviceIsReader || !advancedTasksAvailable
@@ -469,11 +558,16 @@ export default function AutomaticTasksPage() {
                   </td>
                   <td className="px-4 py-3">
                     <div>{deviceByID.get(task.deviceId)?.name || task.deviceId}</div>
-                    <div className="mt-1 font-mono text-xs text-gray-400">…{task.profileIccid.slice(-8)}</div>
+                    {task.taskType === "profile_rotation" ? rotationSequence(task) : <div className="mt-1 font-mono text-xs text-gray-400">…{task.profileIccid.slice(-8)}</div>}
                   </td>
                   <td className="px-4 py-3">{taskTypeLabel(task.taskType)}</td>
                   <td className="px-4 py-3"><Tag type={task.environment === "vowifi" ? "primary" : "warning"}>{environmentLabel(task.environment)}</Tag></td>
-                  <td className="px-4 py-3">{t("每 {days} 天").replace("{days}", String(task.intervalDays))} · {task.runTime}</td>
+                  <td className="px-4 py-3">{task.taskType === "profile_rotation"
+                    ? <>
+                        <div>{t("连续轮询")} · {t("停留 {seconds} 秒").replace("{seconds}", String(task.intervalSeconds))}</div>
+                        <div className="mt-1 text-xs text-gray-400">{task.endAt && !task.endAt.startsWith("0001-") ? t("至 {time} 自动停用").replace("{time}", formatDateTime(task.endAt)) : t("不设结束时间")}</div>
+                      </>
+                    : `${t("每 {days} 天").replace("{days}", String(task.intervalDays))} · ${task.runTime}`}</td>
                   <td className="px-4 py-3 text-xs">{formatDateTime(task.nextRunAt)}</td>
                   <td className="px-4 py-3">
                     {task.lastStatus ? <Tag type={task.lastStatus === "success" ? "success" : "danger"}>{task.lastStatus === "success" ? t("成功") : t("失败")}</Tag> : <span className="text-gray-400">--</span>}
@@ -531,19 +625,52 @@ export default function AutomaticTasksPage() {
         <div className="grid gap-4 md:grid-cols-2">
           <div className="md:col-span-2"><label className={fieldLabel}>{t("任务名称")}</label><Input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder={t("例如：每日短信保活")} /></div>
           <div><label className={fieldLabel}>{t("设备")}</label><Select value={form.deviceId} onChange={chooseDevice} options={devices.map((device) => ({ value: device.id, label: `${device.name || device.id} (${device.id})` }))} /></div>
-          <div><label className={fieldLabel}>{t("SIM / Profile")}</label><Select value={form.profileIccid} onChange={chooseProfile} disabled={profileLoading || !form.deviceId} placeholder={profileLoading ? t("读取 Profile 中...") : t("请选择 SIM / Profile")} options={profiles.map((profile) => ({ value: profile.iccid, label: profile.label }))} /></div>
           <div><label className={fieldLabel}>{t("任务类型")}</label><Select value={form.taskType} onChange={(value) => chooseTaskType(value as TaskType)} options={taskTypeOptions} /></div>
-          <div><label className={fieldLabel}>{t("执行环境")}</label><Select value={form.environment} onChange={(value) => setForm({ ...form, environment: value as TaskEnvironment })} disabled={form.taskType === "public_ip" || selectedTaskDeviceIsReader} options={environmentOptions} /></div>
+          {!isRotation ? <div><label className={fieldLabel}>{t("SIM / Profile")}</label><Select value={form.profileIccid} onChange={chooseProfile} disabled={profileLoading || !form.deviceId} placeholder={profileLoading ? t("读取 Profile 中...") : t("请选择 SIM / Profile")} options={profiles.map((profile) => ({ value: profile.iccid, label: profile.label }))} /></div> : null}
+          {isRotation ? (
+            <div className="md:col-span-2">
+              <label className={fieldLabel}>{t("轮询的 eSIM Profile（勾选顺序即轮询顺序）")}</label>
+              {profileLoading ? <div className="text-sm text-gray-400">{t("读取 Profile 中...")}</div> : null}
+              {!profileLoading && !profiles.length ? <div className="text-sm text-gray-400">{t("该设备没有可用的 eSIM Profile")}</div> : null}
+              <div className="divide-y divide-gray-100 rounded-lg border border-gray-200 dark:divide-white/10 dark:border-white/10">
+                {profiles.map((profile) => {
+                  const position = form.rotationProfiles.findIndex((entry) => entry.iccid === profile.iccid);
+                  const checked = position >= 0;
+                  return (
+                    <label key={profile.iccid} className="flex cursor-pointer items-center gap-3 px-3 py-2 text-sm">
+                      <input type="checkbox" className="h-4 w-4 accent-sky-600" checked={checked} onChange={() => toggleRotation(profile)} />
+                      <span className={`w-6 text-center font-mono text-xs ${checked ? "text-sky-600 dark:text-sky-300" : "text-gray-300"}`}>{checked ? position + 1 : "–"}</span>
+                      <span className="flex-1 truncate" title={profile.iccid}>{profile.label}</span>
+                      <Button size="small" plain icon={<ArrowUpRegular />} disabled={!checked || position === 0} onClick={(event) => { event.preventDefault(); moveRotation(profile.iccid, -1); }} />
+                      <Button size="small" plain icon={<ArrowDownRegular />} disabled={!checked || position === form.rotationProfiles.length - 1} onClick={(event) => { event.preventDefault(); moveRotation(profile.iccid, 1); }} />
+                    </label>
+                  );
+                })}
+              </div>
+              <div className="mt-2 text-xs text-gray-400">
+                {t("执行时读取当前启用的 Profile，切换到列表中的下一个，等 VoWiFi 隧道注册完成（IMS + 短信就绪）即算完成，不发短信、不打电话；隧道就绪后运营商会投递积压的短信。")}
+              </div>
+            </div>
+          ) : null}
+          <div><label className={fieldLabel}>{t("执行环境")}</label><Select value={form.environment} onChange={(value) => setForm({ ...form, environment: value as TaskEnvironment })} disabled={form.taskType === "public_ip" || isRotation || selectedTaskDeviceIsReader} options={environmentOptions} /></div>
 		  {selectedTaskDeviceIsReader ? <div className="md:col-span-2 rounded-lg border border-sky-200 bg-sky-50 p-3 text-sm text-sky-700 dark:border-sky-500/20 dark:bg-sky-500/10 dark:text-sky-300">{t("USB SIM读卡器仅支持VoWiFi短信和通话任务")}</div> : null}
 
-          {form.taskType !== "public_ip" ? <div><label className={fieldLabel}>{t("号码")}</label><Input value={form.phone} onChange={(event) => setForm({ ...form, phone: event.target.value })} placeholder="+447700900123" /></div> : null}
+          {form.taskType !== "public_ip" && !isRotation ? <div><label className={fieldLabel}>{t("号码")}</label><Input value={form.phone} onChange={(event) => setForm({ ...form, phone: event.target.value })} placeholder="+447700900123" /></div> : null}
           {form.taskType === "call" ? <div><label className={fieldLabel}>{t("自动挂断")}</label><Input type="number" min={1} max={600} value={form.durationSeconds} suffix="s" onChange={(event) => setForm({ ...form, durationSeconds: Number(event.target.value) })} /></div> : null}
           {form.taskType === "sms" ? <div className="md:col-span-2"><label className={fieldLabel}>{t("短信内容")}</label><Textarea rows={4} value={form.message} onChange={(event) => setForm({ ...form, message: event.target.value })} /></div> : null}
 		  {advancedTasksAvailable && form.taskType === "public_ip" ? <div className="md:col-span-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-700 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-300">{t("该任务固定使用基站直连和自动选网；执行时会开启漫游数据，并通过模块接口访问 ipinfo.io。")}</div> : null}
 
-          <div><label className={fieldLabel}>{t("首次执行日期")}</label><Input type="date" value={form.startDate} onChange={(event) => setForm({ ...form, startDate: event.target.value })} /></div>
-          <div><label className={fieldLabel}>{t("执行时间")}</label><Input type="time" value={form.runTime} onChange={(event) => setForm({ ...form, runTime: event.target.value })} /></div>
-          <div><label className={fieldLabel}>{t("执行周期")}</label><Input type="number" min={1} max={365} value={form.intervalDays} suffix={t("天")} onChange={(event) => setForm({ ...form, intervalDays: Number(event.target.value) })} /></div>
+          <div><label className={fieldLabel}>{isRotation ? t("开始日期") : t("首次执行日期")}</label><Input type="date" value={form.startDate} onChange={(event) => setForm({ ...form, startDate: event.target.value })} /></div>
+          <div><label className={fieldLabel}>{isRotation ? t("开始时间") : t("执行时间")}</label><Input type="time" value={form.runTime} onChange={(event) => setForm({ ...form, runTime: event.target.value })} /></div>
+          {isRotation ? <div><label className={fieldLabel}>{t("结束日期（可选）")}</label><Input type="date" value={form.endDate} onChange={(event) => setForm({ ...form, endDate: event.target.value })} /></div> : null}
+          {isRotation ? <div><label className={fieldLabel}>{t("结束时间（可选）")}</label><Input type="time" value={form.endTime} onChange={(event) => setForm({ ...form, endTime: event.target.value })} /><div className="mt-1 text-xs text-gray-400">{t("到点后任务自动停用，设备停在当时在线的号码上；留空则一直轮询")}</div></div> : null}
+          {isRotation ? (
+            <div>
+              <label className={fieldLabel}>{t("每个 Profile 的停留时间")}</label>
+              <Input type="number" min={5} max={86400} value={form.dwellSeconds} suffix={t("秒")} onChange={(event) => setForm({ ...form, dwellSeconds: Number(event.target.value) })} />
+              <div className="mt-1 text-xs text-gray-400">{t("从隧道就绪开始计时；切换本身约 10 秒，积压短信在注册后 1 秒内开始到达、每条约 0.65 秒。当前配置一轮约 {duration}").replace("{duration}", formatDuration(rotationCycleSeconds))}</div>
+            </div>
+          ) : <div><label className={fieldLabel}>{t("执行周期")}</label><Input type="number" min={1} max={365} value={form.intervalDays} suffix={t("天")} onChange={(event) => setForm({ ...form, intervalDays: Number(event.target.value) })} /></div>}
           <div><label className={fieldLabel}>{t("任务失败重试次数")}</label><Select value={String(form.retryCount)} onChange={(value) => setForm({ ...form, retryCount: Number(value) })} options={Array.from({ length: 11 }, (_, count) => ({ value: String(count), label: t("{count} 次").replace("{count}", String(count)) }))} /></div>
           <div className="flex items-center justify-between rounded-lg border border-gray-200 p-3 dark:border-white/10"><div><div className="text-sm font-semibold">{t("启用任务")}</div><div className="text-xs text-gray-400">{t("停用后不会进入执行队列")}</div></div><Switch checked={form.enabled} onChange={(enabled) => setForm({ ...form, enabled })} /></div>
           <div className="flex items-center justify-between rounded-lg border border-gray-200 p-3 dark:border-white/10"><div><div className="text-sm font-semibold">{t("完成后推送通知")}</div><div className="text-xs text-gray-400">{t("发送到全部已配置并启用的通知渠道")}</div></div><Switch checked={form.notify} onChange={(notify) => setForm({ ...form, notify })} /></div>

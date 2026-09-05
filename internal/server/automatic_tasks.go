@@ -21,12 +21,62 @@ import (
 const (
 	automaticTaskPollInterval = 5 * time.Second
 	automaticTaskMaxRuntime   = 8 * time.Minute
+	// Profile rotation dwell bounds: the time a profile stays online after its
+	// VoWiFi tunnel is ready before the next profile is enabled.
+	automaticRotationMinDwellSeconds = 5
+	automaticRotationMaxDwellSeconds = 86400
 )
 
+type automaticTaskRotationProfile struct {
+	ICCID string `json:"iccid"`
+	AID   string `json:"aid,omitempty"`
+	// Name is the profile nickname captured when the task was saved (this
+	// batch stores the phone number there); display only.
+	Name string `json:"name,omitempty"`
+}
+
 type automaticTaskPayload struct {
-	Phone           string `json:"phone,omitempty"`
-	Message         string `json:"message,omitempty"`
-	DurationSeconds int    `json:"duration_seconds,omitempty"`
+	Phone           string                         `json:"phone,omitempty"`
+	Message         string                         `json:"message,omitempty"`
+	DurationSeconds int                            `json:"duration_seconds,omitempty"`
+	Profiles        []automaticTaskRotationProfile `json:"profiles,omitempty"`
+}
+
+// nextRotationProfile picks the profile after the one currently enabled on
+// the eUICC, wrapping around; an unknown or empty current ICCID restarts the
+// cycle at the first entry.
+func nextRotationProfile(profiles []automaticTaskRotationProfile, currentICCID string) (automaticTaskRotationProfile, error) {
+	if len(profiles) == 0 {
+		return automaticTaskRotationProfile{}, errors.New("rotation task has no profiles")
+	}
+	current := strings.TrimSpace(currentICCID)
+	for index, profile := range profiles {
+		if current != "" && strings.EqualFold(strings.TrimSpace(profile.ICCID), current) {
+			return profiles[(index+1)%len(profiles)], nil
+		}
+	}
+	return profiles[0], nil
+}
+
+func validateAutomaticTaskRotation(profiles []automaticTaskRotationProfile, intervalSeconds int) error {
+	if len(profiles) < 2 {
+		return errors.New("profile rotation needs at least two eSIM profiles")
+	}
+	seen := make(map[string]bool, len(profiles))
+	for _, profile := range profiles {
+		iccid := strings.TrimSpace(profile.ICCID)
+		if iccid == "" {
+			return errors.New("profile rotation entries need an ICCID")
+		}
+		if seen[strings.ToUpper(iccid)] {
+			return errors.New("profile rotation lists the same ICCID twice")
+		}
+		seen[strings.ToUpper(iccid)] = true
+	}
+	if intervalSeconds < automaticRotationMinDwellSeconds || intervalSeconds > automaticRotationMaxDwellSeconds {
+		return fmt.Errorf("profile rotation dwell must be %d-%d seconds", automaticRotationMinDwellSeconds, automaticRotationMaxDwellSeconds)
+	}
+	return nil
 }
 
 type automaticTaskExecutionError struct {
@@ -180,6 +230,15 @@ func (scheduler *automaticTaskScheduler) execute(run store.AutomaticTaskRun) {
 	if updateErr := scheduler.server.store.UpdateAutomaticTaskRun(context.Background(), run); updateErr != nil {
 		scheduler.server.logger.Warn("finish automatic task run", "run_id", run.ID, "error", updateErr)
 	}
+	if task.TaskType == "profile_rotation" && task.IntervalSeconds > 0 {
+		// The dwell counts from the moment this run finished (tunnel ready or
+		// failed), not from the previous slot, so back-to-back switches keep a
+		// predictable online window per profile.
+		next := run.FinishedAt.Add(time.Duration(task.IntervalSeconds) * time.Second)
+		if rescheduleErr := scheduler.server.store.RescheduleAutomaticTask(context.Background(), task.ID, next); rescheduleErr != nil {
+			scheduler.server.logger.Warn("reschedule rotation task", "task_id", task.ID, "error", rescheduleErr)
+		}
+	}
 	if task.Notify {
 		go scheduler.server.notifyAutomaticTask(context.Background(), task, run)
 	}
@@ -190,10 +249,25 @@ func (s *Server) executeAutomaticTask(ctx context.Context, task store.AutomaticT
 		return "", automaticTaskExecutionError{err: err, retryable: false}
 	}
 	progress("正在检查设备和 eSIM Profile")
+	var payload automaticTaskPayload
+	if err := json.Unmarshal(task.Payload, &payload); err != nil {
+		return "", automaticTaskExecutionError{err: fmt.Errorf("decode task payload: %w", err), retryable: false}
+	}
+	var rotationTarget automaticTaskRotationProfile
+	if task.TaskType == "profile_rotation" {
+		target, err := s.resolveRotationTarget(ctx, task, payload)
+		if err != nil {
+			return "", err
+		}
+		rotationTarget = target
+		task.ProfileICCID, task.ProfileAID = target.ICCID, target.AID
+	}
+	switchStarted := time.Now()
 	config, entry, physicalID, err := s.ensureAutomaticTaskProfile(ctx, task, progress)
 	if err != nil {
 		return "", err
 	}
+	switchDuration := time.Since(switchStarted)
 	iccid := strings.TrimSpace(task.ProfileICCID)
 	policy, policyErr := s.store.CardPolicy(ctx, iccid)
 	if errors.Is(policyErr, store.ErrNotFound) {
@@ -204,6 +278,11 @@ func (s *Server) executeAutomaticTask(ctx context.Context, task store.AutomaticT
 	snapshot := automaticTaskEnvironmentSnapshot{config: config, policy: policy}
 	actionCompleted := false
 	defer func() {
+		if task.TaskType == "profile_rotation" {
+			// Rotation's end state is "this profile stays online over VoWiFi";
+			// restoring the pre-task policy would tear the fresh tunnel down.
+			return
+		}
 		progress("正在恢复该 Profile 原先保存的卡策略")
 		if restoreErr := s.restoreAutomaticTaskEnvironment(physicalID, snapshot); restoreErr != nil {
 			if err == nil && actionCompleted {
@@ -216,14 +295,19 @@ func (s *Server) executeAutomaticTask(ctx context.Context, task store.AutomaticT
 			}
 		}
 	}()
+	tunnelStarted := time.Now()
 	if err := s.prepareAutomaticTaskEnvironment(ctx, &config, entry, physicalID, task, progress); err != nil {
 		return "", err
 	}
-	var payload automaticTaskPayload
-	if err := json.Unmarshal(task.Payload, &payload); err != nil {
-		return "", fmt.Errorf("decode task payload: %w", err)
-	}
+	tunnelDuration := time.Since(tunnelStarted)
 	switch task.TaskType {
+	case "profile_rotation":
+		// The switch and the VoWiFi readiness wait above are the whole job:
+		// once the tunnel is registered the carrier delivers queued SMS.
+		output = fmt.Sprintf("已切换到 %s（…%s），VoWiFi 隧道已就绪（%s）", firstNonEmpty(strings.TrimSpace(rotationTarget.Name), rotationTarget.ICCID), lastDigits(rotationTarget.ICCID, 4), formatRotationTiming(switchDuration, tunnelDuration))
+		s.logger.Info("automatic profile rotation timing", "device_id", task.DeviceID, "iccid", rotationTarget.ICCID,
+			"switch_ms", switchDuration.Milliseconds(), "tunnel_ms", tunnelDuration.Milliseconds())
+		err = nil
 	case "sms":
 		progress("正在发送短信")
 		output, err = s.executeAutomaticSMS(ctx, task, payload)
@@ -238,6 +322,37 @@ func (s *Server) executeAutomaticTask(ctx context.Context, task store.AutomaticT
 	}
 	actionCompleted = err == nil
 	return output, err
+}
+
+// resolveRotationTarget reads the ICCID currently enabled on the device and
+// picks the next entry of the task's rotation list.
+func (s *Server) resolveRotationTarget(ctx context.Context, task store.AutomaticTask, payload automaticTaskPayload) (automaticTaskRotationProfile, error) {
+	if err := validateAutomaticTaskRotation(payload.Profiles, task.IntervalSeconds); err != nil {
+		return automaticTaskRotationProfile{}, automaticTaskExecutionError{err: err, retryable: false}
+	}
+	config, err := s.store.Device(ctx, task.DeviceID)
+	if err != nil {
+		return automaticTaskRotationProfile{}, fmt.Errorf("read device: %w", err)
+	}
+	entry, _, present := s.physicalForConfig(config)
+	if !present || entry.Snapshot == nil {
+		return automaticTaskRotationProfile{}, errors.New("configured device is offline")
+	}
+	return nextRotationProfile(payload.Profiles, entry.Snapshot.ICCID)
+}
+
+// formatRotationTiming renders the two halves of a rotation run for the run
+// output: the eUICC/modem switch and the VoWiFi tunnel + IMS registration.
+func formatRotationTiming(switchDuration, tunnelDuration time.Duration) string {
+	return fmt.Sprintf("换档 %.1f s · 隧道 %.1f s", switchDuration.Seconds(), tunnelDuration.Seconds())
+}
+
+func lastDigits(value string, count int) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= count {
+		return value
+	}
+	return value[len(value)-count:]
 }
 
 func (s *Server) ensureAutomaticTaskProfile(ctx context.Context, task store.AutomaticTask, progress automaticTaskProgress) (store.Device, device.Device, string, error) {
@@ -256,6 +371,14 @@ func (s *Server) ensureAutomaticTaskProfile(ctx context.Context, task store.Auto
 		return config, entry, physicalID, nil
 	}
 	progress("正在切换到任务指定的 eSIM Profile")
+	// Mirror the manual switch API: keep the SM/ME scanner's subscription
+	// identity stable, pause VoWiFi reconciliation, and stop the live runtime
+	// so the old profile de-registers cleanly. A switch without that
+	// de-REGISTER leaves a stale IMS binding and the carrier then parks MT SMS
+	// on its retry timer (minutes) instead of pushing them on the next
+	// REGISTER (measured <0.4 s), see DEVICE-REPORT §25.6.
+	s.smsSyncMu.Lock()
+	defer s.smsSyncMu.Unlock()
 	desiredData := config.NetworkEnabled && !config.VoWiFiEnabled
 	dataRuntime := s.cellularDataRuntime()
 	s.clearPublicIP(config.ID)
@@ -266,12 +389,35 @@ func (s *Server) ensureAutomaticTaskProfile(ctx context.Context, task store.Auto
 			dataRuntime.invalidate(config.ID, desiredData, "failed", "automatic eSIM profile switch did not complete")
 		}
 	}()
+	if maintenance, ok := s.vowifi.(VoWiFiMaintenanceController); ok {
+		if err := maintenance.BeginMaintenance(config.ID); err != nil {
+			return store.Device{}, device.Device{}, "", fmt.Errorf("prepare VoWiFi for profile switch: %w", err)
+		}
+		defer maintenance.EndMaintenance(config.ID)
+	}
+	stageStarted := time.Now()
+	stage := func(name string) {
+		s.logger.Info("automatic profile switch stage", "device_id", config.ID, "stage", name, "stage_ms", time.Since(stageStarted).Milliseconds())
+		stageStarted = time.Now()
+	}
+	progress("正在注销当前 Profile 的 VoWiFi 注册")
+	if err := s.quiesceVoWiFiForProfileSwitch(ctx, config.ID); err != nil {
+		return store.Device{}, device.Device{}, "", err
+	}
+	stage("quiesce_vowifi")
 	if _, err := s.devices.SetFlight(ctx, physicalID, true); err != nil {
 		return store.Device{}, device.Device{}, "", fmt.Errorf("enter airplane mode before profile switch: %w", err)
 	}
+	stage("set_flight")
+	progress("正在启用下一个 eSIM Profile")
 	if err := s.devices.ESIMSwitchProfile(ctx, physicalID, task.ProfileICCID, task.ProfileAID); err != nil {
 		return store.Device{}, device.Device{}, "", fmt.Errorf("switch eSIM profile: %w", err)
 	}
+	stage("esim_switch_profile")
+	if _, err := s.devices.SetFlight(ctx, physicalID, true); err != nil {
+		return store.Device{}, device.Device{}, "", fmt.Errorf("keep airplane mode after profile switch: %w", err)
+	}
+	stage("set_flight_again")
 	entry, physicalID, present = s.physicalForConfig(config)
 	if !present {
 		return store.Device{}, device.Device{}, "", errors.New("device did not recover after profile switch")
@@ -280,6 +426,7 @@ func (s *Server) ensureAutomaticTaskProfile(ctx context.Context, task store.Auto
 	if err != nil {
 		return store.Device{}, device.Device{}, "", fmt.Errorf("verify switched profile: %w", err)
 	}
+	stage("snapshot_refresh")
 	if !strings.EqualFold(strings.TrimSpace(snapshot.ICCID), strings.TrimSpace(task.ProfileICCID)) {
 		return store.Device{}, device.Device{}, "", fmt.Errorf("profile verification failed: current ICCID is %s", firstNonEmpty(snapshot.ICCID, "unavailable"))
 	}
@@ -808,7 +955,10 @@ func (s *Server) decodeAutomaticTask(r *http.Request, id int64) (store.Automatic
 		TaskType     string               `json:"task_type"`
 		Environment  string               `json:"environment"`
 		IntervalDays int                  `json:"interval_days"`
+		IntervalSeconds int               `json:"interval_seconds"`
 		StartDate    string               `json:"start_date"`
+		EndDate      string               `json:"end_date"`
+		EndTime      string               `json:"end_time"`
 		RunTime      string               `json:"run_time"`
 		Timezone     string               `json:"timezone"`
 		RetryCount   int                  `json:"retry_count"`
@@ -831,8 +981,30 @@ func (s *Server) decodeAutomaticTask(r *http.Request, id int64) (store.Automatic
 	if request.Environment != "vowifi" && request.Environment != "cellular" {
 		return store.AutomaticTask{}, errors.New("environment must be vowifi or cellular")
 	}
-	if request.TaskType != "sms" && request.TaskType != "call" && request.TaskType != "public_ip" {
+	if request.TaskType != "sms" && request.TaskType != "call" && request.TaskType != "public_ip" && request.TaskType != "profile_rotation" {
 		return store.AutomaticTask{}, errors.New("unsupported task type")
+	}
+	if request.TaskType == "profile_rotation" {
+		if request.Environment != "vowifi" {
+			return store.AutomaticTask{}, errors.New("profile rotation tasks must use the VoWiFi environment")
+		}
+		if err := validateAutomaticTaskRotation(request.Payload.Profiles, request.IntervalSeconds); err != nil {
+			return store.AutomaticTask{}, err
+		}
+		for index := range request.Payload.Profiles {
+			request.Payload.Profiles[index].ICCID = strings.TrimSpace(request.Payload.Profiles[index].ICCID)
+			request.Payload.Profiles[index].AID = strings.TrimSpace(request.Payload.Profiles[index].AID)
+			request.Payload.Profiles[index].Name = strings.TrimSpace(request.Payload.Profiles[index].Name)
+		}
+		// Rotation never keys off the day schedule; keep a valid placeholder.
+		if request.IntervalDays < 1 {
+			request.IntervalDays = 1
+		}
+	} else {
+		if request.IntervalSeconds != 0 {
+			return store.AutomaticTask{}, errors.New("interval_seconds is only valid for profile rotation tasks")
+		}
+		request.Payload.Profiles = nil
 	}
 	if request.TaskType == "public_ip" && request.Environment != "cellular" {
 		return store.AutomaticTask{}, errors.New("public IP tasks must use cellular direct mode")
@@ -866,10 +1038,25 @@ func (s *Server) decodeAutomaticTask(r *http.Request, id int64) (store.Automatic
 	if err != nil {
 		return store.AutomaticTask{}, err
 	}
+	var endAt time.Time
+	request.EndDate, request.EndTime = strings.TrimSpace(request.EndDate), strings.TrimSpace(request.EndTime)
+	if request.EndDate != "" || request.EndTime != "" {
+		if request.TaskType != "profile_rotation" {
+			return store.AutomaticTask{}, errors.New("end_date/end_time are only valid for profile rotation tasks")
+		}
+		endAt, err = time.ParseInLocation("2006-01-02 15:04", request.EndDate+" "+request.EndTime, location)
+		if err != nil {
+			return store.AutomaticTask{}, errors.New("end_date and end_time must both be set using YYYY-MM-DD and HH:MM")
+		}
+		start, _ := time.ParseInLocation("2006-01-02 15:04", strings.TrimSpace(request.StartDate)+" "+strings.TrimSpace(request.RunTime), location)
+		if !endAt.After(start) {
+			return store.AutomaticTask{}, errors.New("end time must be after the start time")
+		}
+	}
 	payload, _ := json.Marshal(request.Payload)
 	task := store.AutomaticTask{ID: id, Name: request.Name, Enabled: request.Enabled, DeviceID: request.DeviceID,
 		ProfileICCID: request.ProfileICCID, ProfileAID: request.ProfileAID, TaskType: request.TaskType,
-		Environment: request.Environment, IntervalDays: request.IntervalDays, StartDate: request.StartDate,
+		Environment: request.Environment, IntervalDays: request.IntervalDays, IntervalSeconds: request.IntervalSeconds, EndAt: endAt.UTC(), StartDate: request.StartDate,
 		RunTime: request.RunTime, Timezone: request.Timezone, Payload: payload, RetryCount: request.RetryCount, Notify: request.Notify, NextRunAt: nextRun.UTC()}
 	if id != 0 {
 		if previous, previousErr := s.store.AutomaticTask(r.Context(), id); previousErr == nil {

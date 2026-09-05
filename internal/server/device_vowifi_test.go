@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"vocat/internal/store"
 	"vocat/internal/vowifi"
@@ -197,5 +198,118 @@ func TestVoWiFiReconnectRequiresEnabledPolicy(t *testing.T) {
 	}
 	if controller.reconnects != 0 {
 		t.Fatalf("reconnects = %d", controller.reconnects)
+	}
+}
+
+// deleteTestVoWiFiController simulates the asynchronous runtime: a disable
+// request completes on the next State() poll unless the test pins it busy.
+type deleteTestVoWiFiController struct {
+	state      vowifi.State
+	enabled    []bool
+	neverStops bool
+}
+
+func (controller *deleteTestVoWiFiController) State(string) (vowifi.State, error) {
+	if len(controller.enabled) > 0 && !controller.enabled[len(controller.enabled)-1] && !controller.neverStops {
+		controller.state.Active = false
+		controller.state.TunnelReady = false
+		controller.state.IMSReady = false
+		controller.state.SMSReady = false
+		controller.state.Enabled = false
+		controller.state.Phase = vowifi.PhaseIdle
+	}
+	return controller.state, nil
+}
+
+func (controller *deleteTestVoWiFiController) RequestEnabled(_ string, enabled bool) (vowifi.State, error) {
+	controller.enabled = append(controller.enabled, enabled)
+	if !enabled {
+		controller.state.Phase = vowifi.PhaseStopping
+	}
+	return controller.state, nil
+}
+
+func (controller *deleteTestVoWiFiController) RequestReconnect(string) (vowifi.State, error) {
+	return controller.state, nil
+}
+
+func newDeleteTestServer(t *testing.T, controller VoWiFiController) (*Server, *store.Store) {
+	t.Helper()
+	database, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	config := store.Device{ID: "ec20", Name: "EC20", VoWiFiEnabled: true}
+	if err := database.UpsertDevice(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
+	return &Server{
+		store:               database,
+		vowifi:              controller,
+		logger:              slog.New(slog.NewTextHandler(io.Discard, nil)),
+		maxRequestBodyBytes: 4096,
+	}, database
+}
+
+// Regression: deleting a device record used to leave its IKE tunnel and IMS
+// registration alive (orphan binding for up to the REGISTER expiry, ~3600 s),
+// and the runtime worker kept failing with FOREIGN KEY errors. The record must
+// be torn down (SIP de-registration, tunnel close) before the row disappears.
+func TestDeleteDeviceStopsVoWiFiBeforeRemovingRecord(t *testing.T) {
+	controller := &deleteTestVoWiFiController{state: vowifi.State{
+		DeviceID: "ec20", Enabled: true, Active: true, TunnelReady: true, IMSReady: true, Phase: vowifi.PhaseSMSReady,
+	}}
+	server, database := newDeleteTestServer(t, controller)
+	response := httptest.NewRecorder()
+	server.handleDevicePath(response, httptest.NewRequest(http.MethodDelete, "/api/devices/ec20", nil), "ec20", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if len(controller.enabled) != 1 || controller.enabled[0] {
+		t.Fatalf("runtime disable requests = %#v, want exactly one disable", controller.enabled)
+	}
+	if !bytes.Contains(response.Body.Bytes(), []byte(`"vowifi_teardown":"stopped"`)) {
+		t.Fatalf("body = %s, want vowifi_teardown stopped", response.Body.String())
+	}
+	if _, err := database.Device(context.Background(), "ec20"); err == nil {
+		t.Fatal("device record still exists after DELETE")
+	}
+}
+
+func TestDeleteDeviceStillRemovesRecordWhenTeardownTimesOut(t *testing.T) {
+	previous := deviceDeleteTeardownTimeout
+	deviceDeleteTeardownTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { deviceDeleteTeardownTimeout = previous })
+	controller := &deleteTestVoWiFiController{neverStops: true, state: vowifi.State{
+		DeviceID: "ec20", Enabled: true, Active: true, TunnelReady: true, Phase: vowifi.PhaseSMSReady,
+	}}
+	server, database := newDeleteTestServer(t, controller)
+	response := httptest.NewRecorder()
+	server.handleDevicePath(response, httptest.NewRequest(http.MethodDelete, "/api/devices/ec20", nil), "ec20", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if !bytes.Contains(response.Body.Bytes(), []byte(`"vowifi_teardown":"timeout"`)) {
+		t.Fatalf("body = %s, want vowifi_teardown timeout", response.Body.String())
+	}
+	if _, err := database.Device(context.Background(), "ec20"); err == nil {
+		t.Fatal("device record still exists after DELETE")
+	}
+}
+
+func TestDeleteDeviceWithoutRunningVoWiFiSkipsTeardown(t *testing.T) {
+	controller := &deleteTestVoWiFiController{state: vowifi.State{DeviceID: "ec20", Phase: vowifi.PhaseIdle}}
+	server, database := newDeleteTestServer(t, controller)
+	response := httptest.NewRecorder()
+	server.handleDevicePath(response, httptest.NewRequest(http.MethodDelete, "/api/devices/ec20", nil), "ec20", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if len(controller.enabled) != 0 {
+		t.Fatalf("runtime requests = %#v, want none for an idle device", controller.enabled)
+	}
+	if _, err := database.Device(context.Background(), "ec20"); err == nil {
+		t.Fatal("device record still exists after DELETE")
 	}
 }

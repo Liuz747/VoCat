@@ -15,6 +15,24 @@ import (
 	"vocat/internal/modem"
 )
 
+// snapshotStepTimer reports snapshot steps that take longer than a second so a
+// blocked transport (for example QMI right after an eUICC REFRESH) is visible
+// in the journal instead of hiding inside the caller's long timeout.
+type snapshotStepTimer struct {
+	manager *Manager
+	id      string
+	last    time.Time
+}
+
+func (timer *snapshotStepTimer) step(name string) {
+	now := time.Now()
+	elapsed := now.Sub(timer.last)
+	timer.last = now
+	if elapsed >= time.Second && timer.manager.logger != nil {
+		timer.manager.logger.Info("slow modem snapshot step", "device_id", timer.id, "step", name, "elapsed_ms", elapsed.Milliseconds())
+	}
+}
+
 func (manager *Manager) readSnapshot(
 	ctx context.Context,
 	id string,
@@ -24,6 +42,7 @@ func (manager *Manager) readSnapshot(
 	previousSnapshot *Snapshot,
 	client modem.Client,
 ) (Snapshot, error) {
+	stepTimer := &snapshotStepTimer{manager: manager, id: id, last: time.Now()}
 	snapshot := Snapshot{
 		DeviceID:      id,
 		Port:          candidate.ATPort.OpenPath(),
@@ -65,6 +84,7 @@ func (manager *Manager) readSnapshot(
 	if response, ok := optional("AT+CPIN?"); ok {
 		snapshot.SIMStatus, snapshot.SIMReady = parseCPIN(response)
 	}
+	stepTimer.step("probe_and_cpin")
 	previousICCID = strings.TrimSpace(previousICCID)
 	if !snapshot.SIMReady && previousICCID != "" {
 		// On Quectel EC20 and similar modems without physical SIMDET GPIO interrupts,
@@ -118,6 +138,7 @@ func (manager *Manager) readSnapshot(
 			snapshot.ICCID = parseICCIDIdentifier(ccid, []string{"+CCID:", "+QCCID:"}, 18, 22)
 		}
 	}
+	stepTimer.step("iccid")
 	if previousICCID != "" && snapshot.ICCID != "" && !strings.EqualFold(previousICCID, snapshot.ICCID) {
 		// A different physical SIM must never inherit the previous card's
 		// permission to use cellular RF. Disable RF before reading serving-cell
@@ -153,6 +174,7 @@ func (manager *Manager) readSnapshot(
 		}
 		snapshot.GID1 = encodeSIMGroupID(manager.readTransparentSIMFile(ctx, client, 28478))
 		snapshot.GID2 = encodeSIMGroupID(manager.readTransparentSIMFile(ctx, client, 28479))
+	stepTimer.step("sim_files")
 		snapshot.IdentityFilesRead = true
 	}
 	if response, ok := optional("AT+CSQ"); ok {
@@ -195,8 +217,10 @@ func (manager *Manager) readSnapshot(
 			break
 		}
 	}
+	stepTimer.step("at_radio_and_registration")
 	if strings.EqualFold(backend, "qmi") {
 		registration, found := readPlatformRegistration(ctx, candidate)
+	stepTimer.step("qmi_registration")
 		if found {
 			snapshot.RegistrationStatus = registration.Status
 			snapshot.RegistrationSource = "QMI NAS"
@@ -243,6 +267,7 @@ func (manager *Manager) readSnapshot(
 		// Preserve a prior successful read across a transient QMI/AT failure.
 		snapshot.IMEI = previousSnapshot.IMEI
 	}
+	stepTimer.step("imei")
 	if response, ok := optional("AT+CFUN?"); ok {
 		if mode, found := parseCFUN(response); found {
 			snapshot.OperatingMode = mode
@@ -252,7 +277,9 @@ func (manager *Manager) readSnapshot(
 		}
 	}
 
-	phone, warnings := manager.readPhoneNumber(ctx, client)
+	stepTimer.step("cfun")
+	phone, warnings := manager.readPhoneNumberUnlessHeld(ctx, id, client, previousSnapshot)
+	stepTimer.step("phone")
 	snapshot.Phone = phone
 	snapshot.Warnings = append(snapshot.Warnings, warnings...)
 	snapshot.UpdatedAt = time.Now().UTC()
@@ -662,4 +689,18 @@ func parseOptionalInt(value string) *int {
 
 func intPointer(value int) *int {
 	return &value
+}
+
+// readPhoneNumberUnlessHeld skips the CNUM/phonebook/EF_MSISDN reads for a
+// while after an eSIM profile switch (see phoneReadHoldAfterSwitch); the
+// previous snapshot's number is kept meanwhile.
+func (manager *Manager) readPhoneNumberUnlessHeld(ctx context.Context, id string, client modem.Client, previous *Snapshot) (PhoneNumber, []string) {
+	if manager.phoneReadsHeld(id) {
+		result := PhoneNumber{Status: "eSIM Profile 刚切换，号码读取暂缓"}
+		if previous != nil && previous.Phone.Number != "" {
+			result = previous.Phone
+		}
+		return result, []string{"phone number read held after profile switch"}
+	}
+	return manager.readPhoneNumber(ctx, client)
 }

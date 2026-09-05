@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"path/filepath"
 	"strings"
@@ -226,5 +227,175 @@ func TestRecoverAutomaticTaskRunsFailsRunningAndReturnsQueued(t *testing.T) {
 	}
 	if recoveredTask.LastStatus != "failed" || !strings.Contains(recoveredTask.LastError, "service restarted") {
 		t.Fatalf("recovered task status = %+v", recoveredTask)
+	}
+}
+
+func TestMigration24KeepsAutomaticTaskHistoryAndAcceptsProfileRotation(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "automatic-task-rotation-migration.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for version := 1; version <= 23; version++ {
+		for _, statement := range migrationStatements(version) {
+			if _, err := raw.ExecContext(ctx, statement); err != nil {
+				t.Fatalf("create v%d schema: %v", version, err)
+			}
+		}
+	}
+	if _, err := raw.ExecContext(ctx, `
+		INSERT INTO devices (id, name, created_at, updated_at) VALUES ('ec20', 'EC20', 100, 100);
+		INSERT INTO automatic_tasks (
+			id, name, enabled, device_id, profile_iccid, task_type, environment, interval_days,
+			start_date, run_time, payload_json, next_run_at, created_at, updated_at
+		) VALUES (7, 'daily', 1, 'ec20', '8944100000000000001', 'sms', 'vowifi', 2,
+			'2026-08-10', '12:00', '{"phone":"10086","message":"hi"}', 200, 100, 100);
+		INSERT INTO automatic_task_runs (
+			task_id, device_id, scheduled_at, status, attempts, output, created_at, updated_at
+		) VALUES (7, 'ec20', 200, 'success', 1, 'done', 200, 200);
+		PRAGMA user_version = 23;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	database := openTestStore(t, path)
+	legacy, err := database.AutomaticTask(ctx, 7)
+	if err != nil || legacy.Name != "daily" || legacy.IntervalDays != 2 || legacy.IntervalSeconds != 0 {
+		t.Fatalf("legacy task after migration = %+v, %v", legacy, err)
+	}
+	runs, total, err := database.ListAutomaticTaskRunsPaginated(ctx, 10, 0)
+	if err != nil || total != 1 || len(runs) != 1 || runs[0].TaskID != 7 || runs[0].Output != "done" {
+		t.Fatalf("run history after migration = %+v (total %d), %v", runs, total, err)
+	}
+	rotation, err := database.SaveAutomaticTask(ctx, AutomaticTask{
+		Name: "rotate", Enabled: true, DeviceID: "ec20", ProfileICCID: "8944100000000000001",
+		TaskType: "profile_rotation", Environment: "vowifi", IntervalDays: 1, IntervalSeconds: 900,
+		StartDate: "2026-08-10", RunTime: "12:00", Timezone: "Asia/Shanghai",
+		Payload:   []byte(`{"profiles":[{"iccid":"8944100000000000001"},{"iccid":"8944100000000000002"}]}`),
+		NextRunAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("save profile_rotation task: %v", err)
+	}
+	if rotation.TaskType != "profile_rotation" || rotation.IntervalSeconds != 900 {
+		t.Fatalf("saved rotation task = %+v", rotation)
+	}
+	if err := database.DeleteAutomaticTask(ctx, 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, total, err := database.ListAutomaticTaskRunsPaginated(ctx, 10, 0); err != nil || total != 0 {
+		t.Fatalf("run history did not cascade after migration: total=%d, %v", total, err)
+	}
+}
+
+func TestClaimAdvancesSecondScheduledTasksByIntervalSeconds(t *testing.T) {
+	ctx := context.Background()
+	database := openTestStore(t, filepath.Join(t.TempDir(), "automatic-task-minutes.db"))
+	mustSaveDevice(t, database, "ec20", "EC20")
+	now := time.Now().UTC().Truncate(time.Second)
+	due := now.Add(-40 * time.Minute)
+	task, err := database.SaveAutomaticTask(ctx, AutomaticTask{
+		Name: "rotate", Enabled: true, DeviceID: "ec20", ProfileICCID: "one",
+		TaskType: "profile_rotation", Environment: "vowifi", IntervalDays: 1, IntervalSeconds: 900,
+		StartDate: "2026-08-10", RunTime: "12:00", Timezone: "Asia/Shanghai",
+		Payload: []byte(`{"profiles":[{"iccid":"one"},{"iccid":"two"}]}`), NextRunAt: due,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs, err := database.ClaimDueAutomaticTasks(ctx, now, 10)
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("claimed = %+v, %v", runs, err)
+	}
+	stored, err := database.AutomaticTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// due + 15m, +30m are still in the past; +45m is the first future slot.
+	if want := due.Add(45 * time.Minute); !stored.NextRunAt.Equal(want) {
+		t.Fatalf("next run = %v, want %v", stored.NextRunAt, want)
+	}
+}
+
+func TestClaimSkipsTasksWithInFlightRuns(t *testing.T) {
+	ctx := context.Background()
+	database := openTestStore(t, filepath.Join(t.TempDir(), "automatic-task-inflight.db"))
+	mustSaveDevice(t, database, "ec20", "EC20")
+	now := time.Now().UTC().Truncate(time.Second)
+	task, err := database.SaveAutomaticTask(ctx, AutomaticTask{
+		Name: "rotate", Enabled: true, DeviceID: "ec20", ProfileICCID: "one",
+		TaskType: "profile_rotation", Environment: "vowifi", IntervalDays: 1, IntervalSeconds: 30,
+		StartDate: "2026-08-10", RunTime: "12:00", Timezone: "Asia/Shanghai",
+		Payload: []byte(`{"profiles":[{"iccid":"one"},{"iccid":"two"}]}`), NextRunAt: now.Add(-time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := database.ClaimDueAutomaticTasks(ctx, now, 10)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first claim = %+v, %v", first, err)
+	}
+	// The first run is still queued; the slot is due again but must not pile up.
+	again, err := database.ClaimDueAutomaticTasks(ctx, now.Add(5*time.Minute), 10)
+	if err != nil || len(again) != 0 {
+		t.Fatalf("claim with queued run = %+v, %v", again, err)
+	}
+	first[0].Status, first[0].FinishedAt = "success", now
+	if err := database.UpdateAutomaticTaskRun(ctx, first[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.RescheduleAutomaticTask(ctx, task.ID, now.Add(30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := database.AutomaticTask(ctx, task.ID)
+	if err != nil || !stored.NextRunAt.Equal(now.Add(30*time.Second)) {
+		t.Fatalf("rescheduled next run = %v, %v", stored.NextRunAt, err)
+	}
+	after, err := database.ClaimDueAutomaticTasks(ctx, now.Add(time.Minute), 10)
+	if err != nil || len(after) != 1 {
+		t.Fatalf("claim after completion = %+v, %v", after, err)
+	}
+}
+
+func TestRotationTaskDisablesItselfAfterEndAt(t *testing.T) {
+	ctx := context.Background()
+	database := openTestStore(t, filepath.Join(t.TempDir(), "automatic-task-end.db"))
+	mustSaveDevice(t, database, "ec20", "EC20")
+	now := time.Now().UTC().Truncate(time.Second)
+	task, err := database.SaveAutomaticTask(ctx, AutomaticTask{
+		Name: "rotate", Enabled: true, DeviceID: "ec20", ProfileICCID: "one",
+		TaskType: "profile_rotation", Environment: "vowifi", IntervalDays: 1, IntervalSeconds: 30,
+		StartDate: "2026-08-10", RunTime: "12:00", Timezone: "Asia/Shanghai",
+		Payload: []byte(`{"profiles":[{"iccid":"one"},{"iccid":"two"}]}`),
+		NextRunAt: now.Add(-time.Minute), EndAt: now.Add(10 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !task.EndAt.Equal(now.Add(10 * time.Minute)) {
+		t.Fatalf("persisted end_at = %v", task.EndAt)
+	}
+	before, err := database.ClaimDueAutomaticTasks(ctx, now, 10)
+	if err != nil || len(before) != 1 {
+		t.Fatalf("claim before end = %+v, %v", before, err)
+	}
+	before[0].Status, before[0].FinishedAt = "success", now
+	if err := database.UpdateAutomaticTaskRun(ctx, before[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.RescheduleAutomaticTask(ctx, task.ID, now.Add(11*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	after, err := database.ClaimDueAutomaticTasks(ctx, now.Add(12*time.Minute), 10)
+	if err != nil || len(after) != 0 {
+		t.Fatalf("claim after end created runs: %+v, %v", after, err)
+	}
+	stored, err := database.AutomaticTask(ctx, task.ID)
+	if err != nil || stored.Enabled {
+		t.Fatalf("task past end_at still enabled: %+v, %v", stored, err)
 	}
 }

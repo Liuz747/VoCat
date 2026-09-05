@@ -11,7 +11,7 @@ import (
 
 const automaticTaskSelect = `
 	SELECT id, name, enabled, device_id, profile_iccid, profile_aid,
-		task_type, environment, interval_days, start_date, run_time,
+		task_type, environment, interval_days, interval_seconds, end_at, start_date, run_time,
 		timezone, payload_json, retry_count, notify, next_run_at, last_run_at,
 		last_status, last_error, created_at, updated_at
 	FROM automatic_tasks`
@@ -31,13 +31,13 @@ func (s *Store) SaveAutomaticTask(ctx context.Context, value AutomaticTask) (Aut
 	if value.ID == 0 {
 		result, err := s.db.ExecContext(ctx, `INSERT INTO automatic_tasks (
 			name, enabled, device_id, profile_iccid, profile_aid, task_type,
-			environment, interval_days, start_date, run_time, timezone, payload_json,
+			environment, interval_days, interval_seconds, end_at, start_date, run_time, timezone, payload_json,
 			retry_count, notify, next_run_at, last_run_at, last_status,
 			last_error, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			strings.TrimSpace(value.Name), value.Enabled, strings.TrimSpace(value.DeviceID),
 			strings.TrimSpace(value.ProfileICCID), strings.TrimSpace(value.ProfileAID),
-			value.TaskType, value.Environment, value.IntervalDays, value.StartDate,
+			value.TaskType, value.Environment, value.IntervalDays, value.IntervalSeconds, unixOrZero(value.EndAt), value.StartDate,
 			value.RunTime, value.Timezone, string(value.Payload), value.RetryCount, value.Notify,
 			value.NextRunAt.Unix(), unixOrZero(value.LastRunAt), value.LastStatus,
 			value.LastError, value.CreatedAt.Unix(), value.UpdatedAt.Unix())
@@ -48,12 +48,12 @@ func (s *Store) SaveAutomaticTask(ctx context.Context, value AutomaticTask) (Aut
 	} else {
 		result, err := s.db.ExecContext(ctx, `UPDATE automatic_tasks SET
 			name = ?, enabled = ?, device_id = ?, profile_iccid = ?, profile_aid = ?,
-			task_type = ?, environment = ?, interval_days = ?, start_date = ?,
+			task_type = ?, environment = ?, interval_days = ?, interval_seconds = ?, end_at = ?, start_date = ?,
 			run_time = ?, timezone = ?, payload_json = ?, retry_count = ?, notify = ?,
 			next_run_at = ?, updated_at = ? WHERE id = ?`,
 			strings.TrimSpace(value.Name), value.Enabled, strings.TrimSpace(value.DeviceID),
 			strings.TrimSpace(value.ProfileICCID), strings.TrimSpace(value.ProfileAID),
-			value.TaskType, value.Environment, value.IntervalDays, value.StartDate,
+			value.TaskType, value.Environment, value.IntervalDays, value.IntervalSeconds, unixOrZero(value.EndAt), value.StartDate,
 			value.RunTime, value.Timezone, string(value.Payload), value.RetryCount, value.Notify,
 			value.NextRunAt.Unix(), value.UpdatedAt.Unix(), value.ID)
 		if err != nil {
@@ -121,8 +121,18 @@ func (s *Store) claimDueAutomaticTasks(ctx context.Context, now time.Time, limit
 	if availableOnly {
 		availability = " AND task_type <> 'public_ip' AND environment <> 'cellular'"
 	}
+	// A second-interval task whose previous run is still queued or running is
+	// not claimed again; profile rotation would otherwise pile up runs behind a
+	// switch that takes longer than the interval. Day-based tasks keep the
+	// original behaviour so a manual "run now" never delays the schedule.
 	rows, err := tx.QueryContext(ctx, automaticTaskSelect+`
-		WHERE enabled = 1 AND next_run_at <= ?`+availability+` ORDER BY next_run_at, id LIMIT ?`, now.Unix(), limit)
+		WHERE enabled = 1 AND next_run_at <= ?`+availability+`
+			AND (interval_seconds = 0 OR NOT EXISTS (
+				SELECT 1 FROM automatic_task_runs
+				WHERE automatic_task_runs.task_id = automatic_tasks.id
+					AND automatic_task_runs.status IN ('queued', 'running')
+			))
+		ORDER BY next_run_at, id LIMIT ?`, now.Unix(), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -138,13 +148,21 @@ func (s *Store) claimDueAutomaticTasks(ctx context.Context, now time.Time, limit
 	rows.Close()
 	result := make([]AutomaticTaskRun, 0, len(tasks))
 	for _, task := range tasks {
+		if !task.EndAt.IsZero() && !now.Before(task.EndAt) {
+			// The one-off window closed: switch the task off instead of running
+			// it, leaving the device on whichever profile is active now.
+			if _, err = tx.ExecContext(ctx, `UPDATE automatic_tasks SET enabled = 0, updated_at = ? WHERE id = ?`, now.Unix(), task.ID); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		next := task.NextRunAt
 		location := time.Local
 		if loaded, loadErr := time.LoadLocation(task.Timezone); loadErr == nil {
 			location = loaded
 		}
 		for !next.After(now) {
-			next = next.In(location).AddDate(0, 0, task.IntervalDays).UTC()
+			next = nextAutomaticTaskSlot(next, location, task)
 		}
 		if _, err = tx.ExecContext(ctx, `UPDATE automatic_tasks SET next_run_at = ?, updated_at = ? WHERE id = ?`, next.Unix(), now.Unix(), task.ID); err != nil {
 			return nil, err
@@ -162,6 +180,25 @@ func (s *Store) claimDueAutomaticTasks(ctx context.Context, now time.Time, limit
 		return nil, err
 	}
 	return result, nil
+}
+
+// nextAutomaticTaskSlot advances one schedule step: second-based tasks step by
+// IntervalSeconds on the absolute clock; day-based tasks keep their local wall
+// clock across DST changes.
+func nextAutomaticTaskSlot(current time.Time, location *time.Location, task AutomaticTask) time.Time {
+	if task.IntervalSeconds > 0 {
+		return current.Add(time.Duration(task.IntervalSeconds) * time.Second).UTC()
+	}
+	return current.In(location).AddDate(0, 0, task.IntervalDays).UTC()
+}
+
+// RescheduleAutomaticTask moves a task's next run to an explicit time, used
+// after a rotation run so the dwell is measured from tunnel readiness rather
+// than from the previous slot.
+func (s *Store) RescheduleAutomaticTask(ctx context.Context, id int64, nextRun time.Time) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE automatic_tasks SET next_run_at = ?, updated_at = ? WHERE id = ?`,
+		nextRun.UTC().Unix(), time.Now().UTC().Unix(), id)
+	return err
 }
 
 func (s *Store) QueueAutomaticTaskNow(ctx context.Context, task AutomaticTask) (AutomaticTaskRun, error) {
@@ -308,9 +345,9 @@ func scanAutomaticTask(row rowScanner) (AutomaticTask, error) {
 	var value AutomaticTask
 	var enabled, notify bool
 	var payload string
-	var nextRun, lastRun, created, updated int64
+	var nextRun, lastRun, created, updated, endAt int64
 	if err := row.Scan(&value.ID, &value.Name, &enabled, &value.DeviceID, &value.ProfileICCID,
-		&value.ProfileAID, &value.TaskType, &value.Environment, &value.IntervalDays,
+		&value.ProfileAID, &value.TaskType, &value.Environment, &value.IntervalDays, &value.IntervalSeconds, &endAt,
 		&value.StartDate, &value.RunTime, &value.Timezone, &payload, &value.RetryCount, &notify,
 		&nextRun, &lastRun, &value.LastStatus, &value.LastError, &created, &updated); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -321,6 +358,7 @@ func scanAutomaticTask(row rowScanner) (AutomaticTask, error) {
 	value.Enabled, value.Notify = enabled, notify
 	value.Payload = []byte(payload)
 	value.NextRunAt, value.LastRunAt = time.Unix(nextRun, 0).UTC(), timeFromUnix(lastRun)
+	value.EndAt = timeFromUnix(endAt)
 	value.CreatedAt, value.UpdatedAt = time.Unix(created, 0).UTC(), time.Unix(updated, 0).UTC()
 	return value, nil
 }

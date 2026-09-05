@@ -363,6 +363,12 @@ func findDiscoveredDevice(devices []device.Device, config deviceConfigPayload) *
 				return &devices[index]
 			}
 		}
+		if usbTopologyPath(config.USBPath) {
+			// The caller asked for a specific USB bus position that is not
+			// present. Do not hand back whichever modem currently owns the
+			// requested ttyUSB / cdc-wdm numbers; see physicalMatchesConfig.
+			return nil
+		}
 	}
 	if config.ControlDevice != "" {
 		for index := range devices {
@@ -476,6 +482,57 @@ func (s *Server) handleDeviceRescan(w http.ResponseWriter, r *http.Request) bool
 	return true
 }
 
+// deviceDeleteTeardownTimeout bounds how long DELETE /api/devices/{id} waits
+// for the VoWiFi runtime to de-register and close the tunnel before the record
+// is removed. A variable so tests can shorten it.
+var deviceDeleteTeardownTimeout = 20 * time.Second
+
+// stopVoWiFiBeforeDelete asks the VoWiFi runtime to disable the device and
+// waits for the teardown to finish. Deleting the row first used to leave an
+// orphan IKE tunnel and IMS registration behind: the network kept the old
+// Contact binding until REGISTER expiry (~3600 s) and could route MT SMS into
+// it, and the runtime worker kept retrying against a row that no longer
+// existed (FOREIGN KEY errors every 30 s). The returned label is reported to
+// the caller: "skipped", "not_running", "request_failed", "stopped" or
+// "timeout". The row is deleted regardless so the operator is never stuck.
+func (s *Server) stopVoWiFiBeforeDelete(ctx context.Context, config store.Device) string {
+	if s.vowifi == nil {
+		return "skipped"
+	}
+	state, err := s.vowifi.State(config.ID)
+	if err != nil {
+		if !config.VoWiFiEnabled {
+			return "not_running"
+		}
+	} else if !state.Enabled && !state.Active && !state.TunnelReady && !state.IMSReady {
+		return "not_running"
+	}
+	if _, err := s.vowifi.RequestEnabled(config.ID, false); err != nil &&
+		!errors.Is(err, vowifiruntime.ErrOperationInProgress) {
+		s.logger.Warn("request VoWiFi disable before device delete", "device_id", config.ID, "error", err)
+		return "request_failed"
+	}
+	deadline := time.NewTimer(deviceDeleteTeardownTimeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		state, err := s.vowifi.State(config.ID)
+		if err == nil && !state.Active && !state.TunnelReady && !state.IMSReady && state.Phase != vowifi.PhaseStopping {
+			return "stopped"
+		}
+		select {
+		case <-ctx.Done():
+			s.logger.Warn("VoWiFi teardown before device delete interrupted", "device_id", config.ID, "error", ctx.Err())
+			return "timeout"
+		case <-deadline.C:
+			s.logger.Warn("VoWiFi teardown before device delete timed out", "device_id", config.ID, "phase", state.Phase)
+			return "timeout"
+		case <-ticker.C:
+		}
+	}
+}
+
 func (s *Server) handleDevicePath(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -490,12 +547,17 @@ func (s *Server) handleDevicePath(
 	if len(tail) == 0 {
 		switch r.Method {
 		case http.MethodDelete:
+			teardown := s.stopVoWiFiBeforeDelete(r.Context(), config)
 			if err := s.store.DeleteDevice(r.Context(), id); err != nil {
 				s.writeStoreError(w, err)
 				return true
 			}
 			writeJSON(w, http.StatusOK, map[string]any{
-				"data": map[string]any{"deleted": true, "physical_device_untouched": true},
+				"data": map[string]any{
+					"deleted":                   true,
+					"physical_device_untouched": true,
+					"vowifi_teardown":           teardown,
+				},
 			})
 		case http.MethodPut:
 			var request struct {
@@ -1911,6 +1973,14 @@ func (s *Server) physicalForConfig(config store.Device) (device.Device, string, 
 	return device.Device{ID: config.ID}, "", false
 }
 
+// usbTopologyPath reports whether a sysfs path names a USB bus position such
+// as /sys/bus/usb/devices/1-1.3.4.2. Unlike /sys/class symlinks for PCIe or
+// MHI WWAN devices, a USB position has a single spelling, so two differing
+// positions always denote two different physical modems.
+func usbTopologyPath(path string) bool {
+	return strings.Contains(path, "/bus/usb/devices/")
+}
+
 func physicalMatchesConfig(entry device.Device, config store.Device) bool {
 	candidate := entry.Candidate
 	if entry.ID == config.ID {
@@ -1923,10 +1993,20 @@ func physicalMatchesConfig(entry device.Device, config store.Device) bool {
 		if config.USBPath == candidate.USBPath {
 			return true
 		}
+		if usbTopologyPath(config.USBPath) && usbTopologyPath(candidate.USBPath) {
+			// Both sides name a USB bus position and they differ, so this is a
+			// different physical modem. Never fall through to the ttyUSB /
+			// cdc-wdm names below: Linux hands those out in enumeration order
+			// and reuses them after a re-plug, which let a stale record claim a
+			// live modem and show one EC20 twice (all of them ship with the
+			// factory serial 0123456789ABCDEF, so the path is the identity).
+			return false
+		}
 		// Sysfs paths may be stored through /sys/class symlinks while a
-		// subsequent discovery returns the resolved device path. Keep checking
-		// the selected AT/QMI nodes instead of rejecting a modem whose physical
-		// path spelling changed but whose control plane is unchanged.
+		// subsequent discovery returns the resolved device path (PCIe/MHI WWAN).
+		// Keep checking the selected AT/QMI nodes instead of rejecting a modem
+		// whose physical path spelling changed but whose control plane is
+		// unchanged.
 	}
 	if candidate.HardwareKind == pcsc.HardwareKind && config.ControlDevice != "" && candidate.ReaderName != "" {
 		if config.ControlDevice == candidate.ReaderName {

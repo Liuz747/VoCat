@@ -25,7 +25,7 @@ func TestDeployTMobileIPhoneLikeProfileLoads(t *testing.T) {
 	if !opts.PPreferredIdentity {
 		t.Fatalf("P-Preferred-Identity should be enabled")
 	}
-	if opts.SupportedHeader == nil || *opts.SupportedHeader != "path, gruu, sec-agree" {
+	if opts.SupportedHeader == nil || *opts.SupportedHeader != "path, gruu, sec-agree, outbound" {
 		t.Fatalf("Supported = %v", opts.SupportedHeader)
 	}
 	if len(opts.ContactExtraTags) != 4 || opts.ContactExtraTags[2] != "+g.3gpp.srvcc-alerting" {

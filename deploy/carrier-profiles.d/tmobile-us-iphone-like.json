@@ -4,28 +4,429 @@
     {
       "id": "tmobile-us-iphone-like",
       "match_any": [
-        { "home_plmns": ["310240"] },
-        { "home_plmns": ["310260"] }
+        {
+          "home_plmns": [
+            "310240"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "DD"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "DD"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "4753"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "4753"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "AB"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "AB"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "6C"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "6C"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "43"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "43"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "4201"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "4201"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "4276"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "4276"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "73"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "73"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "57"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "57"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "6133"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "6133"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "6134"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "6134"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "6136"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "6136"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "6137"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "6137"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "6138"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "6138"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "4C"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "4C"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "4E"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "4E"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "4B"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "4B"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "82"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "82"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "74"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "74"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "72"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "72"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "70"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "70"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "69"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "69"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "514C"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "514C"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310240"
+          ],
+          "gid1_prefixes": [
+            "1A53"
+          ]
+        },
+        {
+          "home_plmns": [
+            "310260"
+          ],
+          "gid1_prefixes": [
+            "1A53"
+          ]
+        }
       ],
+      "epdg": {
+        "hostname": "ss.epdg.epc.mnc260.mcc310.pub.3gppnetwork.org"
+      },
+      "ike": {
+        "proposal": "modern"
+      },
       "ims": {
         "user_agent": "iOS/18.2.1 iPhone (iPhone15,4)",
         "pani_enabled": true,
         "register_options": {
           "contact_format": "standard",
+          "outbound_reg_id": 1,
+          "deregister_all_on_close": true,
           "contact_extra_tags": [
             "video",
             "+g.3gpp.mid-call",
             "+g.3gpp.srvcc-alerting",
             "+g.3gpp.ps2cs-srvcc-orig-pre-alerting"
           ],
-          "supported_header": "path, gruu, sec-agree",
+          "supported_header": "path, gruu, sec-agree, outbound",
           "allow_header": "INVITE, ACK, CANCEL, BYE, UPDATE, REFER, NOTIFY, MESSAGE, PRACK, OPTIONS, INFO",
           "p_preferred_identity": true,
           "accept_contact_tags": [
             "*;+g.3gpp.smsip",
             "*;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\""
           ]
-        }
+        },
+        "ipsec_encryption": "aes-cbc"
       }
     }
   ]

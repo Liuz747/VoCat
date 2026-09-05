@@ -111,3 +111,20 @@ export interface EsimDownloadForm {
   confirmationCode: string;
   aidHex: string;
 }
+
+// Enabled profile-rotation automatic task, shown as a reminder on the device it drives.
+export interface RotationTaskSummary {
+  id: number;
+  name: string;
+  enabled: boolean;
+  deviceId: string;
+  taskType: string;
+  intervalSeconds: number;
+  nextRunAt: string;
+  endAt?: string;
+  payload?: { profiles?: Array<{ iccid: string; name?: string }> };
+}
+
+export function rotationSequenceText(task: RotationTaskSummary): string {
+  return (task.payload?.profiles || []).map((profile) => profile.name || `…${profile.iccid.slice(-4)}`).join(" → ");
+}

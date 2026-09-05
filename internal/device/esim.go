@@ -278,6 +278,9 @@ func (channel *euiccChannel) recoverCATBusy(ctx context.Context) error {
 // the modem's default 3s command timeout, so eSIM APDUs get a longer budget.
 const csimAPDUTimeout = 30 * time.Second
 
+// profileSwitchSIMReadyTimeout bounds the wait for +CPIN: READY after EnableProfile.
+const profileSwitchSIMReadyTimeout = 20 * time.Second
+
 // csim sends one raw APDU over AT+CSIM and returns payload + status word.
 func (manager *Manager) csim(ctx context.Context, id string, apdu []byte) ([]byte, int, error) {
 	command := fmt.Sprintf("AT+CSIM=%d,\"%s\"", len(apdu)*2, strings.ToUpper(hex.EncodeToString(apdu)))
@@ -818,7 +821,7 @@ func boundESIMContext(ctx context.Context) (context.Context, context.CancelFunc)
 }
 
 // ESIMSwitchProfile enables one profile by ICCID via ES10c EnableProfile.
-func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid string, aidHex string) error {
+func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid string, aidHex string) (err error) {
 	iccid = strings.TrimSpace(iccid)
 	if iccid == "" {
 		return errors.New("esim: an ICCID is required")
@@ -827,21 +830,30 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 	if nativeErr != nil {
 		return nativeErr
 	}
+	timer := newProfileSwitchTimer(manager.logger, id, iccid, nil)
+	defer func() { timer.finish(err) }()
+	manager.holdPhoneReads(id, phoneReadHoldAfterSwitch)
 	manager.lockESIM()
 	if err := manager.waitForESIMRecovery(ctx, id); err != nil {
 		manager.unlockESIM()
 		return err
 	}
+	timer.stage("lock_and_prior_recovery")
 	channel, err := manager.openEuiccAID(ctx, id, targetEuiccAID(aidHex))
 	if err != nil {
 		manager.unlockESIM()
 		return err
 	}
+	timer.stage("open_channel")
 	refreshRequested := !nativeQMI
 	if nativeQMI {
 		refreshContext, cancelRefresh := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		refreshRequested, err = channel.registerProfileRefresh(refreshContext)
 		cancelRefresh()
+		timer.stage("register_refresh")
+		if manager.logger != nil {
+			manager.logger.Info("eSIM profile switch refresh registration", "device_id", id, "refresh_requested", refreshRequested, "error", err)
+		}
 		if err != nil {
 			channel.close(context.Background())
 			manager.unlockESIM()
@@ -876,6 +888,7 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 	commitContext, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), csimAPDUTimeout)
 	payload, err := channel.es10(commitContext, der)
 	cancelCommit()
+	timer.stage("enable_profile_apdu")
 	// A rejected EnableProfile (for example CAT busy) does not emit REFRESH.
 	// Parse the card-level result before waiting for an indication, otherwise
 	// every retry needlessly waits for the refresh timeout.
@@ -900,8 +913,12 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 		enableProfileResponseError(byte(resultBeforeClose), payload) == nil &&
 		refreshRequested && nativeQMI {
 		refreshContext, cancelRefresh := context.WithTimeout(context.Background(), 20*time.Second)
-		_ = channel.completeProfileRefresh(refreshContext)
+		refreshErr := channel.completeProfileRefresh(refreshContext)
 		cancelRefresh()
+		timer.stage("refresh_wait")
+		if manager.logger != nil {
+			manager.logger.Info("eSIM profile switch refresh wait ended", "device_id", id, "error", refreshErr)
+		}
 	}
 	// Release the logical channel before any reset: openEuicc's csim holds
 	// opMu only for the duration of each APDU, so by here the lock is free.
@@ -909,6 +926,7 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 	channel.resetOnClose = channel.pcscSession != nil
 	channel.close(closeContext)
 	cancelClose()
+	timer.stage("close_channel")
 	if err != nil {
 		// The card may have committed immediately before the transport error. A
 		// detached reset is safe in either case and prevents an uncertain switch
@@ -955,7 +973,19 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 		)
 		probeErr := manager.verifySwitchedICCIDAttempts(probeContext, id, iccid, 3, time.Second)
 		cancelProbe()
+		timer.stage("refresh_probe")
 		if probeErr == nil {
+			// The ICCID is already readable, but the modem's SIM stack is still
+			// initialising after the eUICC REFRESH. Let it reach READY before the
+			// snapshot below; otherwise readSnapshot treats the card as hot-swapped
+			// and its QMI ICCID read blocks for the whole long timeout.
+			readyContext, cancelReady := context.WithTimeout(context.WithoutCancel(ctx), profileSwitchSIMReadyTimeout)
+			readyErr := manager.waitForSIMReadyAfterSwitch(readyContext, id, 300*time.Millisecond)
+			cancelReady()
+			timer.stage("wait_sim_ready")
+			if manager.logger != nil && readyErr != nil {
+				manager.logger.Warn("eSIM profile switch SIM did not report READY in time", "device_id", id, "error", readyErr)
+			}
 			// Repopulate the cached snapshot while the AT transport is still live.
 			// Verification above is authoritative, so snapshot refresh remains
 			// best-effort just as it is after the legacy reboot path.
@@ -963,12 +993,17 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 				context.WithoutCancel(ctx),
 				manager.longTimeout,
 			)
-			_, _ = manager.Refresh(refreshContext, id)
+			_, refreshErr := manager.Refresh(refreshContext, id)
 			cancelRefresh()
+			timer.stage("snapshot_after_probe")
+			if manager.logger != nil && refreshErr != nil {
+				manager.logger.Info("eSIM profile switch snapshot after probe failed", "device_id", id, "error", refreshErr)
+			}
 			manager.unlockESIM()
 			mbnContext, cancelMBN := context.WithTimeout(context.WithoutCancel(ctx), profileSwitchVerificationTimeout(manager))
 			defer cancelMBN()
 			manager.reconcileEC20MBNAfterProfileSwitchBestEffort(mbnContext, id, iccid)
+			timer.stage("mbn_reconcile")
 			return nil
 		}
 	}
@@ -980,15 +1015,18 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 
 	verifyContext, cancelVerify := context.WithTimeout(context.WithoutCancel(ctx), profileSwitchVerificationTimeout(manager))
 	defer cancelVerify()
-	if err := manager.waitForESIMRecovery(verifyContext, id); err != nil {
+	if err = manager.waitForESIMRecovery(verifyContext, id); err != nil {
 		return err
 	}
-	if err := manager.verifySwitchedICCID(verifyContext, id, iccid); err != nil {
+	timer.stage("recovery_power_cycle")
+	if err = manager.verifySwitchedICCID(verifyContext, id, iccid); err != nil {
 		return err
 	}
+	timer.stage("verify_iccid")
 	mbnContext, cancelMBN := context.WithTimeout(context.WithoutCancel(ctx), profileSwitchVerificationTimeout(manager))
 	defer cancelMBN()
 	manager.reconcileEC20MBNAfterProfileSwitchBestEffort(mbnContext, id, iccid)
+	timer.stage("mbn_reconcile")
 	return nil
 }
 

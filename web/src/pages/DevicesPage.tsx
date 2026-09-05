@@ -8,6 +8,7 @@ import { useMediaQuery } from "../lib/useMediaQuery";
 import { Button, PageHeader, RefreshButton, ErrorState, ListSkeleton, Tabs, confirmDialog, message } from "../components/ui";
 import { DeviceListPanel, type StatusFilter, type SortDir, type SortKey } from "../components/devices/DeviceListPanel";
 import { DeviceDetailHeader } from "../components/devices/DeviceDetailHeader";
+import type { RotationTaskSummary } from "../components/devices/types";
 import { DeviceOverviewTab } from "../components/devices/DeviceOverviewTab";
 import { DeviceEsimTab } from "../components/devices/DeviceEsimTab";
 import { DeviceAtTab } from "../components/devices/DeviceAtTab";
@@ -180,6 +181,13 @@ export default function DevicesPage() {
     [loadDetail, loadConfig, setSearchParams],
   );
 
+  const [rotationTasks, setRotationTasks] = useState<RotationTaskSummary[]>([]);
+  const rotationByDevice = useMemo(() => {
+    const map = new Map<string, RotationTaskSummary>();
+    for (const task of rotationTasks) if (!map.has(task.deviceId)) map.set(task.deviceId, task);
+    return map;
+  }, [rotationTasks]);
+
   const loadDevices = useCallback(
     async (manual: boolean) => {
       if (manual) {
@@ -187,9 +195,13 @@ export default function DevicesPage() {
         setListError(null);
       }
       try {
-        const res = await api<{ devices?: DeviceListItem[]; deviceLimit?: number }>("/devices");
+        const [res, taskRes] = await Promise.all([
+          api<{ devices?: DeviceListItem[]; deviceLimit?: number }>("/devices"),
+          api<{ tasks?: RotationTaskSummary[] }>("/automatic-tasks").catch(() => ({ tasks: [] as RotationTaskSummary[] })),
+        ]);
         const devices = res?.devices || [];
         setList(devices);
+        setRotationTasks((taskRes?.tasks || []).filter((task) => task.enabled && task.taskType === "profile_rotation"));
         setDeviceLimit(typeof res?.deviceLimit === "number" ? res.deviceLimit : 0);
         setLastOkAt(Date.now());
         if (manual) setListError(null);
@@ -729,6 +741,7 @@ export default function DevicesPage() {
             sortDir={sortDir}
             selectedId={selectedId}
             filteredDevices={filteredDevices}
+            rotationDeviceIds={rotationByDevice}
             deviceCount={list.length}
             deviceLimit={deviceLimit}
             onQueryChange={setQuery}
@@ -748,6 +761,7 @@ export default function DevicesPage() {
             <>
 			<DeviceDetailHeader
 				device={detail}
+				rotationTask={rotationByDevice.get(detail.id)}
 				dataToggling={dataToggling || detail.modemPhase === "rebooting" || ["starting", "stopping"].includes(detail.networkPhase || "")}
 				dataToggleTarget={detail.modemPhase === "rebooting" ? null : dataToggling ? dataToggleTarget : detail.networkPhase === "starting" ? true : detail.networkPhase === "stopping" ? false : null}
 				modemRebooting={detail.modemPhase === "rebooting"}

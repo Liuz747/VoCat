@@ -37,6 +37,8 @@ type Manager struct {
 	opener         modem.Opener
 	commandTimeout time.Duration
 	longTimeout    time.Duration
+	phoneHoldMu    sync.Mutex
+	phoneHold      map[string]time.Time
 	smsTimeout     time.Duration
 	scanTimeout    time.Duration
 	cardReaders    *pcsc.Service
