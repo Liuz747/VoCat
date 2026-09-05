@@ -2,6 +2,7 @@ package device
 
 import (
 	"errors"
+	"strings"
 	"time"
 
 	"vocat/internal/modem"
@@ -257,4 +258,13 @@ type SMSSendResult struct {
 	AllPartsAccepted  bool            `json:"allPartsAccepted"`
 	ConcatReference   *int            `json:"concatReference,omitempty"`
 	PartResults       []SMSPartResult `json:"partResults"`
+}
+
+// USBTopologyPath reports whether a sysfs path names a USB bus position such as
+// /sys/bus/usb/devices/1-1.3.4.2. Unlike the /sys/class symlinks used by PCIe
+// or MHI WWAN devices, a USB position has a single spelling, so two differing
+// positions always denote two different physical modems. ttyUSB and cdc-wdm
+// names, by contrast, are reassigned by the kernel on every re-enumeration.
+func USBTopologyPath(path string) bool {
+	return strings.Contains(path, "/bus/usb/devices/")
 }

@@ -1978,7 +1978,7 @@ func (s *Server) physicalForConfig(config store.Device) (device.Device, string, 
 // MHI WWAN devices, a USB position has a single spelling, so two differing
 // positions always denote two different physical modems.
 func usbTopologyPath(path string) bool {
-	return strings.Contains(path, "/bus/usb/devices/")
+	return device.USBTopologyPath(path)
 }
 
 func physicalMatchesConfig(entry device.Device, config store.Device) bool {

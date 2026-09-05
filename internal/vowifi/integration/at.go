@@ -173,9 +173,18 @@ func physicalMatchScore(configuredID string, config store.Device, entry device.D
 	score := 0
 	// A live modem identity is the strongest evidence and must override stale
 	// Linux node names or a USB topology saved before devices were rearranged.
-	if config.ModemIMEI != "" && entry.Snapshot != nil &&
-		strings.EqualFold(strings.TrimSpace(config.ModemIMEI), strings.TrimSpace(entry.Snapshot.IMEI)) {
+	imeiMatches := config.ModemIMEI != "" && entry.Snapshot != nil &&
+		strings.EqualFold(strings.TrimSpace(config.ModemIMEI), strings.TrimSpace(entry.Snapshot.IMEI))
+	if imeiMatches {
 		score += 10000
+	} else if device.USBTopologyPath(config.USBPath) && device.USBTopologyPath(candidate.USBPath) &&
+		!strings.EqualFold(strings.TrimSpace(config.USBPath), strings.TrimSpace(candidate.USBPath)) {
+		// Two USB bus positions are two modems. ttyUSB and cdc-wdm names are
+		// recycled on re-enumeration, so a coincidental node-name match must not
+		// bind this record to another modem: that produced two logical devices
+		// registering one IMPU with a single instance-id in production
+		// (DEVICE-REPORT §24 for the server-side twin of this bug, §25.15).
+		return 0
 	}
 	if config.ATPort != "" &&
 		(config.ATPort == candidate.ATPort.Path || config.ATPort == candidate.ATPort.OpenPath()) {
@@ -186,7 +195,8 @@ func physicalMatchScore(configuredID string, config store.Device, entry device.D
 		score += 300
 	}
 	if config.USBPath != "" && config.USBPath == candidate.USBPath {
-		score += 100
+		// Above the node names: the bus position survives re-enumeration.
+		score += 1000
 	}
 	// Discovery IDs are not persistent user IDs. Treat an exact text match only
 	// as a weak hint so it cannot override physical identity evidence.

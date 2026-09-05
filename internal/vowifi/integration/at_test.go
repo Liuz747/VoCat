@@ -88,7 +88,10 @@ func TestATMapperResolvesConfiguredIDByStableATPath(t *testing.T) {
 	}
 }
 
-func TestATMapperScoresAllCandidatesBeforeUsingStaleUSBPath(t *testing.T) {
+// A ttyUSB/cdc-wdm pair is recycled by the kernel on every re-enumeration, so
+// a coincidental node-name match must never outvote the USB bus position: two
+// different positions are two different modems (DEVICE-REPORT §24, §25.15).
+func TestATMapperTrustsUSBTopologyOverRecycledNodeNames(t *testing.T) {
 	database := testStore(t)
 	if err := database.UpsertDevice(context.Background(), store.Device{
 		ID:            "ec20_1",
@@ -125,8 +128,8 @@ func TestATMapperScoresAllCandidatesBeforeUsingStaleUSBPath(t *testing.T) {
 	if _, err := mapper.ExecuteAT(context.Background(), "ec20_1", "AT+CIMI"); err != nil {
 		t.Fatal(err)
 	}
-	if devices.executedID != "quectel-0306-1-5" {
-		t.Fatalf("ExecuteAT physical ID = %q, want coherent AT/QMI candidate", devices.executedID)
+	if devices.executedID != "quectel-0125-1-6" {
+		t.Fatalf("ExecuteAT physical ID = %q, want the modem at the configured USB position", devices.executedID)
 	}
 }
 
@@ -170,5 +173,50 @@ func TestATMapperPrefersLiveIMEIOverAllStalePaths(t *testing.T) {
 	}
 	if devices.executedID != "live-imei" {
 		t.Fatalf("ExecuteAT physical ID = %q, want live IMEI candidate", devices.executedID)
+	}
+}
+
+
+// Regression (production, 2026-09-05): device 1-1-3-1 kept its 09-03 node names
+// (/dev/ttyUSB2, /dev/cdc-wdm1). After a hub reset those names were handed to
+// the modem at 1-1.3.4.2, so the VoWiFi runtime of 1-1-3-1 bound to that modem
+// and both logical devices registered the same IMPU with one instance-id.
+func TestATMapperIgnoresNodeNamesInheritedByAnotherModem(t *testing.T) {
+	database := testStore(t)
+	if err := database.UpsertDevice(context.Background(), store.Device{
+		ID:            "line-3-1",
+		Name:          "EC20 3-1",
+		ATPort:        "/dev/ttyUSB2",
+		ControlDevice: "/dev/cdc-wdm1",
+		USBPath:       "/sys/bus/usb/devices/1-1.3.1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	devices := &fakeATDevices{entries: []device.Device{
+		{
+			ID:         "rotating-modem",
+			Discovered: true,
+			Candidate: modem.Candidate{
+				USBPath:    "/sys/bus/usb/devices/1-1.3.4.2",
+				QMIControl: "/dev/cdc-wdm1",
+				ATPort:     modem.Port{Path: "/dev/ttyUSB2"},
+			},
+		},
+		{
+			ID:         "own-modem",
+			Discovered: true,
+			Candidate: modem.Candidate{
+				USBPath:    "/sys/bus/usb/devices/1-1.3.1",
+				QMIControl: "/dev/cdc-wdm3",
+				ATPort:     modem.Port{Path: "/dev/ttyUSB10"},
+			},
+		},
+	}}
+	mapper := ATMapper{Store: database, Devices: devices}
+	if _, err := mapper.ExecuteAT(context.Background(), "line-3-1", "AT+CIMI"); err != nil {
+		t.Fatal(err)
+	}
+	if devices.executedID != "own-modem" {
+		t.Fatalf("ExecuteAT physical ID = %q, want the modem at the configured USB position", devices.executedID)
 	}
 }
