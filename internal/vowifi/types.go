@@ -485,11 +485,17 @@ type Options struct {
 	AllowMissingResponderAUTH bool
 	AllowIMSWithoutSMS        bool
 	CleanupTimeout            time.Duration
+	// IMSRegistrationTimeout bounds one IMS registration attempt (see
+	// defaultIMSRegistrationTimeout). Zero selects the default.
+	IMSRegistrationTimeout time.Duration
 }
 
 func (options Options) validate() error {
 	if strings.TrimSpace(options.DeviceID) == "" {
 		return errors.New("vowifi: device ID is required")
+	}
+	if options.IMSRegistrationTimeout < 0 {
+		return errors.New("vowifi: IMS registration timeout must not be negative")
 	}
 	if options.CleanupTimeout < 0 {
 		return errors.New("vowifi: cleanup timeout must not be negative")

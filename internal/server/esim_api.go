@@ -547,7 +547,14 @@ func (s *Server) quiesceVoWiFiForProfileSwitch(ctx context.Context, configuredID
 		return nil
 	}
 	if _, err := s.vowifi.RequestEnabled(configuredID, false); err != nil {
-		return fmt.Errorf("stop VoWiFi before switching profile: %w", err)
+		// The runtime has already released the tunnel, IMS session and radio;
+		// only the best-effort SIP de-registration failed. That leaves a
+		// binding the next REGISTER purges, and must not block the switch.
+		if !errors.Is(err, vowifi.ErrCleanupIncomplete) {
+			return fmt.Errorf("stop VoWiFi before switching profile: %w", err)
+		}
+		s.logger.Warn("VoWiFi stopped with an incomplete de-registration before profile switch",
+			"device_id", configuredID, "error", err)
 	}
 	waitContext, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()

@@ -15,6 +15,7 @@ import (
 
 	"vocat/internal/device"
 	"vocat/internal/exportproxy"
+	"vocat/internal/loghub"
 	"vocat/internal/store"
 )
 
@@ -23,7 +24,10 @@ const (
 	automaticTaskMaxRuntime   = 8 * time.Minute
 	// Profile rotation dwell bounds: the time a profile stays online after its
 	// VoWiFi tunnel is ready before the next profile is enabled.
-	automaticRotationMinDwellSeconds = 5
+	automaticRotationMinDwellSeconds = 2
+	// automaticDevicePresenceWait covers the moment a modem is re-enumerating
+	// after an eUICC REFRESH.
+	automaticDevicePresenceWait      = 20 * time.Second
 	automaticRotationMaxDwellSeconds = 86400
 )
 
@@ -40,6 +44,25 @@ type automaticTaskPayload struct {
 	Message         string                         `json:"message,omitempty"`
 	DurationSeconds int                            `json:"duration_seconds,omitempty"`
 	Profiles        []automaticTaskRotationProfile `json:"profiles,omitempty"`
+}
+
+// rotationRunState pins the target profile for every attempt of one run: if
+// attempt 1 switched the card but failed later (for example the VoWiFi wait
+// timed out), attempt 2 must finish the same target instead of skipping a
+// profile.
+type rotationRunState struct {
+	target *automaticTaskRotationProfile
+}
+
+type rotationRunContextKey struct{}
+
+func withRotationRun(ctx context.Context, state *rotationRunState) context.Context {
+	return context.WithValue(ctx, rotationRunContextKey{}, state)
+}
+
+func rotationRunFromContext(ctx context.Context) *rotationRunState {
+	state, _ := ctx.Value(rotationRunContextKey{}).(*rotationRunState)
+	return state
 }
 
 // nextRotationProfile picks the profile after the one currently enabled on
@@ -191,6 +214,7 @@ func (scheduler *automaticTaskScheduler) execute(run store.AutomaticTaskRun) {
 	run.Status, run.StartedAt = "running", time.Now().UTC()
 	_ = scheduler.server.store.UpdateAutomaticTaskRun(context.Background(), run)
 	var output string
+	runState := &rotationRunState{}
 	for attempt := 1; attempt <= task.RetryCount+1; attempt++ {
 		run.Attempts = attempt
 		run.Output = fmt.Sprintf("第 %d 次尝试：正在检查设备和 eSIM Profile", attempt)
@@ -200,7 +224,7 @@ func (scheduler *automaticTaskScheduler) execute(run store.AutomaticTaskRun) {
 			_ = scheduler.server.store.UpdateAutomaticTaskRun(context.Background(), run)
 		}
 		operationContext, cancel := context.WithTimeout(scheduler.ctx, automaticTaskMaxRuntime)
-		output, err = scheduler.server.executeAutomaticTask(operationContext, task, progress)
+		output, err = scheduler.server.executeAutomaticTask(withRotationRun(operationContext, runState), task, progress)
 		cancel()
 		if err == nil {
 			break
@@ -213,7 +237,7 @@ func (scheduler *automaticTaskScheduler) execute(run store.AutomaticTaskRun) {
 			// A device error may contain the full AT command, including APN
 			// credentials. The persisted run retains a user-facing outcome; logs
 			// contain only non-sensitive execution metadata.
-			scheduler.server.logger.Warn("automatic task attempt failed", "task_id", task.ID, "device_id", task.DeviceID, "attempt", attempt)
+			scheduler.server.logger.Warn("automatic task attempt failed", "task_id", task.ID, "device_id", task.DeviceID, "attempt", attempt, "error", loghub.RedactString(err.Error()))
 			select {
 			case <-scheduler.ctx.Done():
 				break
@@ -330,15 +354,33 @@ func (s *Server) resolveRotationTarget(ctx context.Context, task store.Automatic
 	if err := validateAutomaticTaskRotation(payload.Profiles, task.IntervalSeconds); err != nil {
 		return automaticTaskRotationProfile{}, automaticTaskExecutionError{err: err, retryable: false}
 	}
+	runState := rotationRunFromContext(ctx)
+	if runState != nil && runState.target != nil {
+		return *runState.target, nil
+	}
 	config, err := s.store.Device(ctx, task.DeviceID)
 	if err != nil {
 		return automaticTaskRotationProfile{}, fmt.Errorf("read device: %w", err)
 	}
-	entry, _, present := s.physicalForConfig(config)
-	if !present || entry.Snapshot == nil {
-		return automaticTaskRotationProfile{}, errors.New("configured device is offline")
+	entry, physicalID, err := s.waitForPhysicalDevice(ctx, config, automaticDevicePresenceWait)
+	if err != nil {
+		return automaticTaskRotationProfile{}, err
 	}
-	return nextRotationProfile(payload.Profiles, entry.Snapshot.ICCID)
+	// The cached snapshot can lag behind a switch made by a failed earlier run;
+	// read the ICCID the modem reports now.
+	currentICCID := entry.Snapshot.ICCID
+	if snapshot, refreshErr := s.devices.Refresh(ctx, physicalID); refreshErr == nil && strings.TrimSpace(snapshot.ICCID) != "" {
+		currentICCID = snapshot.ICCID
+	}
+	target, err := nextRotationProfile(payload.Profiles, currentICCID)
+	if err != nil {
+		return automaticTaskRotationProfile{}, err
+	}
+	if runState != nil {
+		pinned := target
+		runState.target = &pinned
+	}
+	return target, nil
 }
 
 // formatRotationTiming renders the two halves of a rotation run for the run
@@ -355,6 +397,28 @@ func lastDigits(value string, count int) string {
 	return value[len(value)-count:]
 }
 
+// waitForPhysicalDevice rides out the short window in which the modem is not
+// enumerated: an eUICC REFRESH (and the SIM re-initialisation behind it) makes
+// the device disappear from the manager's list for a moment, which is not the
+// same as a device that is really gone.
+func (s *Server) waitForPhysicalDevice(ctx context.Context, config store.Device, timeout time.Duration) (device.Device, string, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		entry, physicalID, present := s.physicalForConfig(config)
+		if present && entry.Snapshot != nil {
+			return entry, physicalID, nil
+		}
+		if !time.Now().Before(deadline) {
+			return device.Device{}, "", errors.New("configured device is offline")
+		}
+		select {
+		case <-ctx.Done():
+			return device.Device{}, "", ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
 func (s *Server) ensureAutomaticTaskProfile(ctx context.Context, task store.AutomaticTask, progress automaticTaskProgress) (store.Device, device.Device, string, error) {
 	config, err := s.store.Device(ctx, task.DeviceID)
 	if err != nil {
@@ -363,9 +427,9 @@ func (s *Server) ensureAutomaticTaskProfile(ctx context.Context, task store.Auto
 	if err := validateAutomaticTaskDeviceCapabilities(config, task.TaskType, task.Environment); err != nil {
 		return store.Device{}, device.Device{}, "", err
 	}
-	entry, physicalID, present := s.physicalForConfig(config)
-	if !present || entry.Snapshot == nil {
-		return store.Device{}, device.Device{}, "", errors.New("configured device is offline")
+	entry, physicalID, err := s.waitForPhysicalDevice(ctx, config, automaticDevicePresenceWait)
+	if err != nil {
+		return store.Device{}, device.Device{}, "", err
 	}
 	if strings.EqualFold(strings.TrimSpace(entry.Snapshot.ICCID), strings.TrimSpace(task.ProfileICCID)) {
 		return config, entry, physicalID, nil
@@ -418,9 +482,9 @@ func (s *Server) ensureAutomaticTaskProfile(ctx context.Context, task store.Auto
 		return store.Device{}, device.Device{}, "", fmt.Errorf("keep airplane mode after profile switch: %w", err)
 	}
 	stage("set_flight_again")
-	entry, physicalID, present = s.physicalForConfig(config)
-	if !present {
-		return store.Device{}, device.Device{}, "", errors.New("device did not recover after profile switch")
+	entry, physicalID, err = s.waitForPhysicalDevice(ctx, config, automaticDevicePresenceWait)
+	if err != nil {
+		return store.Device{}, device.Device{}, "", fmt.Errorf("device did not recover after profile switch: %w", err)
 	}
 	snapshot, err := s.devices.Refresh(ctx, physicalID)
 	if err != nil {
@@ -486,7 +550,7 @@ func (s *Server) prepareAutomaticTaskEnvironment(ctx context.Context, config *st
 		if stateErr != nil {
 			return fmt.Errorf("start VoWiFi: %w", stateErr)
 		}
-		return s.waitAutomaticVoWiFi(ctx, config.ID, iccid, task.TaskType == "sms")
+		return s.waitAutomaticVoWiFi(ctx, config.ID, iccid, task.TaskType == "sms" || task.TaskType == "profile_rotation")
 	}
 	if s.vowifi != nil {
 		if state, stateErr := s.vowifi.State(config.ID); stateErr == nil && (state.Enabled || state.Active) {
@@ -553,7 +617,10 @@ func (s *Server) waitAutomaticVoWiFi(ctx context.Context, deviceID, iccid string
 		if err == nil && state.IMSReady && (!requireSMS || state.SMSReady) && (state.ICCID == "" || strings.EqualFold(state.ICCID, iccid)) {
 			return nil
 		}
-		if err == nil && state.LastError != "" && !state.Active && !state.Enabled {
+		// A "cleanup_warning" is the previous profile's best-effort
+		// de-registration failing; the runtime is idle and our enable request
+		// is still queued, so it must not be mistaken for a failed start.
+		if err == nil && state.LastError != "" && state.LastErrorClass != "cleanup_warning" && !state.Active && !state.Enabled {
 			return errors.New(state.LastError)
 		}
 		select {

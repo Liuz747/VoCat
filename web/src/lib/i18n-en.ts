@@ -98,7 +98,7 @@ export const EN_DICT: Record<string, string> = {
   "SIM / Profile": "SIM / Profile",
   "轮询切换 eSIM Profile": "Rotate eSIM profiles",
   "轮询至少需要勾选 2 个 eSIM Profile": "Select at least 2 eSIM profiles to rotate",
-  "停留时间需在 5–86400 秒之间": "Dwell time must be between 5 and 86400 seconds",
+  "停留时间需在 2–86400 秒之间": "Dwell time must be between 2 and 86400 seconds",
   "连续轮询": "Continuous rotation",
   "停留 {seconds} 秒": "dwell {seconds} s",
   "轮询的 eSIM Profile（勾选顺序即轮询顺序）": "eSIM profiles to rotate (tick order = rotation order)",

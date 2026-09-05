@@ -50,8 +50,12 @@ func (timer *profileSwitchTimer) finish(err error) {
 	if timer == nil || timer.logger == nil {
 		return
 	}
+	errText := ""
+	if err != nil {
+		errText = err.Error()
+	}
 	timer.logger.Info("eSIM profile switch finished",
-		"device_id", timer.id, "iccid", timer.iccid, "ok", err == nil,
+		"device_id", timer.id, "iccid", timer.iccid, "ok", err == nil, "error", errText,
 		"total_ms", timer.now().Sub(timer.start).Milliseconds())
 }
 

@@ -12,6 +12,14 @@ import (
 
 const defaultCleanupTimeout = 10 * time.Second
 
+// defaultIMSRegistrationTimeout bounds one IMS registration attempt. A P-CSCF
+// that answers the first REGISTER and then goes silent otherwise consumes the
+// caller's whole operation budget (120 s measured), while the runtime's own
+// retry registers in about three seconds. A registration that is going to
+// succeed completes in 2-6 s on T-Mobile US over VoWiFi, so this leaves ample
+// headroom while keeping a stalled attempt short.
+const defaultIMSRegistrationTimeout = 20 * time.Second
+
 type runtimeResources struct {
 	cancel       context.CancelFunc
 	radio        RadioSnapshot
@@ -42,6 +50,9 @@ func New(deps Dependencies, options Options) (*Orchestrator, error) {
 	}
 	if err := options.validate(); err != nil {
 		return nil, err
+	}
+	if options.IMSRegistrationTimeout == 0 {
+		options.IMSRegistrationTimeout = defaultIMSRegistrationTimeout
 	}
 	if options.CleanupTimeout == 0 {
 		options.CleanupTimeout = defaultCleanupTimeout
@@ -322,11 +333,26 @@ func (orchestrator *Orchestrator) Enable(ctx context.Context) (State, error) {
 	})
 	orchestrator.watchRuntimeTunnel(runtimeContext, resources, tunnel)
 
-	ims, err := orchestrator.deps.IMS.Start(setupContext, IMSRequest{
-		DeviceID: orchestrator.options.DeviceID,
-		Identity: identity,
-		Tunnel:   tunnel,
-	})
+	ims, err := func() (IMSSession, error) {
+		registrationContext := setupContext
+		if budget := orchestrator.options.IMSRegistrationTimeout; budget > 0 {
+			var cancel context.CancelFunc
+			registrationContext, cancel = context.WithTimeout(setupContext, budget)
+			defer cancel()
+		}
+		// The session does not retain this context, so cancelling it as soon as
+		// Start returns bounds only the registration exchange.
+		session, startErr := orchestrator.deps.IMS.Start(registrationContext, IMSRequest{
+			DeviceID: orchestrator.options.DeviceID,
+			Identity: identity,
+			Tunnel:   tunnel,
+		})
+		if startErr != nil && registrationContext.Err() != nil && setupContext.Err() == nil {
+			return nil, fmt.Errorf("IMS registration did not complete within %s: %w",
+				orchestrator.options.IMSRegistrationTimeout, startErr)
+		}
+		return session, startErr
+	}()
 	if err != nil {
 		return fail(PhaseIMSReady, err)
 	}

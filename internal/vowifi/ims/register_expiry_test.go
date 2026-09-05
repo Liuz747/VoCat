@@ -179,9 +179,10 @@ func TestCloseSurfacesDeregistrationRejectionReason(t *testing.T) {
 				if headers["expires"] != "0" {
 					return nil, true, fmt.Errorf("deregister Expires = %q, want 0", headers["expires"])
 				}
+				// Close() retries a rejected de-registration once; answer both.
 				return testResponse(400, "Bad Request", callID, headers["cseq"], []string{
 					`Warning: 399 registrar "security verify missing"`,
-				}), true, nil
+				}), step >= 3, nil
 			}
 		})
 	}()
@@ -340,5 +341,100 @@ func TestCloseDeregistersAllBindingsWithWildcardContact(t *testing.T) {
 	}
 	if err := <-serverDone; err != nil {
 		t.Fatalf("registrar error = %v", err)
+	}
+}
+
+// Regression: T-Mobile intermittently answers a wildcard (Contact: *)
+// de-registration with 480 "Function is not allowed". Close() must retry once
+// with the specific Contact binding instead of leaving an orphan binding.
+func TestCloseRetriesDeregistrationWithSpecificContactAfter480(t *testing.T) {
+	listener, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	_ = listener.SetDeadline(time.Now().Add(10 * time.Second))
+	nonce := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	serverDone := make(chan error, 1)
+	var deregisterContacts []string
+	go func() {
+		serverDone <- serveScriptedRegistrar(listener, func(step int, headers map[string]string, callID string) ([]byte, bool, error) {
+			switch step {
+			case 0:
+				return challengeResponse(callID, headers["cseq"], nonce), false, nil
+			case 1:
+				return okRegistration(callID, headers["cseq"], headers["contact"]), false, nil
+			case 2:
+				deregisterContacts = append(deregisterContacts, headers["contact"])
+				return testResponse(480, "Temporarily Unavailable", callID, headers["cseq"], []string{
+					`Warning: 122 10.180.102.4 "Function is not allowed"`,
+				}), false, nil
+			default:
+				deregisterContacts = append(deregisterContacts, headers["contact"])
+				if headers["expires"] != "0" {
+					return nil, true, fmt.Errorf("retry Expires = %q, want 0", headers["expires"])
+				}
+				return testResponse(200, "OK", callID, headers["cseq"], nil), true, nil
+			}
+		})
+	}()
+	provider, request := newExpiryTestProvider(t, listener, 0)
+	session, err := provider.Start(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Provider.Start() error = %v", err)
+	}
+	if err := session.Close(context.Background()); err != nil {
+		t.Fatalf("Close() error = %v, want the retried de-registration to succeed", err)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+	if len(deregisterContacts) != 2 {
+		t.Fatalf("de-registration attempts = %v, want 2", deregisterContacts)
+	}
+	if strings.TrimSpace(deregisterContacts[1]) == "*" {
+		t.Fatalf("retry still used the wildcard Contact: %v", deregisterContacts)
+	}
+}
+
+// Regression: T-Mobile sometimes never answers a de-registration for a number
+// that has re-registered many times. Close() must give up quickly instead of
+// blocking teardown (and the eSIM switch behind it) for the caller's whole
+// cleanup budget; answers to a de-registration arrive in well under a second.
+func TestCloseStopsWaitingForAnUnansweredDeregistration(t *testing.T) {
+	listener, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	_ = listener.SetDeadline(time.Now().Add(30 * time.Second))
+	nonce := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	go func() {
+		_ = serveScriptedRegistrar(listener, func(step int, headers map[string]string, callID string) ([]byte, bool, error) {
+			switch step {
+			case 0:
+				return challengeResponse(callID, headers["cseq"], nonce), false, nil
+			case 1:
+				return okRegistration(callID, headers["cseq"], headers["contact"]), false, nil
+			default:
+				// Silence: answer only long after the de-registration budget.
+				time.Sleep(20 * time.Second)
+				return testResponse(200, "OK", callID, headers["cseq"], nil), true, nil
+			}
+		})
+	}()
+	provider, request := newExpiryTestProvider(t, listener, 0)
+	session, err := provider.Start(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Provider.Start() error = %v", err)
+	}
+	started := time.Now()
+	err = session.Close(context.Background())
+	elapsed := time.Since(started)
+	if err == nil {
+		t.Fatal("Close() error = nil, want the unanswered de-registration reported")
+	}
+	if elapsed > 3*deregisterTimeout {
+		t.Fatalf("Close() took %v; an unanswered de-registration must not block teardown", elapsed)
 	}
 }

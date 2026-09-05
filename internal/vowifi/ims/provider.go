@@ -18,6 +18,11 @@ import (
 	"vocat/internal/vowifi"
 )
 
+// deregisterTimeout bounds each de-registration attempt in Close. T-Mobile
+// either answers in <1 s or (for a number that has re-registered many times)
+// never; blocking teardown any longer buys nothing.
+const deregisterTimeout = 3 * time.Second
+
 const (
 	defaultSIPPort              = 5060
 	defaultRegistrationExpiry   = 3600 * time.Second
@@ -333,6 +338,14 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.IMSRequest) 
 		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
+		}
+		if lastErr != nil && pcscfIndex+1 < len(pcscfCandidates) {
+			// Without this the loop walks every P-CSCF in silence: an endpoint
+			// that answers the first REGISTER and then stops responding breaks
+			// out of the transport loop without a log line.
+			provider.config.Logger.Warn("IMS registration failed on this P-CSCF; trying the next one",
+				"device_id", request.DeviceID, "pcscf_index", pcscfIndex,
+				"remaining", len(pcscfCandidates)-pcscfIndex-1, "error", lastErr)
 		}
 	}
 	return nil, lastErr
@@ -1797,7 +1810,30 @@ func (session *Session) Close(ctx context.Context) error {
 	if session.evidence.Registered && ctx.Err() == nil {
 		session.deregisterAll = deregisterAllOverride ||
 			vowifi.ResolveCarrierProfile(session.request.Identity).IMSRegisterOptions.DeregisterAllOnClose
-		response, err := session.register(ctx, 0)
+		// A de-registration is answered in well under a second when the
+		// registrar answers at all. Waiting for the caller's full cleanup
+		// budget only delays the teardown (and any eSIM switch behind it).
+		deregisterContext, cancelDeregister := context.WithTimeout(ctx, deregisterTimeout)
+		response, err := session.register(deregisterContext, 0)
+		cancelDeregister()
+		if err == nil && response != nil && response.StatusCode != 200 && ctx.Err() == nil {
+			// T-Mobile intermittently rejects a de-registration (480 "Function is
+			// not allowed" on a wildcard Contact). One retry with the specific
+			// Contact binding usually succeeds; giving up leaves an orphan
+			// binding that swallows MT SMS until it expires.
+			session.provider.config.Logger.Warn("IMS de-registration rejected; retrying with specific contact",
+				"device_id", session.request.DeviceID, "sip_status", response.StatusCode, "wildcard", session.deregisterAll)
+			session.deregisterAll = false
+			firstRejection := response
+			retryContext, cancelRetry := context.WithTimeout(ctx, deregisterTimeout)
+			response, err = session.register(retryContext, 0)
+			cancelRetry()
+			if err != nil {
+				// No answer to the retry: report the original rejection, which
+				// carries the registrar's reason phrase and Warning header.
+				response, err = firstRejection, nil
+			}
+		}
 		if err != nil {
 			unregisterErr = err
 		} else if response.StatusCode == 200 {

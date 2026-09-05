@@ -89,7 +89,7 @@ func TestProfileRotationTaskDecodeValidation(t *testing.T) {
 	for name, body := range map[string]string{
 		"single profile":     strings.Replace(base(""), `,{"iccid":"8901240527185778332","aid":"A0"}`, "", 1),
 		"duplicate profile":  strings.Replace(base(""), `8901240527185778332`, `8901240527185779025`, 1),
-		"interval too short": strings.Replace(base(""), `"interval_seconds":30`, `"interval_seconds":3`, 1),
+		"interval too short": strings.Replace(base(""), `"interval_seconds":30`, `"interval_seconds":1`, 1),
 		"no interval":        strings.Replace(base(""), `"interval_seconds":30`, `"interval_seconds":0`, 1),
 		"cellular":           strings.Replace(base(""), `"environment":"vowifi"`, `"environment":"cellular"`, 1),
 	} {
@@ -212,6 +212,9 @@ func TestProfileRotationTaskEndTimeAndDwellFloor(t *testing.T) {
 	if created.Data.IntervalSeconds != 5 {
 		t.Fatalf("5 s dwell not accepted: %+v", created.Data)
 	}
+	if response := post(strings.Replace(base(""), `"interval_seconds":5`, `"interval_seconds":2`, 1)); response.Code != http.StatusCreated {
+		t.Fatalf("2 s dwell (the documented floor): status = %d, body=%s", response.Code, response.Body.String())
+	}
 	if response := post(base("")); response.Code != http.StatusCreated {
 		t.Fatalf("rotation without end time: status = %d, body=%s", response.Code, response.Body.String())
 	}
@@ -219,7 +222,7 @@ func TestProfileRotationTaskEndTimeAndDwellFloor(t *testing.T) {
 		"end before start": base(`,"end_date":"2029-12-31","end_time":"10:00"`),
 		"end equals start": base(`,"end_date":"2030-01-01","end_time":"10:00"`),
 		"half end":         base(`,"end_date":"2030-01-02"`),
-		"dwell 3s":         strings.Replace(base(""), `"interval_seconds":5`, `"interval_seconds":3`, 1),
+		"dwell 1s":         strings.Replace(base(""), `"interval_seconds":5`, `"interval_seconds":1`, 1),
 	} {
 		if response := post(body); response.Code != http.StatusBadRequest {
 			t.Errorf("%s: status = %d, body=%s", name, response.Code, response.Body.String())
@@ -231,5 +234,139 @@ func TestFormatRotationTimingSummarisesSwitchAndTunnel(t *testing.T) {
 	got := formatRotationTiming(47*time.Second+300*time.Millisecond, 3800*time.Millisecond)
 	if got != "换档 47.3 s · 隧道 3.8 s" {
 		t.Fatalf("formatRotationTiming = %q", got)
+	}
+}
+
+// A VoWiFi runtime that reports a stale cleanup warning from the previous
+// profile before the new enable request has been picked up by its worker.
+type cleanupWarningVoWiFiController struct {
+	polls int
+}
+
+func (c *cleanupWarningVoWiFiController) State(string) (vowifi.State, error) {
+	c.polls++
+	if c.polls == 1 {
+		return vowifi.State{Phase: vowifi.PhaseIdle, LastErrorClass: "cleanup_warning", LastError: "vowifi: cleanup incomplete: close IMS: context deadline exceeded"}, nil
+	}
+	return vowifi.State{Enabled: true, Active: true, IMSReady: true, SMSReady: true, Phase: vowifi.PhaseSMSReady}, nil
+}
+func (c *cleanupWarningVoWiFiController) RequestEnabled(string, bool) (vowifi.State, error) {
+	return vowifi.State{}, nil
+}
+func (c *cleanupWarningVoWiFiController) RequestReconnect(string) (vowifi.State, error) {
+	return vowifi.State{}, nil
+}
+
+func TestWaitAutomaticVoWiFiIgnoresStaleCleanupWarning(t *testing.T) {
+	controller := &cleanupWarningVoWiFiController{}
+	server := &Server{vowifi: controller, logger: regionTestLogger()}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.waitAutomaticVoWiFi(ctx, "ec20", "8901240527185778332", true); err != nil {
+		t.Fatalf("waitAutomaticVoWiFi treated the previous profile's cleanup warning as fatal: %v", err)
+	}
+}
+
+func TestRotationTargetIsPinnedForAllAttemptsOfOneRun(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.UpsertDevice(ctx, store.Device{ID: "ec20", Name: "EC20"}); err != nil {
+		t.Fatal(err)
+	}
+	var log []string
+	live := "8901240527185779025"
+	devices := rotationSwitchController{
+		fakeDeviceController: fakeDeviceController{entry: device.Device{ID: "ec20", Discovered: true, Snapshot: &device.Snapshot{ICCID: "stale-cached-value"}}},
+		log:                  &log, switched: &live,
+	}
+	server := &Server{store: database, devices: devices, logger: regionTestLogger()}
+	payload := automaticTaskPayload{Profiles: []automaticTaskRotationProfile{{ICCID: "8901240527185779025"}, {ICCID: "8901240527185778332"}, {ICCID: "8901240527185778316"}}}
+	task := store.AutomaticTask{DeviceID: "ec20", TaskType: "profile_rotation", IntervalSeconds: 5}
+	runCtx := withRotationRun(ctx, &rotationRunState{})
+	first, err := server.resolveRotationTarget(runCtx, task, payload)
+	if err != nil || first.ICCID != "8901240527185778332" {
+		t.Fatalf("first attempt target = %+v, %v (must use the live ICCID, not the cached snapshot)", first, err)
+	}
+	// Attempt 1 switched the card but failed later; attempt 2 must keep the
+	// same target instead of advancing to the third profile.
+	live = "8901240527185778332"
+	second, err := server.resolveRotationTarget(runCtx, task, payload)
+	if err != nil || second.ICCID != first.ICCID {
+		t.Fatalf("second attempt target = %+v, %v, want %s", second, err, first.ICCID)
+	}
+}
+
+// A runtime whose Disable reports the best-effort de-registration failure.
+type cleanupIncompleteVoWiFiController struct{ stopped bool }
+
+func (c *cleanupIncompleteVoWiFiController) State(string) (vowifi.State, error) {
+	if c.stopped {
+		return vowifi.State{Phase: vowifi.PhaseIdle}, nil
+	}
+	return vowifi.State{Enabled: true, Active: true, Phase: vowifi.PhaseSMSReady}, nil
+}
+
+func (c *cleanupIncompleteVoWiFiController) RequestEnabled(_ string, enabled bool) (vowifi.State, error) {
+	if !enabled {
+		c.stopped = true
+		return vowifi.State{Phase: vowifi.PhaseIdle},
+			fmt.Errorf("%w: close IMS: context deadline exceeded", vowifi.ErrCleanupIncomplete)
+	}
+	return vowifi.State{}, nil
+}
+
+func (c *cleanupIncompleteVoWiFiController) RequestReconnect(string) (vowifi.State, error) {
+	return vowifi.State{}, nil
+}
+
+func TestQuiesceTreatsIncompleteCleanupAsSuccess(t *testing.T) {
+	server := &Server{vowifi: &cleanupIncompleteVoWiFiController{}, logger: regionTestLogger()}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.quiesceVoWiFiForProfileSwitch(ctx, "ec20"); err != nil {
+		t.Fatalf("a best-effort de-registration failure blocked the profile switch: %v", err)
+	}
+}
+
+// A controller whose modem is missing for the first few lookups, as it is for
+// a moment right after the eUICC REFRESH.
+type latePresenceController struct {
+	fakeDeviceController
+	calls *int
+	ready int
+}
+
+func (c latePresenceController) List() []device.Device {
+	*c.calls++
+	if *c.calls < c.ready {
+		return nil
+	}
+	return []device.Device{c.entry}
+}
+
+func (c latePresenceController) Get(id string) (device.Device, error) {
+	if *c.calls < c.ready {
+		return device.Device{}, device.ErrNotFound
+	}
+	return c.fakeDeviceController.Get(id)
+}
+
+func TestWaitForPhysicalDeviceRidesOutTheRefreshGap(t *testing.T) {
+	calls := 0
+	controller := latePresenceController{
+		fakeDeviceController: fakeDeviceController{entry: device.Device{ID: "ec20", Discovered: true, Snapshot: &device.Snapshot{ICCID: "8901240527185778332"}}},
+		calls:                &calls,
+		ready:                3,
+	}
+	server := &Server{devices: controller, logger: regionTestLogger()}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	entry, physicalID, err := server.waitForPhysicalDevice(ctx, store.Device{ID: "ec20"}, 5*time.Second)
+	if err != nil || physicalID != "ec20" || entry.Snapshot == nil {
+		t.Fatalf("waitForPhysicalDevice = (%+v, %q, %v), want the modem once it reappears", entry, physicalID, err)
 	}
 }

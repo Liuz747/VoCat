@@ -140,7 +140,7 @@ function emptyForm(deviceId = ""): TaskForm {
     taskType: "sms",
     environment: "vowifi",
     intervalDays: 1,
-    dwellSeconds: 60,
+    dwellSeconds: 5,
     rotationProfiles: [],
     startDate: localDate(),
     runTime: localTime(),
@@ -341,7 +341,7 @@ export default function AutomaticTasksPage() {
       taskType: task.taskType,
       environment: task.environment,
       intervalDays: task.intervalDays,
-      dwellSeconds: task.intervalSeconds || 60,
+      dwellSeconds: task.intervalSeconds || 5,
       rotationProfiles: rotationProfilesFromPayload(task.payload),
       startDate: task.startDate,
       runTime: task.runTime,
@@ -402,7 +402,7 @@ export default function AutomaticTasksPage() {
     if (!form.deviceId) return message.warning(t("请选择设备"));
     const rotation = form.taskType === "profile_rotation";
     if (rotation && form.rotationProfiles.length < 2) return message.warning(t("轮询至少需要勾选 2 个 eSIM Profile"));
-    if (rotation && (form.dwellSeconds < 5 || form.dwellSeconds > 86400)) return message.warning(t("停留时间需在 5–86400 秒之间"));
+    if (rotation && (form.dwellSeconds < 2 || form.dwellSeconds > 86400)) return message.warning(t("停留时间需在 2–86400 秒之间"));
     if (rotation && (!!form.endDate !== !!form.endTime)) return message.warning(t("结束日期和结束时间需同时填写，或都留空"));
     if (rotation && form.endDate && new Date(`${form.endDate}T${form.endTime}`) <= new Date(`${form.startDate}T${form.runTime}`)) return message.warning(t("结束时间必须晚于开始时间"));
     if (!rotation && !form.profileIccid) return message.warning(t("请选择 SIM 卡或 eSIM Profile"));
@@ -667,7 +667,7 @@ export default function AutomaticTasksPage() {
           {isRotation ? (
             <div>
               <label className={fieldLabel}>{t("每个 Profile 的停留时间")}</label>
-              <Input type="number" min={5} max={86400} value={form.dwellSeconds} suffix={t("秒")} onChange={(event) => setForm({ ...form, dwellSeconds: Number(event.target.value) })} />
+              <Input type="number" min={2} max={86400} value={form.dwellSeconds} suffix={t("秒")} onChange={(event) => setForm({ ...form, dwellSeconds: Number(event.target.value) })} />
               <div className="mt-1 text-xs text-gray-400">{t("从隧道就绪开始计时；切换本身约 10 秒，积压短信在注册后 1 秒内开始到达、每条约 0.65 秒。当前配置一轮约 {duration}").replace("{duration}", formatDuration(rotationCycleSeconds))}</div>
             </div>
           ) : <div><label className={fieldLabel}>{t("执行周期")}</label><Input type="number" min={1} max={365} value={form.intervalDays} suffix={t("天")} onChange={(event) => setForm({ ...form, intervalDays: Number(event.target.value) })} /></div>}
