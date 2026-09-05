@@ -32,12 +32,6 @@ func TestTfInterpolation(t *testing.T) {
 	if got != want {
 		t.Fatalf("Tf = %q, want %q", got, want)
 	}
-	// region reason: country name itself is translated before interpolation
-	got = Tf("SIM 卡归属地为%s（MCC %s），本服务不向该地区卡片提供数据/短信/VoWiFi", T("中国"), "460")
-	want = "The SIM's home region is China (MCC 460); this service does not provide data, SMS, or VoWiFi to cards from that region."
-	if got != want {
-		t.Fatalf("Tf region = %q, want %q", got, want)
-	}
 }
 
 func TestSetNormalizesUnknownToEnglish(t *testing.T) {

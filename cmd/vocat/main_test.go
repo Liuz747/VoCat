@@ -14,8 +14,7 @@ import (
 	"vocat/internal/store"
 )
 
-// fakeModemClient is a minimal scripted modem.Client for exercising the region
-// enforcement orchestration (flight-mode flips) without hardware.
+// fakeModemClient exercises card policy orchestration without hardware.
 type fakeModemClient struct {
 	steps []fakeStep
 	index int
@@ -101,121 +100,56 @@ func regionTestLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-func TestEnforceCardRegionForcesAirplaneAndPersistsPolicy(t *testing.T) {
-	client := &fakeModemClient{steps: []fakeStep{
-		{command: "AT+CFUN?", lines: []string{"+CFUN: 1"}},
-		{command: "AT+CFUN=4"},
-		{command: "AT+CFUN?", lines: []string{"+CFUN: 4"}},
-	}}
-	manager := newRegionTestManager(t, client)
-	database := newRegionTestStore(t)
-
-	snapshot := &device.Snapshot{
-		DeviceID: regionTestDeviceID,
-		SIMReady: true,
-		IMSI:     "460001234567890",
-		ICCID:    "89860012345678901234",
-	}
-	enforceCardRegion(context.Background(), regionTestLogger(), database, manager, regionTestDeviceID, snapshot)
-	client.assertExhausted(t)
-
-	policy, err := database.CardPolicy(context.Background(), snapshot.ICCID)
-	if err != nil {
-		t.Fatalf("CardPolicy: %v", err)
-	}
-	if policy.Source != cardPolicySourceRegionBlock {
-		t.Fatalf("policy source = %q, want %q", policy.Source, cardPolicySourceRegionBlock)
-	}
-	if policy.NetworkEnabled || policy.VoWiFiEnabled || !policy.AirplaneEnabled {
-		t.Fatalf("policy switches = %#v, want all service off and airplane on", policy)
-	}
-}
-
-func TestEnforceCardRegionSkipsRadioWhenAlreadyOff(t *testing.T) {
-	client := &fakeModemClient{}
-	manager := newRegionTestManager(t, client)
-	database := newRegionTestStore(t)
-
-	snapshot := &device.Snapshot{
-		DeviceID:   regionTestDeviceID,
-		SIMReady:   true,
-		IMSI:       "461001234567890",
-		ICCID:      "89860012345678901234",
-		FlightMode: true,
-	}
-	enforceCardRegion(context.Background(), regionTestLogger(), database, manager, regionTestDeviceID, snapshot)
-	client.assertExhausted(t)
-
-	if _, err := database.CardPolicy(context.Background(), snapshot.ICCID); err != nil {
-		t.Fatalf("expected a persisted block policy even with the radio already off: %v", err)
+func TestDefaultCardPolicySupportsEverySIMRegion(t *testing.T) {
+	for _, imsi := range []string{"460001234567890", "461001234567890", "310260123456789"} {
+		for _, legacy := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/legacy=%t", imsi, legacy), func(t *testing.T) {
+				ctx := context.Background()
+				database := newRegionTestStore(t)
+				iccid := "89860012345678901234"
+				if legacy {
+					if err := database.UpsertCardPolicy(ctx, store.CardPolicy{ICCID: iccid, AirplaneEnabled: true, IPVersion: "IPV4V6", APN: "ims", Source: "auto_region_block"}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				client := &fakeModemClient{steps: []fakeStep{
+					{command: "AT+CFUN?", lines: []string{"+CFUN: 1"}},
+					{command: "AT+CFUN=4"},
+					{command: "AT+CFUN?", lines: []string{"+CFUN: 4"}},
+				}}
+				manager := newRegionTestManager(t, client)
+				snapshot := &device.Snapshot{DeviceID: regionTestDeviceID, SIMReady: true, IMSI: imsi, ICCID: iccid}
+				enforceDefaultSafeCardPolicy(ctx, regionTestLogger(), database, manager, regionTestDeviceID, snapshot)
+				policy, err := database.CardPolicy(ctx, iccid)
+				if err != nil || !policy.VoWiFiEnabled || policy.NetworkEnabled || !policy.AirplaneEnabled || policy.Source != "default" {
+					t.Fatalf("default policy = %+v, %v", policy, err)
+				}
+				if legacy && policy.APN != "ims" {
+					t.Fatalf("existing APN lost: %+v", policy)
+				}
+				client.assertExhausted(t)
+			})
+		}
 	}
 }
 
-func TestEnforceCardRegionLiftsBlockForAllowedSIM(t *testing.T) {
+func TestDefaultCardPolicyPreservesManualPolicy(t *testing.T) {
+	ctx := context.Background()
+	database := newRegionTestStore(t)
+	iccid := "89860012345678901234"
+	original := store.CardPolicy{ICCID: iccid, NetworkEnabled: true, IPVersion: "IPV4V6", APN: "internet", Source: "manual"}
+	if err := database.UpsertCardPolicy(ctx, original); err != nil {
+		t.Fatal(err)
+	}
 	client := &fakeModemClient{}
 	manager := newRegionTestManager(t, client)
-	database := newRegionTestStore(t)
-
-	if err := database.UpsertCardPolicy(context.Background(), store.CardPolicy{
-		ICCID:           "89860012345678901234",
-		AirplaneEnabled: true,
-		IPVersion:       "IPV4V6",
-		Source:          cardPolicySourceRegionBlock,
-	}); err != nil {
-		t.Fatalf("seed block policy: %v", err)
+	snapshot := &device.Snapshot{DeviceID: regionTestDeviceID, SIMReady: true, IMSI: "460001234567890", ICCID: iccid}
+	enforceDefaultSafeCardPolicy(ctx, regionTestLogger(), database, manager, regionTestDeviceID, snapshot)
+	policy, err := database.CardPolicy(ctx, iccid)
+	if err != nil || policy.Source != "manual" || !policy.NetworkEnabled || policy.VoWiFiEnabled || policy.AirplaneEnabled || policy.APN != "internet" {
+		t.Fatalf("manual policy changed: %+v, %v", policy, err)
 	}
-
-	snapshot := &device.Snapshot{
-		DeviceID:   regionTestDeviceID,
-		SIMReady:   true,
-		IMSI:       "310260123456789",
-		ICCID:      "89012601234567890123",
-		FlightMode: true,
-	}
-	enforceCardRegion(context.Background(), regionTestLogger(), database, manager, regionTestDeviceID, snapshot)
 	client.assertExhausted(t)
-
-	if _, err := database.CardPolicy(context.Background(), "89860012345678901234"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("expected the auto block policy to be cleared, got err=%v", err)
-	}
-}
-
-func TestEnforceCardRegionLeavesAllowedSIMWithoutPriorBlockAlone(t *testing.T) {
-	client := &fakeModemClient{}
-	manager := newRegionTestManager(t, client)
-	database := newRegionTestStore(t)
-
-	snapshot := &device.Snapshot{
-		DeviceID: regionTestDeviceID,
-		SIMReady: true,
-		IMSI:     "310260123456789",
-		ICCID:    "89012601234567890123",
-	}
-	enforceCardRegion(context.Background(), regionTestLogger(), database, manager, regionTestDeviceID, snapshot)
-	client.assertExhausted(t)
-}
-
-func TestEnforceCardRegionIgnoresUnknownOrNotReadySIM(t *testing.T) {
-	client := &fakeModemClient{}
-	manager := newRegionTestManager(t, client)
-	database := newRegionTestStore(t)
-
-	// Not ready: no action at all.
-	notReady := &device.Snapshot{DeviceID: regionTestDeviceID, SIMReady: false, IMSI: "460001234567890"}
-	enforceCardRegion(context.Background(), regionTestLogger(), database, manager, regionTestDeviceID, notReady)
-
-	// Ready but IMSI unknown: hold state, neither block nor lift.
-	unknown := &device.Snapshot{DeviceID: regionTestDeviceID, SIMReady: true, IMSI: ""}
-	enforceCardRegion(context.Background(), regionTestLogger(), database, manager, regionTestDeviceID, unknown)
-
-	client.assertExhausted(t)
-	policies, err := database.ListCardPolicies(context.Background())
-	if err != nil {
-		t.Fatalf("ListCardPolicies: %v", err)
-	}
-	if len(policies) != 0 {
-		t.Fatalf("expected no card policies, got %d", len(policies))
-	}
 }
 
 func TestProvisionedDeviceTypeRecognizesNativeWWAN(t *testing.T) {

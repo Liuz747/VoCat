@@ -21,7 +21,6 @@ var (
 	ErrDataBackendUnavailable  = errors.New("cellular data backend is unavailable")
 	ErrDataOperationInProgress = errors.New("cellular data operation is in progress")
 	ErrInvalidNetworkAPN       = errors.New("invalid cellular APN")
-	ErrRegionBlocked           = errors.New("sim card home region is not served")
 	ErrUSSDSessionNotFound     = errors.New("ussd session not found or already closed")
 )
 

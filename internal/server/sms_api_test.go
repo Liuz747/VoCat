@@ -459,29 +459,26 @@ func TestSMSSendOutcome(t *testing.T) {
 	}
 }
 
-func TestBlockedSMSDestination(t *testing.T) {
-	tests := []struct {
-		name  string
-		phone string
-		block bool
-	}{
-		{"e164 china", "+8613800138000", true},
-		{"no plus china", "8613800138000", true},
-		{"international prefix china", "008613800138000", true},
-		{"spaced china", "+86 138 0013 8000", true},
-		{"dashed china", "+86-138-0013-8000", true},
-		{"us e164", "+12025550177", false},
-		{"us no plus", "12025550177", false},
-		{"uk e164", "+447700900123", false},
-		{"italy", "+393331234567", false},
-		{"russia", "+79161234567", false},
-		{"japan", "+819012345678", false},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			blocked, _ := blockedSMSDestination(test.phone)
-			if blocked != test.block {
-				t.Fatalf("blockedSMSDestination(%q) blocked = %v, want %v", test.phone, blocked, test.block)
+func TestHandleSMSSendAcceptsDestinationsRegardlessOfCountry(t *testing.T) {
+	for _, phone := range []string{"+8613800138000", "8613800138000", "008613800138000", "+86 138 0013 8000", "+86-138-0013-8000", "+12025550177", "+447700900123"} {
+		t.Run(phone, func(t *testing.T) {
+			server := blockedRegionServer(t, "460001234567890")
+			controller := server.devices.(fakeDeviceController)
+			controller.smsSendResult = device.SMSSendResult{To: phone, SubmittedAt: time.Now().UTC(), PartsTotal: 1, PartsAttempted: 1, PartsAccepted: 1, AllPartsAccepted: true, SubmissionStatus: "accepted"}
+			server.devices = controller
+
+			if err := server.store.UpsertDevice(context.Background(), store.Device{ID: "dev1", Name: "EC20"}); err != nil {
+				t.Fatal(err)
+			}
+			payload, err := json.Marshal(map[string]string{"device_id": "dev1", "phone": phone, "message": "HELLO"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPost, "/api/sms/send", strings.NewReader(string(payload)))
+			response := httptest.NewRecorder()
+			server.handleSMSSend(response, request)
+			if response.Code != http.StatusAccepted {
+				t.Fatalf("SMS request: status %d, body %s", response.Code, response.Body.String())
 			}
 		})
 	}

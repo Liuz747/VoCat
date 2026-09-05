@@ -850,9 +850,6 @@ func (s *Server) decodeAutomaticTask(r *http.Request, id int64) (store.Automatic
 		if !validDialNumber(request.Payload.Phone) || strings.TrimSpace(request.Payload.Message) == "" {
 			return store.AutomaticTask{}, errors.New("SMS phone and message are required")
 		}
-		if blocked, reason := blockedSMSDestination(request.Payload.Phone); blocked {
-			return store.AutomaticTask{}, errors.New(reason)
-		}
 	}
 	if request.TaskType == "call" && (!validDialNumber(request.Payload.Phone) || request.Payload.DurationSeconds < 1 || request.Payload.DurationSeconds > 600) {
 		return store.AutomaticTask{}, errors.New("call phone is required and automatic hang-up must be 1-600 seconds")

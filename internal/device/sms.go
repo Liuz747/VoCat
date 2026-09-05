@@ -49,11 +49,6 @@ func (manager *Manager) SendSMS(
 		manager.setResult(id, state, nil, err)
 		return result, err
 	}
-	if err := manager.regionBlockError(state); err != nil {
-		result.SubmissionStatus = "region_blocked"
-		manager.setResult(id, state, nil, err)
-		return result, err
-	}
 	for _, command := range parts[0].setup {
 		if _, err := manager.command(ctx, client, command); err != nil {
 			result.SubmissionStatus = "setup_failed"

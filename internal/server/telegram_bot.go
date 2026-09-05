@@ -1160,10 +1160,6 @@ func (bot *telegramBot) confirmSMS(ctx context.Context, config telegramRuntimeCo
 		bot.sendText(ctx, config, chatID, "无法发送："+err.Error(), nil)
 		return
 	}
-	if blocked, reason := blockedSMSDestination(phone); blocked {
-		bot.sendText(ctx, config, chatID, "无法发送："+reason, nil)
-		return
-	}
 	if text == "" {
 		bot.sendText(ctx, config, chatID, "短信内容不能为空。", nil)
 		return
@@ -1270,10 +1266,6 @@ func (bot *telegramBot) handleInputMessage(ctx context.Context, config telegramR
 	}
 	switch state.Kind {
 	case "sms_phone":
-		if blocked, reason := blockedSMSDestination(value); blocked {
-			bot.sendText(ctx, config, message.Chat.ID, "号码不可用："+reason+"\n请重新输入号码。", telegramKeyboard([]map[string]string{telegramButton("❌ 取消", "input:cancel")}))
-			return
-		}
 		state.Kind = "sms_text"
 		state.Argument = value
 		bot.setInput(state)
@@ -2162,12 +2154,6 @@ func (bot *telegramBot) handleVoWiFi(ctx context.Context, config telegramRuntime
 		if enabled && stored.NetworkEnabled {
 			bot.sendText(ctx, config, chatID, "VoWiFi 操作失败：请先关闭漫游数据。", bot.homeKeyboard())
 			return
-		}
-		if enabled && entry.Snapshot != nil {
-			if reason := device.RegionBlockReason(entry.Snapshot.IMSI); reason != "" {
-				bot.sendText(ctx, config, chatID, "VoWiFi 操作被拒绝："+reason, nil)
-				return
-			}
 		}
 		previous := stored.VoWiFiEnabled
 		dataRuntime := bot.server.cellularDataRuntime()

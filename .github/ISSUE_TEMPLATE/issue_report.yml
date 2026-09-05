@@ -52,16 +52,14 @@ body:
       required: true
 
   - type: checkboxes
-    id: abuse-mcc-acknowledgement
+    id: abuse-acknowledgement
     attributes:
       label: Acknowledgement
       description: Please read and confirm the following before submitting.
       options:
         - label: >-
             I understand that this repository will not modify any feature code on
-            behalf of abusers in order to enable abuse, and that this service must
-            not be used in regions with MCC=460; any issues
-            arising from such use will not be resolved.
+            behalf of abusers in order to enable abuse.
           required: true
 
   - type: textarea

@@ -1452,7 +1452,6 @@ func pollDeviceSnapshots(
 					logger.Warn("modem snapshot refresh failed", "device_id", entry.ID, "error", refreshErr)
 				}
 				if refreshErr == nil && ctx.Err() == nil {
-					enforceCardRegion(ctx, logger, database, manager, entry.ID, &snapshot)
 					enforceDefaultSafeCardPolicy(ctx, logger, database, manager, entry.ID, &snapshot)
 					recoverRegistration(entry, snapshot, recoveryTracker.observe(entry.ID, &snapshot, time.Now()))
 				}
@@ -1484,28 +1483,35 @@ func enforceDefaultSafeCardPolicy(
 	physicalID string,
 	snapshot *device.Snapshot,
 ) {
-	if snapshot == nil || !snapshot.SIMReady || strings.TrimSpace(snapshot.ICCID) == "" ||
-		device.RegionBlockReason(snapshot.IMSI) != "" {
+	if snapshot == nil || !snapshot.SIMReady || strings.TrimSpace(snapshot.ICCID) == "" {
 		return
 	}
 	iccid := strings.TrimSpace(snapshot.ICCID)
-	if _, err := database.CardPolicy(ctx, iccid); err == nil {
-		return
-	} else if !errors.Is(err, store.ErrNotFound) {
+	policy, err := database.CardPolicy(ctx, iccid)
+	if err == nil {
+		// Replace only automatic blocks left by older releases. Explicit user
+		// policies keep their settings, regardless of the SIM's home country.
+		if policy.Source != "auto_region_block" {
+			return
+		}
+	} else if errors.Is(err, store.ErrNotFound) {
+		policy = store.CardPolicy{ICCID: iccid, IPVersion: "IPV4V6"}
+	} else {
 		logger.Warn("default card policy: read policy", "iccid", iccid, "error", err)
 		return
 	}
 	flightContext, cancel := context.WithTimeout(ctx, flightModeTransitionTimeout)
-	_, err := manager.SetFlight(flightContext, physicalID, true)
+	_, err = manager.SetFlight(flightContext, physicalID, true)
 	cancel()
 	if err != nil {
 		logger.Warn("default card policy: failed to establish airplane mode", "device_id", physicalID, "iccid", iccid, "error", err)
 		return
 	}
-	if err := database.UpsertCardPolicy(ctx, store.CardPolicy{
-		ICCID: iccid, VoWiFiEnabled: true, AirplaneEnabled: true,
-		IPVersion: "IPV4V6", Source: "default",
-	}); err != nil {
+	policy.NetworkEnabled = false
+	policy.VoWiFiEnabled = true
+	policy.AirplaneEnabled = true
+	policy.Source = "default"
+	if err := database.UpsertCardPolicy(ctx, policy); err != nil {
 		logger.Warn("default card policy: persist policy", "iccid", iccid, "error", err)
 		return
 	}
@@ -1652,117 +1658,6 @@ func reconcileCardPolicies(
 			reconcile()
 		}
 	}
-}
-
-// cardPolicySourceRegionBlock marks a card policy that was written automatically
-// because the inserted SIM belongs to a region the product does not serve. It
-// doubles as the persistent record that the radio was forced off by us, so the
-// block survives restarts and can be lifted when an allowed card is detected.
-const cardPolicySourceRegionBlock = "auto_region_block"
-
-// enforceCardRegion applies the regional service policy for one refreshed
-// device. A SIM whose IMSI home MCC is blocked (mainland China, 460/461) is
-// denied service: the radio is forced into airplane mode and a blocking card
-// policy is persisted. The check is fail-open — it only acts on a positively
-// read blocked IMSI — and the lift path only runs once the current card is
-// positively confirmed to be allowed, so an unreadable IMSI never causes a
-// block or a spurious restore.
-func enforceCardRegion(
-	ctx context.Context,
-	logger *slog.Logger,
-	database *store.Store,
-	manager *device.Manager,
-	id string,
-	snapshot *device.Snapshot,
-) {
-	if snapshot == nil || !snapshot.SIMReady {
-		return
-	}
-	imsi := strings.TrimSpace(snapshot.IMSI)
-	if imsi == "" {
-		// Region unknown: hold the current state rather than block or restore.
-		return
-	}
-	if reason := device.RegionBlockReason(imsi); reason != "" {
-		if !snapshot.FlightMode {
-			flightContext, cancelFlight := context.WithTimeout(ctx, flightModeTransitionTimeout)
-			_, err := manager.SetFlight(flightContext, id, true)
-			cancelFlight()
-			if err != nil && ctx.Err() == nil {
-				logger.Warn(
-					"region block: failed to force airplane mode",
-					"device_id", id, "error", err,
-				)
-			}
-		}
-		if snapshot.ICCID != "" {
-			policy, policyErr := database.CardPolicy(ctx, snapshot.ICCID)
-			if errors.Is(policyErr, store.ErrNotFound) {
-				policy = store.CardPolicy{ICCID: snapshot.ICCID, IPVersion: "IPV4V6"}
-				policyErr = nil
-			}
-			policy.NetworkEnabled = false
-			policy.VoWiFiEnabled = false
-			policy.AirplaneEnabled = true
-			policy.Source = cardPolicySourceRegionBlock
-			if policyErr != nil && ctx.Err() == nil {
-				logger.Warn("region block: failed to read card policy", "device_id", id, "iccid", snapshot.ICCID, "error", policyErr)
-			} else if err := database.UpsertCardPolicy(ctx, policy); err != nil && ctx.Err() == nil {
-				logger.Warn(
-					"region block: failed to persist card policy",
-					"device_id", id, "iccid", snapshot.ICCID, "error", err,
-				)
-			}
-		}
-		logger.Warn(
-			"blocked SIM detected; service disabled and radio forced off",
-			"device_id", id, "iccid", snapshot.ICCID, "imsi", imsi, "reason", reason,
-		)
-		return
-	}
-	liftCardRegionBlock(ctx, logger, database, manager, id, snapshot)
-}
-
-// liftCardRegionBlock removes the regional marker once an allowed SIM is
-// confirmed. It deliberately does not restore RF: the replacement SIM is
-// picked up by enforceDefaultSafeCardPolicy and remains in airplane/VoWiFi
-// mode until an explicit user action.
-func liftCardRegionBlock(
-	ctx context.Context,
-	logger *slog.Logger,
-	database *store.Store,
-	manager *device.Manager,
-	id string,
-	snapshot *device.Snapshot,
-) {
-	policies, err := database.ListCardPolicies(ctx)
-	if err != nil {
-		if ctx.Err() == nil {
-			logger.Warn("region block: failed to list card policies", "error", err)
-		}
-		return
-	}
-	outstanding := make([]store.CardPolicy, 0, 1)
-	for _, policy := range policies {
-		if policy.Source == cardPolicySourceRegionBlock {
-			outstanding = append(outstanding, policy)
-		}
-	}
-	if len(outstanding) == 0 {
-		return
-	}
-	for _, policy := range outstanding {
-		if err := database.DeleteCardPolicy(ctx, policy.ICCID); err != nil && ctx.Err() == nil {
-			logger.Warn(
-				"region block: failed to clear auto policy",
-				"iccid", policy.ICCID, "error", err,
-			)
-		}
-	}
-	logger.Info(
-		"region marker removed; allowed SIM remains RF protected",
-		"device_id", id, "iccid", snapshot.ICCID, "imsi", snapshot.IMSI,
-	)
 }
 
 func firstNonEmpty(values ...string) string {
