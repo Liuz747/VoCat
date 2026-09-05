@@ -176,7 +176,6 @@ func TestATMapperPrefersLiveIMEIOverAllStalePaths(t *testing.T) {
 	}
 }
 
-
 // Regression (production, 2026-09-05): device 1-1-3-1 kept its 09-03 node names
 // (/dev/ttyUSB2, /dev/cdc-wdm1). After a hub reset those names were handed to
 // the modem at 1-1.3.4.2, so the VoWiFi runtime of 1-1-3-1 bound to that modem
