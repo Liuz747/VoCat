@@ -18,10 +18,11 @@ import (
 	"vocat/internal/vowifi"
 )
 
-// deregisterTimeout bounds each de-registration attempt in Close. T-Mobile
-// either answers in <1 s or (for a number that has re-registered many times)
-// never; blocking teardown any longer buys nothing.
-const deregisterTimeout = 3 * time.Second
+// deregisterTimeout bounds each de-registration attempt in Close. Measured on
+// T-Mobile US: an answered de-registration comes back inside 0.5 s, and for a
+// number that has re-registered many times it never comes at all, so a longer
+// wait only delays the teardown (and the eSIM switch behind it).
+const deregisterTimeout = 1500 * time.Millisecond
 
 const (
 	defaultSIPPort              = 5060
@@ -58,6 +59,12 @@ type Config struct {
 	UserAgent             string
 	SecurityMode          SecurityMode
 	IPSecInstaller        IPSecSAInstaller
+	// RetryLostRegistration retries an unanswered REGISTER once on the same
+	// P-CSCF with fresh SPIs and protected ports. Off by default: measured on
+	// T-Mobile US, every such retry failed too, and only a rebuilt SWu tunnel
+	// registered, so the retry only delayed the recovery. Kept because it is
+	// the standards-sanctioned move (TS 33.203 §7.3.1.4) and networks differ.
+	RetryLostRegistration bool
 	ProtectedClientPort   int
 	ProtectedServerPort   int
 	// SMSCenter is an operator-provided fallback when the SIM leaves EF_SMSP
@@ -261,20 +268,6 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.IMSRequest) 
 		if provider.config.PCSCF != "" && !pcscfProvenByTunnel(endpoint, tunnel.PCSCF, provider.config.Port) {
 			return nil, errors.New("ims: configured P-CSCF is not proven by the SWu tunnel")
 		}
-		transport, carrierSelected := carrierTransportForIdentity(provider.config, request.Identity)
-		if cached := provider.cachedTransport(request.Identity); cached != "" {
-			transport = cached
-			carrierSelected = true
-		}
-		if transport == "" && !carrierSelected {
-			transport = transportHint
-		}
-		if transport == "" {
-			transport = provider.config.Transport
-		}
-		if transport == "" {
-			transport = "tcp"
-		}
 		localAddress := provider.config.LocalAddress
 		if localAddress == "" {
 			if endpointIP := net.ParseIP(endpoint.host); endpointIP != nil && endpointIP.To4() == nil {
@@ -294,59 +287,140 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.IMSRequest) 
 			return nil, errors.New("ims: configured local address is not assigned by the SWu tunnel")
 		}
 
-		transports := []string{transport}
-		if provider.config.AutoTransportFallback {
-			alternate := "udp"
-			if transport == "udp" {
-				alternate = "tcp"
-			}
-			transports = append(transports, alternate)
+		// One immediate retry on the same P-CSCF. The authenticated REGISTER is
+		// the one that gets lost (the P-CSCF installs the IPsec SAs only after
+		// sending the 401, TS 33.203 §7.4.2a, and discards anything on a
+		// mismatched SA), and TS 33.203 §7.3.1.4 says a fresh challenge makes it
+		// drop the previous registration's state. A new attempt here brings new
+		// SPIs and protected ports; moving to another endpoint would abandon a
+		// P-CSCF that is otherwise healthy.
+		endpointAttempts := 1
+		if provider.config.RetryLostRegistration {
+			endpointAttempts = 2
 		}
-		for attempt, candidate := range transports {
-			connection, dialErr := dialSIP(ctx, candidate, localAddress, 0, endpoint.address())
-			if dialErr != nil {
-				lastErr = fmt.Errorf("ims: connect to P-CSCF over %s: %w", candidate, dialErr)
-				if attempt+1 < len(transports) && ctx.Err() == nil {
-					provider.logTransportFallback(request.Identity, candidate, transports[attempt+1], lastErr)
-					continue
+		for endpointAttempt := 0; endpointAttempt < endpointAttempts; endpointAttempt++ {
+			if endpointAttempt > 0 {
+				if ctx.Err() != nil || !registrationLost(lastErr) {
+					break
 				}
-				break
+				provider.config.Logger.Warn("IMS REGISTER was lost; retrying the same P-CSCF with fresh security parameters",
+					"device_id", request.DeviceID, "pcscf_index", pcscfIndex, "error", lastErr)
 			}
-			session, sessionErr := newSession(provider, request, identities, endpoint, candidate, connection)
-			if sessionErr != nil {
-				_ = connection.Close()
-				lastErr = sessionErr
-				break
-			}
-			establishErr := session.establish(ctx)
-			if establishErr == nil {
-				provider.rememberTransport(request.Identity, candidate)
-				if attempt > 0 || pcscfIndex > 0 {
-					provider.config.Logger.Info("IMS automatic transport fallback succeeded",
-						"carrier_profile", vowifi.ResolveCarrierProfile(request.Identity).ID,
-						"transport", candidate)
-				}
+			session, retryErr := provider.startOnEndpoint(ctx, request, identities, endpoint, transportHint, localAddress, tunnel, pcscfIndex)
+			if retryErr == nil {
 				return session, nil
 			}
-			sipResponseObserved := session.evidence.LastSIPCode != 0
-			session.abort()
-			lastErr = establishErr
-			if sipResponseObserved || attempt+1 >= len(transports) || ctx.Err() != nil {
-				break
+			lastErr = retryErr
+			if simSideFailure(retryErr) {
+				provider.config.Logger.Warn("IMS registration aborted: the SIM identity is no longer usable",
+					"device_id", request.DeviceID, "error", retryErr)
+				return nil, retryErr
 			}
-			provider.logTransportFallback(request.Identity, candidate, transports[attempt+1], establishErr)
 		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 		if lastErr != nil && pcscfIndex+1 < len(pcscfCandidates) {
-			// Without this the loop walks every P-CSCF in silence: an endpoint
-			// that answers the first REGISTER and then stops responding breaks
-			// out of the transport loop without a log line.
 			provider.config.Logger.Warn("IMS registration failed on this P-CSCF; trying the next one",
 				"device_id", request.DeviceID, "pcscf_index", pcscfIndex,
 				"remaining", len(pcscfCandidates)-pcscfIndex-1, "error", lastErr)
 		}
+	}
+	return nil, lastErr
+}
+
+// registrationLost reports a REGISTER that never got an answer, as opposed to
+// one the registrar rejected.
+func registrationLost(err error) bool {
+	if err == nil {
+		return false
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError) && networkError.Timeout() ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		strings.Contains(err.Error(), "receive SIP REGISTER response")
+}
+
+// startOnEndpoint runs one full registration attempt against a single P-CSCF,
+// including the transport fallback.
+func (provider *Provider) startOnEndpoint(
+	ctx context.Context,
+	request vowifi.IMSRequest,
+	identities identitySet,
+	endpoint pcscfEndpoint,
+	transportHint string,
+	localAddress string,
+	tunnel vowifi.TunnelEvidence,
+	pcscfIndex int,
+) (vowifi.IMSSession, error) {
+	var lastErr error
+	transport, carrierSelected := carrierTransportForIdentity(provider.config, request.Identity)
+	if cached := provider.cachedTransport(request.Identity); cached != "" {
+		transport = cached
+		carrierSelected = true
+	}
+	if transport == "" && !carrierSelected {
+		transport = transportHint
+	}
+	if transport == "" {
+		transport = provider.config.Transport
+	}
+	if transport == "" {
+		transport = "tcp"
+	}
+	transports := []string{transport}
+	if provider.config.AutoTransportFallback {
+		alternate := "udp"
+		if transport == "udp" {
+			alternate = "tcp"
+		}
+		transports = append(transports, alternate)
+	}
+	for attempt, candidate := range transports {
+		connection, dialErr := dialSIP(ctx, candidate, localAddress, 0, endpoint.address())
+		if dialErr != nil {
+			lastErr = fmt.Errorf("ims: connect to P-CSCF over %s: %w", candidate, dialErr)
+			if attempt+1 < len(transports) && ctx.Err() == nil {
+				provider.logTransportFallback(request.Identity, candidate, transports[attempt+1], lastErr)
+				continue
+			}
+			break
+		}
+		session, sessionErr := newSession(provider, request, identities, endpoint, candidate, connection)
+		if sessionErr != nil {
+			_ = connection.Close()
+			lastErr = sessionErr
+			break
+		}
+		establishErr := session.establish(ctx)
+		if establishErr == nil {
+			provider.rememberTransport(request.Identity, candidate)
+			if attempt > 0 || pcscfIndex > 0 {
+				provider.config.Logger.Info("IMS automatic transport fallback succeeded",
+					"carrier_profile", vowifi.ResolveCarrierProfile(request.Identity).ID,
+					"transport", candidate)
+			}
+			return session, nil
+		}
+		sipResponseObserved := session.evidence.LastSIPCode != 0
+		session.abort()
+		lastErr = establishErr
+		if simSideFailure(establishErr) {
+			// No other P-CSCF or transport can fix a SIM that changed or
+			// went away (a rotated eUICC, a stale retry holding the previous
+			// identity). Fail now so the runtime retries with a fresh one
+			// instead of walking every endpoint at one transaction each.
+			provider.config.Logger.Warn("IMS registration aborted: the SIM identity is no longer usable",
+				"device_id", request.DeviceID, "error", establishErr)
+			return nil, establishErr
+		}
+		if sipResponseObserved || attempt+1 >= len(transports) || ctx.Err() != nil {
+			break
+		}
+		provider.logTransportFallback(request.Identity, candidate, transports[attempt+1], establishErr)
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
 	return nil, lastErr
 }
@@ -368,6 +442,12 @@ func carrierTransportForIdentity(config Config, identity vowifi.SIMIdentity) (st
 		return transport, true
 	}
 	return "", false
+}
+
+// simSideFailure reports an error that belongs to the SIM rather than to the
+// network, so trying another P-CSCF or transport cannot help.
+func simSideFailure(err error) bool {
+	return errors.Is(err, vowifi.ErrEC20IdentityChanged) || errors.Is(err, vowifi.ErrEC20SIMNotReady)
 }
 
 func transportCacheKey(identity vowifi.SIMIdentity) string {
@@ -888,6 +968,22 @@ func (session *Session) register(ctx context.Context, expires int) (*sipResponse
 		session.lastRegister = request
 		response, err := session.exchange(ctx, request, cseq)
 		if err != nil {
+			// Which REGISTER went unanswered decides where to look: the initial
+			// one is plain network silence, while the authenticated one points
+			// at the IPsec SA the P-CSCF installs only after it sent the 401
+			// (TS 33.203 §7.4.2a orders it that way), whose packets it discards
+			// silently when the SA does not match.
+			stage := "initial"
+			if authorization != "" {
+				stage = "authenticated"
+			}
+			session.provider.config.Logger.Warn("IMS REGISTER got no answer",
+				"device_id", session.request.DeviceID,
+				"stage", stage,
+				"transport", session.transport,
+				"ipsec_installed", session.ipsecHandle != nil,
+				"challenges", challenges,
+				"error", err)
 			return nil, err
 		}
 		session.evidence.LastSIPCode = response.StatusCode
@@ -1485,11 +1581,23 @@ func (session *Session) applyRegistrationEvidence(response *sipResponse) error {
 			}
 		}
 	}
+	// RFC 5626 §6: a registrar that supports outbound MUST echo it in Require.
+	// Without it, bindings are matched by URI comparison, so every new tunnel
+	// IP or protected port creates another binding instead of replacing ours —
+	// which is why old bindings pile up on this network.
+	outboundHonoured := false
+	for _, value := range splitHeaderValues(response.values("Require")) {
+		if strings.Contains(strings.ToLower(value), "outbound") {
+			outboundHonoured = true
+			break
+		}
+	}
 	session.provider.config.Logger.Info("IMS registrar contact bindings",
 		"device_id", session.request.DeviceID,
 		"bindings", len(contacts),
 		"instance_ids", contactInstanceIDs(contacts),
 		"expires", contactExpires(contacts),
+		"outbound_honoured", outboundHonoured,
 		"this_session_matched", registeredContact != "")
 	expiry := registrationExpiry(response, contacts, session.provider.config.RegistrationExpiry)
 	if expiry <= 0 {
@@ -1808,44 +1916,70 @@ func (session *Session) Close(ctx context.Context) error {
 	}
 	var unregisterErr error
 	if session.evidence.Registered && ctx.Err() == nil {
-		session.deregisterAll = deregisterAllOverride ||
+		// RFC 3261 §10.2.2: the wildcard Contact is for clients that do not know
+		// their own bindings. This one does, and T-Mobile answers 480 "Function
+		// is not allowed" to the wildcard often enough that leading with it just
+		// costs a round trip. The wildcard stays as the fallback and as the only
+		// way to clear bindings this client did not create.
+		purgeAllowed := deregisterAllOverride ||
 			vowifi.ResolveCarrierProfile(session.request.Identity).IMSRegisterOptions.DeregisterAllOnClose
-		// A de-registration is answered in well under a second when the
-		// registrar answers at all. Waiting for the caller's full cleanup
-		// budget only delays the teardown (and any eSIM switch behind it).
-		deregisterContext, cancelDeregister := context.WithTimeout(ctx, deregisterTimeout)
-		response, err := session.register(deregisterContext, 0)
-		cancelDeregister()
-		if err == nil && response != nil && response.StatusCode != 200 && ctx.Err() == nil {
-			// T-Mobile intermittently rejects a de-registration (480 "Function is
-			// not allowed" on a wildcard Contact). One retry with the specific
-			// Contact binding usually succeeds; giving up leaves an orphan
-			// binding that swallows MT SMS until it expires.
-			session.provider.config.Logger.Warn("IMS de-registration rejected; retrying with specific contact",
-				"device_id", session.request.DeviceID, "sip_status", response.StatusCode, "wildcard", session.deregisterAll)
-			session.deregisterAll = false
-			firstRejection := response
-			retryContext, cancelRetry := context.WithTimeout(ctx, deregisterTimeout)
-			response, err = session.register(retryContext, 0)
-			cancelRetry()
-			if err != nil {
-				// No answer to the retry: report the original rejection, which
-				// carries the registrar's reason phrase and Warning header.
-				response, err = firstRejection, nil
-			}
+		attempt := func(wildcard bool) (*sipResponse, error) {
+			session.deregisterAll = wildcard
+			attemptContext, cancel := context.WithTimeout(ctx, deregisterTimeout)
+			defer cancel()
+			return session.register(attemptContext, 0)
 		}
-		if err != nil {
-			unregisterErr = err
-		} else if response.StatusCode == 200 {
+		remainingBindings := func(response *sipResponse) int {
+			if response == nil {
+				return 0
+			}
+			return len(splitHeaderValues(response.values("Contact")))
+		}
+		response, err := attempt(false)
+		switch {
+		case err != nil:
+			// TS 33.203 §7.4.1a: no answer to a protected message means the
+			// network has already dropped the security association, which is
+			// what the de-registration asked for. Retrying only lands on the
+			// same dead SA, so record it and finish the teardown.
+			session.provider.config.Logger.Info("IMS de-registration went unanswered; treating the registration as gone",
+				"device_id", session.request.DeviceID, "error", err)
+		case response.StatusCode == 200:
+			remaining := remainingBindings(response)
 			session.provider.config.Logger.Info("IMS de-registration accepted",
 				"device_id", session.request.DeviceID,
-				"all_bindings", session.deregisterAll,
-				"remaining_bindings", len(splitHeaderValues(response.values("Contact"))))
-		} else {
-			// Keep the registrar's reason phrase and Reason/Warning headers: a
-			// rejected de-registration leaves the old Contact binding alive on
-			// the S-CSCF until it expires, and MT SMS may be routed into it.
-			unregisterErr = registrationRejectionError(response, "de-registration")
+				"all_bindings", false,
+				"remaining_bindings", remaining)
+			if remaining > 0 && purgeAllowed {
+				// Bindings this session did not create (an earlier tunnel IP
+				// whose lease has not expired). Best effort: a rejected purge
+				// must not fail the teardown.
+				purgeResponse, purgeErr := attempt(true)
+				status := 0
+				if purgeResponse != nil {
+					status = purgeResponse.StatusCode
+				}
+				session.provider.config.Logger.Info("IMS stale bindings purge attempted",
+					"device_id", session.request.DeviceID, "sip_status", status,
+					"remaining_bindings", remainingBindings(purgeResponse), "error", purgeErr)
+			}
+		default:
+			session.provider.config.Logger.Warn("IMS de-registration rejected; falling back to the wildcard Contact",
+				"device_id", session.request.DeviceID, "sip_status", response.StatusCode)
+			rejection := registrationRejectionError(response, "de-registration")
+			fallback, fallbackErr := attempt(true)
+			switch {
+			case fallbackErr != nil:
+				// Keep the registrar's reason phrase from the first rejection.
+				unregisterErr = rejection
+			case fallback.StatusCode == 200:
+				session.provider.config.Logger.Info("IMS de-registration accepted",
+					"device_id", session.request.DeviceID,
+					"all_bindings", true,
+					"remaining_bindings", remainingBindings(fallback))
+			default:
+				unregisterErr = registrationRejectionError(fallback, "de-registration")
+			}
 		}
 		if unregisterErr != nil {
 			status := 0

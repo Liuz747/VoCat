@@ -16,9 +16,10 @@ const defaultCleanupTimeout = 10 * time.Second
 // that answers the first REGISTER and then goes silent otherwise consumes the
 // caller's whole operation budget (120 s measured), while the runtime's own
 // retry registers in about three seconds. A registration that is going to
-// succeed completes in 2-6 s on T-Mobile US over VoWiFi, so this leaves ample
-// headroom while keeping a stalled attempt short.
-const defaultIMSRegistrationTimeout = 20 * time.Second
+// succeed answers in 1-2 s on T-Mobile US (2-6 s including the SWu tunnel),
+// and when the authenticated REGISTER is lost only a rebuilt tunnel recovers
+// it, so failing early is what shortens the outage.
+const defaultIMSRegistrationTimeout = 6 * time.Second
 
 type runtimeResources struct {
 	cancel       context.CancelFunc

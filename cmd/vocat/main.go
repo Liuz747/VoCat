@@ -1155,7 +1155,13 @@ func newVoWiFiOrchestrator(
 		// alternate transport only if no SIP response was observed.
 		Transport:             "tcp",
 		AutoTransportFallback: true,
-		OnIncomingCall:        onIncomingCall,
+		// One SIP transaction must be short enough that a lost REGISTER can be
+		// retried inside the registration budget (see
+		// defaultIMSRegistrationTimeout). A registration that is going to
+		// succeed answers in well under a second on this network; the default
+		// 12 s only ever delayed the recovery.
+		TransactionTimeout: 4 * time.Second,
+		OnIncomingCall:     onIncomingCall,
 		OnSMS: func(ctx context.Context, message ims.ReceivedSMS) error {
 			localPhone, _ := database.PhoneNumberForICCID(ctx, message.ICCID)
 			modemIMEI := firstNonEmpty(message.ModemIMEI, deviceConfig.ModemIMEI)
