@@ -42,6 +42,14 @@ type linuxXFRMHandle struct {
 	reqid            string
 	closed           bool
 	releaseAddresses func()
+	cleanup          []xfrmCleanup
+}
+
+// Cleanup records are added only after the corresponding create succeeds.
+// A failed add may mean the object belongs to a different live session.
+type xfrmCleanup struct {
+	operation string
+	arguments []string
 }
 
 func (*linuxXFRMHandle) DataplaneMode() string { return "xfrm" }
@@ -85,6 +93,9 @@ func (handle *linuxXFRMHandle) install(ctx context.Context) error {
 	if err := handle.run(ctx, "create tunnel interface", "link", "add", config.Name, "type", "dummy"); err != nil {
 		return err
 	}
+	handle.cleanup = append(handle.cleanup, xfrmCleanup{
+		operation: "delete tunnel interface", arguments: []string{"link", "delete", config.Name},
+	})
 	if config.InnerLocalIPv4 != nil {
 		if err := handle.run(ctx, "assign tunnel IPv4 address", "address", "add", config.InnerLocalIPv4.String()+"/32", "dev", config.Name); err != nil {
 			return err
@@ -105,6 +116,10 @@ func (handle *linuxXFRMHandle) install(ctx context.Context) error {
 	if err := handle.run(ctx, "install outbound ESP state", append([]string{"xfrm", "state", "add"}, outboundState...)...); err != nil {
 		return err
 	}
+	handle.cleanup = append(handle.cleanup, xfrmCleanup{
+		operation: "delete outbound ESP state",
+		arguments: []string{"xfrm", "state", "delete", "src", config.OuterLocal.String(), "dst", config.OuterRemote.String(), "proto", "esp", "spi", fmt.Sprintf("0x%08x", config.OutboundSPI)},
+	})
 	inboundState := handle.stateArguments(
 		config.OuterRemote, config.OuterLocal, config.InboundSPI,
 		config.InboundEncKey, config.InboundAuthKey,
@@ -112,6 +127,10 @@ func (handle *linuxXFRMHandle) install(ctx context.Context) error {
 	if err := handle.run(ctx, "install inbound ESP state", append([]string{"xfrm", "state", "add"}, inboundState...)...); err != nil {
 		return err
 	}
+	handle.cleanup = append(handle.cleanup, xfrmCleanup{
+		operation: "delete inbound ESP state",
+		arguments: []string{"xfrm", "state", "delete", "src", config.OuterRemote.String(), "dst", config.OuterLocal.String(), "proto", "esp", "spi", fmt.Sprintf("0x%08x", config.InboundSPI)},
+	})
 	for _, initiator := range config.InitiatorSelectors {
 		for _, responder := range config.ResponderSelectors {
 			if (initiator.StartIP.To4() == nil) != (responder.StartIP.To4() == nil) {
@@ -170,6 +189,13 @@ func (handle *linuxXFRMHandle) installPolicyPair(
 	if err != nil {
 		return err
 	}
+	// Policy deletion identifies the exact selector, including protocol and
+	// ports, but takes no transform template. Keep the installed selector instead
+	// of reconstructing a broader one from the desired config during Close.
+	outboundDelete := append([]string(nil), outbound...)
+	inboundDelete := append([]string(nil), inbound...)
+	outboundDelete[3] = "delete"
+	inboundDelete[3] = "delete"
 	outbound = append(outbound,
 		"tmpl", "src", handle.config.OuterLocal.String(), "dst", handle.config.OuterRemote.String(),
 		"proto", "esp", "mode", "tunnel", "reqid", handle.reqid,
@@ -181,7 +207,12 @@ func (handle *linuxXFRMHandle) installPolicyPair(
 	if err := handle.run(ctx, "install outbound ESP policy", outbound...); err != nil {
 		return err
 	}
-	return handle.run(ctx, "install inbound ESP policy", inbound...)
+	handle.cleanup = append(handle.cleanup, xfrmCleanup{operation: "delete outbound ESP policy", arguments: outboundDelete})
+	if err := handle.run(ctx, "install inbound ESP policy", inbound...); err != nil {
+		return err
+	}
+	handle.cleanup = append(handle.cleanup, xfrmCleanup{operation: "delete inbound ESP policy", arguments: inboundDelete})
+	return nil
 }
 
 func appendSelectorPorts(
@@ -294,50 +325,14 @@ func (handle *linuxXFRMHandle) Close(ctx context.Context) error {
 	if handle.releaseAddresses != nil {
 		defer handle.releaseAddresses()
 	}
-	config := handle.config
 	var errs []error
-	deletePolicy := func(family, source, destination, direction string) {
-		command := exec.CommandContext(ctx, handle.ipCommand,
-			family, "xfrm", "policy", "delete",
-			"src", source, "dst", destination, "dir", direction,
-		)
-		if err := command.Run(); err != nil {
+	for index := len(handle.cleanup) - 1; index >= 0; index-- {
+		cleanup := handle.cleanup[index]
+		if err := handle.run(ctx, cleanup.operation, cleanup.arguments...); err != nil {
 			errs = append(errs, err)
 		}
 	}
-	for _, initiator := range config.InitiatorSelectors {
-		for _, responder := range config.ResponderSelectors {
-			if (initiator.StartIP.To4() == nil) != (responder.StartIP.To4() == nil) {
-				continue
-			}
-			initiatorPrefix, initiatorErr := selectorPrefix(initiator)
-			responderPrefix, responderErr := selectorPrefix(responder)
-			if initiatorErr != nil || responderErr != nil {
-				continue
-			}
-			family := "-4"
-			if initiator.StartIP.To4() == nil {
-				family = "-6"
-			}
-			deletePolicy(family, initiatorPrefix, responderPrefix, "out")
-			deletePolicy(family, responderPrefix, initiatorPrefix, "in")
-		}
-	}
-	deleteState := func(source net.IP, destination net.IP, spi uint32) {
-		command := exec.CommandContext(ctx, handle.ipCommand,
-			"xfrm", "state", "delete",
-			"src", source.String(), "dst", destination.String(),
-			"proto", "esp", "spi", fmt.Sprintf("0x%08x", spi),
-		)
-		if err := command.Run(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	deleteState(config.OuterLocal, config.OuterRemote, config.OutboundSPI)
-	deleteState(config.OuterRemote, config.OuterLocal, config.InboundSPI)
-	if err := exec.CommandContext(ctx, handle.ipCommand, "link", "delete", config.Name).Run(); err != nil {
-		errs = append(errs, err)
-	}
+	handle.cleanup = nil
 	return errors.Join(errs...)
 }
 
