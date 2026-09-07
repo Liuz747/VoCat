@@ -295,8 +295,11 @@ func (m *Manager) run(g *group, cycleCtx context.Context) {
 		if startErr != nil && !g.stopRequested && !m.closed {
 			g.state.Phase = "failed"
 			g.state.LastError = "group preparation failed"
+			m.options.Logger.Error("multisim group preparation failed; no automatic retry, re-save the configuration to start again",
+				"device_id", g.config.DeviceID, "error", startErr)
 		} else {
 			g.state.Enabled = false
+			m.options.Logger.Info("multisim group released the device", "device_id", g.config.DeviceID)
 		}
 		g.state.UpdatedAt = time.Now().UTC()
 		m.mu.Unlock()
@@ -376,11 +379,18 @@ func (m *Manager) initializeLine(g *group, cycleCtx context.Context, config Conf
 			m.mu.Lock()
 			item.lastError = "line initialization failed"
 			m.mu.Unlock()
+			m.options.Logger.Warn("multisim line initialization failed; retrying",
+				"device_id", config.DeviceID, "session_id", item.sessionID,
+				"profile_suffix", profileSuffix(item.profile.ICCID), "profile_name", item.profile.Name,
+				"retry_in", retry, "error", err)
 		} else {
 			m.mu.Lock()
 			item.orchestrator = orchestrator
 			item.lastError = ""
 			m.mu.Unlock()
+			m.options.Logger.Info("multisim line created",
+				"device_id", config.DeviceID, "session_id", item.sessionID,
+				"profile_suffix", profileSuffix(item.profile.ICCID), "profile_name", item.profile.Name)
 			if cycleCtx.Err() != nil {
 				return
 			}
@@ -413,6 +423,15 @@ func (m *Manager) initializeLine(g *group, cycleCtx context.Context, config Conf
 func (m *Manager) setPhase(g *group, phase string, busy bool, lastError string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if g.state.Phase != phase || lastError != "" {
+		attrs := []any{"device_id", g.config.DeviceID, "from", g.state.Phase, "to", phase, "busy", busy}
+		if lastError != "" {
+			attrs = append(attrs, "error", lastError)
+			m.options.Logger.Warn("multisim group phase changed", attrs...)
+		} else {
+			m.options.Logger.Info("multisim group phase changed", attrs...)
+		}
+	}
 	g.state.Phase = phase
 	g.state.Busy = busy
 	g.state.LastError = lastError

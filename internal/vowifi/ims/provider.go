@@ -1841,13 +1841,24 @@ func (session *Session) refreshLoop() {
 			return
 		case <-timer.C:
 		}
+		session.provider.config.Logger.Info("IMS registration refresh due",
+			"device_id", session.request.DeviceID,
+			"scheduled_after", delay.Round(time.Second).String())
+		started := time.Now()
 		if err := session.refreshOnce(session.refreshContext); err != nil {
 			if session.refreshContext.Err() != nil {
 				return
 			}
+			session.provider.config.Logger.Warn("IMS registration refresh failed; the session will be rebuilt",
+				"device_id", session.request.DeviceID,
+				"refresh_ms", time.Since(started).Milliseconds(),
+				"error", err)
 			session.publishFailure(err)
 			return
 		}
+		session.provider.config.Logger.Info("IMS registration refresh completed",
+			"device_id", session.request.DeviceID,
+			"refresh_ms", time.Since(started).Milliseconds())
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -625,6 +626,13 @@ func (manager *Manager) scheduleAutoRetryLocked(deviceID string, item *entry) {
 
 func (manager *Manager) watch(deviceID string, states <-chan vowifi.State) {
 	defer manager.wg.Done()
+	// Track the previous phase and the moment the session became SMS ready so a
+	// runtime failure (DPD timeout, peer DELETE, IMS refresh failure, ...) is
+	// logged once with its cause and how long the session had been serving.
+	// The orchestrator records the cause in State only; without this line the
+	// journal shows the teardown (de-registration) but never why it started.
+	var lastPhase vowifi.Phase
+	var readySince time.Time
 	for {
 		select {
 		case <-manager.ctx.Done():
@@ -633,6 +641,36 @@ func (manager *Manager) watch(deviceID string, states <-chan vowifi.State) {
 			if !ok {
 				return
 			}
+			if state.Phase == vowifi.PhaseSMSReady && lastPhase != vowifi.PhaseSMSReady {
+				readySince = time.Now()
+			}
+			if state.Phase == vowifi.PhaseFailed && lastPhase != vowifi.PhaseFailed {
+				attrs := []any{
+					"device_id", deviceID,
+					"reason", state.LastReason,
+					"error_class", state.LastErrorClass,
+					"error", state.LastError,
+					"attempt", state.Attempt,
+				}
+				if !readySince.IsZero() {
+					attrs = append(attrs, "ready_for", time.Since(readySince).Round(time.Second).String())
+				}
+				if len(state.CleanupErrors) > 0 {
+					attrs = append(attrs, "cleanup_errors", state.CleanupErrors)
+				}
+				manager.logger.Warn("VoWiFi session failed", attrs...)
+				readySince = time.Time{}
+			}
+			if state.Phase == vowifi.PhaseStopping && lastPhase == vowifi.PhaseSMSReady && strings.HasPrefix(state.LastReason, "runtime_") {
+				manager.logger.Warn("VoWiFi session lost while ready; tearing down",
+					"device_id", deviceID,
+					"reason", state.LastReason,
+					"error_class", state.LastErrorClass,
+					"error", state.LastError,
+					"ready_for", time.Since(readySince).Round(time.Second).String(),
+				)
+			}
+			lastPhase = state.Phase
 			if state.Phase == vowifi.PhaseFailed {
 				manager.mu.Lock()
 				item := manager.entries[deviceID]
