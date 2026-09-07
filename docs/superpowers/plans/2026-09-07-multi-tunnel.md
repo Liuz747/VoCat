@@ -58,6 +58,10 @@ Files: `cmd/vocat/main.go`, new `cmd/vocat/multisim.go`, integration tests and r
 - [x] Load desired configurations at startup; suppress single-line startup/reconciliation while owned; close groups before device teardown.
 - [x] Test policy handoff, profile restore, immutable SMS ownership and factory composition.
 - [x] Build UI and static binary; run required repository checks once after integration.
-- [ ] Back up live binary/SQLite/service invocation, deploy and enable only the designated reader.
-- [ ] Test inactive-profile MT, observed renewal, individual-line reconnect and service restart; use few externally triggered messages at these decision points.
-- [ ] Record the actual behavior, remaining limitations, enabled configuration and rollback command; do not leave a failed trial owning the reader.
+- [x] Back up live binary/SQLite/service invocation, deploy and enable only the designated reader.
+- [x] Test inactive-profile MT, observed renewal, individual-line reconnect and service restart; use few externally triggered messages at these decision points.
+- [x] Record the actual behavior, remaining limitations, enabled configuration and rollback command; do not leave a failed trial owning the reader.
+
+## Deployment evidence
+
+Implemented in `874b9eb`; deployed `0.1.0-multitunnel.20260907.3` on the designated public reader. Five external messages were received. Three-line coexistence, ordinary in-session refresh, individual reconnect, original-profile restoration and service restart were verified. One A-line interruption recovered automatically; continuous availability and full in-place rekey are not claimed. Evidence: `Note/多隧道-上线与三号实测-2026-09-07.md` in the parent workspace.
