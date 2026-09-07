@@ -47,6 +47,7 @@ type sessionRelay struct {
 
 	mu           sync.Mutex
 	lastErr      error
+	closing      bool // protected by mu; no new local IKE transaction or DPD retry
 	options      relayOptions
 	nextProbe    time.Time
 	pending      *dpdRequest
@@ -318,6 +319,11 @@ func (relay *sessionRelay) Close() error {
 	// wake-up as well: a socket implementation that is stuck in Read must not
 	// hold teardown (and the associated TUN interface) indefinitely.
 	transportErr := relay.transport.Close()
+	// Do not wait for mu before canceling/closing the socket: a DPD or DELETE
+	// writer may hold it across Send and need socket Close to wake up.
+	relay.mu.Lock()
+	relay.closing = true
+	relay.mu.Unlock()
 	<-relay.done
 	return errors.Join(relay.terminalErrorIfFailure(), transportErr)
 }
@@ -330,6 +336,13 @@ func (relay *sessionRelay) CloseWithDelete(ctx context.Context) error {
 func (relay *sessionRelay) sendIKEDelete(ctx context.Context) error {
 	relay.mu.Lock()
 	defer relay.mu.Unlock()
+	if relay.closing || relay.ctx.Err() != nil {
+		return nil
+	}
+	// Commit the close transition before Send releases mu. A queued DPD tick
+	// must not consume the next message ID after this DELETE, even before Close
+	// cancels the reader. Pending-DPD and failed-DELETE paths also stay closing.
+	relay.closing = true
 	// An already terminal SA cannot acknowledge another transaction.
 	if relay.lastErr != nil {
 		return nil
@@ -397,6 +410,9 @@ var _ NATTPacketRelay = (*sessionRelay)(nil)
 func (relay *sessionRelay) dpdTick(now time.Time) error {
 	relay.mu.Lock()
 	defer relay.mu.Unlock()
+	if relay.closing || relay.ctx.Err() != nil {
+		return nil
+	}
 	if relay.pending != nil {
 		p := relay.pending
 		if now.Sub(p.sent) < relay.options.DPDTimeout {
