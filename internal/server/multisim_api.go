@@ -120,6 +120,67 @@ func (s *Server) multiSIMResponse(ctx context.Context, device store.Device) map[
 	return map[string]any{"config": cfg, "state": state, "owned": owned, "active_profile_iccid": active, "available": s.multisim != nil}
 }
 
+// multiSIMSummary is the compact projection attached to device summaries so the
+// device list, dashboard and overview can show a running group without one
+// extra request per device. It returns nil when the device has no enabled or
+// owned group, so legacy single-line devices are unaffected.
+func (s *Server) multiSIMSummary(ctx context.Context, deviceID string) map[string]any {
+	if s.store == nil {
+		return nil
+	}
+	cfg, err := s.store.MultiSIMConfig(ctx, deviceID)
+	if err != nil {
+		return nil
+	}
+	owned := s.multisim != nil && s.multisim.Owns(deviceID)
+	if !cfg.Enabled && !owned {
+		return nil
+	}
+	state := multisim.GroupState{Phase: "pending", Lines: []multisim.LineState{}}
+	if s.multisim != nil {
+		if live := s.multisim.State(deviceID); live.Phase != "" {
+			state = live
+		}
+	}
+	ready := 0
+	lines := make([]map[string]any, 0, len(state.Lines))
+	for _, line := range state.Lines {
+		if line.State.SMSReady {
+			ready++
+		}
+		suffix := line.ICCID
+		if len(suffix) > 6 {
+			suffix = suffix[len(suffix)-6:]
+		}
+		lines = append(lines, map[string]any{
+			"iccid_suffix":     suffix,
+			"name":             line.Name,
+			"session_id":       line.SessionID,
+			"phone_number":     line.State.PhoneNumber,
+			"phase":            string(line.State.Phase),
+			"sms_ready":        line.State.SMSReady,
+			"tunnel_ready":     line.State.TunnelReady,
+			"ims_ready":        line.State.IMSReady,
+			"proxy_id":         line.State.ProxyID,
+			"attempt":          line.State.Attempt,
+			"last_reason":      line.State.LastReason,
+			"last_error_class": line.State.LastErrorClass,
+			"updated_at":       line.State.UpdatedAt,
+		})
+	}
+	return map[string]any{
+		"enabled":     cfg.Enabled,
+		"owned":       owned,
+		"phase":       state.Phase,
+		"busy":        state.Busy,
+		"last_error":  state.LastError,
+		"lines_total": len(cfg.Profiles),
+		"lines_ready": ready,
+		"lines":       lines,
+		"updated_at":  state.UpdatedAt,
+	}
+}
+
 func (s *Server) applyMultiSIMConfig(ctx context.Context, cfg store.MultiSIMConfig) (store.MultiSIMConfig, error) {
 	previous, readErr := s.store.MultiSIMConfig(ctx, cfg.DeviceID)
 	if readErr != nil && !errors.Is(readErr, store.ErrNotFound) {

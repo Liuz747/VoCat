@@ -424,7 +424,7 @@ func (m *Manager) setPhase(g *group, phase string, busy bool, lastError string) 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if g.state.Phase != phase || lastError != "" {
-		attrs := []any{"device_id", g.config.DeviceID, "from", g.state.Phase, "to", phase, "busy", busy}
+		attrs := []any{"device_id", g.config.DeviceID, "phase_from", g.state.Phase, "phase_to", phase, "busy", busy}
 		if lastError != "" {
 			attrs = append(attrs, "error", lastError)
 			m.options.Logger.Warn("multisim group phase changed", attrs...)

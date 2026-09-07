@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from "react";
 import { message } from "../ui";
 import type { DeviceDetail, DeviceModem, ModemPnn } from "./types";
-import { tl } from "../../lib/i18n";
+import { tf, tl } from "../../lib/i18n";
 import { lookupCarrier } from "../../lib/carrier";
 import { notifyUnauthorized } from "../../api";
 
@@ -68,6 +68,19 @@ export function isVoWiFiInUse(device?: {
 } | null): boolean {
   if (!device?.vowifiEnabled) return false;
   return device.vowifiRuntime?.enabled !== false;
+}
+
+// A multi-tunnel group that currently owns the modem. The legacy single-line
+// runtime is idle while the group runs, so callers must not read
+// vowifiRuntime to decide whether the device is receiving.
+export function isMultiSIMActive(device?: { multisim?: { owned?: boolean; enabled?: boolean } } | null): boolean {
+  return !!(device?.multisim && (device.multisim.owned || device.multisim.enabled));
+}
+
+export function multiSIMStatusText(device?: { multisim?: { linesReady: number; linesTotal: number; phase: string } } | null): string {
+  const m = device?.multisim;
+  if (!m) return "";
+  return `${tl("多隧道")} · ${tf("{ready}/{total} 可收", { ready: m.linesReady, total: m.linesTotal })}`;
 }
 
 export interface StatusMeta {

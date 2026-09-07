@@ -3,7 +3,7 @@ import { Button, Spinner, Switch } from "../ui";
 import type { DeviceDetail } from "./types";
 import { useI18n } from "../../lib/i18n";
 import { deviceTypeImage } from "../../lib/deviceTypes";
-import { isVoWiFiInUse } from "./shared";
+import { isVoWiFiInUse, multiSIMStatusText } from "./shared";
 import { Link } from "react-router-dom";
 import { rotationSequenceText, type RotationTaskSummary } from "./types";
 
@@ -41,6 +41,11 @@ export function DeviceDetailHeader(props: DeviceDetailHeaderProps) {
                   {device.id}
                 </span>
               </div>
+              {device.multisim && (device.multisim.owned || device.multisim.enabled) ? (
+                <div className="mt-0.5 truncate text-xs text-sky-600 dark:text-sky-300" title={t("多隧道运行中：每个号码保留独立的 VoWiFi 线路；此时普通 VoWiFi 运行时处于空闲，以 eSIM 标签页的多隧道面板为准。")}>
+                  {multiSIMStatusText(device)} · {device.multisim.lines.map((l) => (l.phoneNumber || l.name || l.iccidSuffix).replace(/^\+1/, "") + (l.smsReady ? " ✓" : " …")).join(" · ")}
+                </div>
+              ) : null}
               {props.rotationTask ? (
                 <div className="mt-0.5 truncate text-xs text-sky-600 dark:text-sky-300" title={t("此设备的 eSIM Profile 会被自动任务周期性切换，手动切换或改 VoWiFi 会在下一次轮询时被覆盖。")}>
                   {t("轮询中")} · {props.rotationTask.name} · {rotationSequenceText(props.rotationTask)} · {t("停留 {seconds} 秒").replace("{seconds}", String(props.rotationTask.intervalSeconds))} · <Link to="/automatic-tasks" className="underline">{t("去自动任务页管理")}</Link>

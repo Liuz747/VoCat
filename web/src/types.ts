@@ -102,6 +102,35 @@ export interface PublicIPInfo {
   organization?: string;
 }
 
+/** Compact projection of a multi-tunnel (multisim) group attached to a device summary. */
+export interface MultiSIMLineSummary {
+  iccidSuffix: string;
+  name?: string;
+  sessionId: string;
+  phoneNumber?: string;
+  phase: string;
+  smsReady: boolean;
+  tunnelReady: boolean;
+  imsReady: boolean;
+  proxyId?: string;
+  attempt: number;
+  lastReason?: string;
+  lastErrorClass?: string;
+  updatedAt: string;
+}
+
+export interface MultiSIMSummary {
+  enabled: boolean;
+  owned: boolean;
+  phase: string;
+  busy: boolean;
+  lastError?: string;
+  linesTotal: number;
+  linesReady: number;
+  lines: MultiSIMLineSummary[];
+  updatedAt: string;
+}
+
 export interface DeviceListItem {
   id: string;
   name: string;
@@ -124,6 +153,7 @@ export interface DeviceListItem {
   vowifiEnabled: boolean;
   vowifiActive?: boolean;
   vowifiRuntime: VoWiFiRuntime;
+  multisim?: MultiSIMSummary;
   modem: ModemSummary;
   networkConnected: boolean;
 	  networkPhase?: "unknown" | "starting" | "connected" | "stopping" | "recovering" | "disabled" | "failed";
@@ -153,6 +183,7 @@ export interface DashboardDevice {
   networkDuplex?: string;
   vowifiActive: boolean;
   vowifiRuntime: VoWiFiRuntime;
+  multisim?: MultiSIMSummary;
   networkConnected: boolean;
   model?: string;
 }

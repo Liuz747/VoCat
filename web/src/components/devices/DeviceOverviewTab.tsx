@@ -1,13 +1,14 @@
 import { useState } from "react";
 import { OverviewNetworkCard } from "./OverviewNetworkCard";
 import { OverviewVowifiCard } from "./OverviewVowifiCard";
+import { OverviewMultiSIMCard } from "./OverviewMultiSIMCard";
 import { OverviewSimPanel } from "./OverviewSimPanel";
 import { OverviewNetworkPanel } from "./OverviewNetworkPanel";
 import { OverviewTrafficChart } from "./OverviewTrafficChart";
 import { OperatorSelectionDialog } from "./OperatorSelectionDialog";
 import type { DeviceDetail } from "./types";
 import { useI18n } from "../../lib/i18n";
-import { isVoWiFiInUse } from "./shared";
+import { isMultiSIMActive, isVoWiFiInUse } from "./shared";
 
 export interface DeviceOverviewTabProps {
   device: DeviceDetail;
@@ -33,7 +34,9 @@ export function DeviceOverviewTab(props: DeviceOverviewTabProps) {
       <div className={`grid grid-cols-1 gap-4 ${showNetworkDetails ? "lg:grid-cols-3" : "lg:grid-cols-2"}`}>
         <div className="ui-panel-muted p-4">
           <div className="mb-3 text-xs font-bold uppercase tracking-wider text-gray-500">{t("运行状态")}</div>
-		  {isVoWiFiInUse(device) && !(device.modem?.imei && device.modem?.simInserted === false) ? (
+		  {isMultiSIMActive(device) ? (
+            <OverviewMultiSIMCard device={device} />
+          ) : isVoWiFiInUse(device) && !(device.modem?.imei && device.modem?.simInserted === false) ? (
             <OverviewVowifiCard device={device} />
           ) : (
             <OverviewNetworkCard device={device} onOpenOperatorSelection={() => setOperatorOpen(true)} />

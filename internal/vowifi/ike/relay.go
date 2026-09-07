@@ -9,6 +9,7 @@ import (
 	"math"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -44,6 +45,16 @@ type sessionRelay struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 	esp    chan []byte
+
+	// Liveness diagnostics folded into the DPD failure error: the relay has
+	// no logger, and "DPD deadline exceeded" alone cannot tell a dead proxy
+	// UDP association from a peer that stopped talking to us.
+	dpdAnswered  atomic.Int64 // our DPD probes the peer answered
+	peerRequests atomic.Int64 // peer INFORMATIONAL/CREATE_CHILD_SA requests answered
+	peerIgnored  atomic.Int64 // peer requests dropped for an unexpected Message ID
+	lastRxUnix   atomic.Int64 // last authenticated IKE packet from the peer (UnixNano)
+	lastESPUnix  atomic.Int64 // last ESP packet handed to the data plane (UnixNano)
+	startedUnix  int64
 
 	mu           sync.Mutex
 	lastErr      error
@@ -96,6 +107,7 @@ func newSessionRelay(
 		spii:             initiatorSPI,
 		spir:             responderSPI,
 		deleteID:         deleteMessageID,
+		startedUnix:      time.Now().UnixNano(),
 		natt:             natt,
 		keepalive:        keepalive,
 		ctx:              ctx,
@@ -161,6 +173,7 @@ func (relay *sessionRelay) run() {
 			// Unauthenticated network input must not tear down the session.
 			continue
 		}
+		relay.lastESPUnix.Store(time.Now().UnixNano())
 		select {
 		case relay.esp <- packet:
 		default:
@@ -192,11 +205,13 @@ func (relay *sessionRelay) handleIKE(packet []byte) error {
 	if err != nil {
 		return nil
 	}
+	relay.lastRxUnix.Store(time.Now().UnixNano())
 	if header.Flags&flagResponse != 0 {
 		relay.mu.Lock()
 		if p := relay.pending; p != nil && header.Exchange == exchangeInformational && header.MessageID == p.id && len(payloads) == 0 {
 			relay.pending = nil
 			relay.nextProbe = time.Now().Add(relay.options.DPDInterval)
+			relay.dpdAnswered.Add(1)
 		}
 		relay.mu.Unlock()
 		return nil
@@ -211,6 +226,7 @@ func (relay *sessionRelay) handleIKE(packet []byte) error {
 			return nil
 		}
 		if relay.peerID == math.MaxUint32 || header.MessageID != relay.peerID+1 {
+			relay.peerIgnored.Add(1)
 			return nil
 		}
 	}
@@ -255,6 +271,7 @@ func (relay *sessionRelay) handleIKE(packet []byte) error {
 	}
 	relay.peerSeen = true
 	relay.peerID = header.MessageID
+	relay.peerRequests.Add(1)
 	relay.peerRequest = append([]byte(nil), packet...)
 	relay.peerResponse = append([]byte(nil), response...)
 	if err = relay.transport.SendSessionPacket(relay.ctx, response, true); err != nil {
@@ -419,7 +436,7 @@ func (relay *sessionRelay) dpdTick(now time.Time) error {
 			return nil
 		}
 		if p.attempts >= relay.options.DPDAttempts {
-			return ErrDPDTimeout
+			return fmt.Errorf("%w (%s)", ErrDPDTimeout, relay.livenessSummary(now))
 		}
 		if err := relay.transport.SendSessionPacket(relay.ctx, p.packet, true); err != nil {
 			return err
@@ -445,4 +462,20 @@ func (relay *sessionRelay) dpdTick(now time.Time) error {
 	relay.deleteID++
 	relay.pending = &dpdRequest{packet: request, id: id, sent: now, attempts: 1}
 	return nil
+}
+
+// livenessSummary describes what the relay saw before a DPD failure so the
+// session-failed log line can distinguish "peer went silent on everything"
+// from "peer still sends ESP/keepalives but ignores our probes".
+func (relay *sessionRelay) livenessSummary(now time.Time) string {
+	age := func(unix int64) string {
+		if unix == 0 {
+			return "never"
+		}
+		return now.Sub(time.Unix(0, unix)).Round(time.Second).String() + " ago"
+	}
+	return fmt.Sprintf("session_age=%s dpd_answered=%d peer_requests=%d peer_ignored=%d last_ike_rx=%s last_esp_rx=%s",
+		now.Sub(time.Unix(0, relay.startedUnix)).Round(time.Second),
+		relay.dpdAnswered.Load(), relay.peerRequests.Load(), relay.peerIgnored.Load(),
+		age(relay.lastRxUnix.Load()), age(relay.lastESPUnix.Load()))
 }

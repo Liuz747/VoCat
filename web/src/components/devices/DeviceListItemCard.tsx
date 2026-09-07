@@ -37,6 +37,16 @@ export function DeviceListItemCard({ device, selected, statusText, rotationTask,
               {device.id} · {device.interface || "--"}
             </div>
             <div className="mt-1 truncate text-xs text-gray-400">{statusText}</div>
+            {device.multisim && (device.multisim.owned || device.multisim.enabled) ? (
+              <div className="mt-0.5 truncate text-xs text-sky-600 dark:text-sky-300" title={device.multisim.lines.map((l) => `${l.phoneNumber || l.name || l.iccidSuffix}: ${l.smsReady ? t("可接收短信") : l.phase}`).join("\n")}>
+                {device.multisim.lines.map((l) => (
+                  <span key={l.sessionId} className="mr-2 inline-flex items-center gap-1">
+                    <span className={cx("inline-block h-1.5 w-1.5 rounded-full", l.smsReady ? "bg-emerald-500" : "bg-amber-500")} />
+                    {(l.phoneNumber || l.name || l.iccidSuffix).replace(/^\+1/, "")}
+                  </span>
+                ))}
+              </div>
+            ) : null}
             {rotationTask ? (
               <div className="mt-0.5 truncate text-xs text-sky-600 dark:text-sky-300" title={`${rotationTask.name}：${rotationSequenceText(rotationTask)}`}>
                 {t("轮询中")} · {rotationSequenceText(rotationTask)}

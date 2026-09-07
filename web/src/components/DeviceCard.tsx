@@ -12,16 +12,18 @@ const BAR_HEIGHTS = ["h-1/4", "h-2/4", "h-3/4", "h-full"];
 
 export function DeviceCard({ device, onOpen }: { device: DashboardDevice; onOpen: (id: string) => void }) {
   const { t } = useI18n();
+  const multi = device.multisim && (device.multisim.owned || device.multisim.enabled) ? device.multisim : null;
   const mode = `${device.networkDuplex ? `${device.networkDuplex} ` : ""}${device.networkMode || ""}`.trim();
   const up = mode.toUpperCase();
   const has = mode.length > 0;
-  const NetIcon = device.vowifiActive ? Wifi1Regular
+  const NetIcon = device.vowifiActive || multi ? Wifi1Regular
     : !has ? CellularData1Regular
     : up.includes("5G") || up.includes("NR") ? Cellular5GRegular
     : up.includes("4G") || up.includes("LTE") ? Cellular4GRegular
     : up.includes("3G") || up.includes("WCDMA") || up.includes("HSPA") || up.includes("UMTS") ? Cellular3GRegular
     : CellularData1Regular;
-  const netColor = device.vowifiActive ? "text-emerald-500"
+  const netColor = multi ? (multi.linesReady === multi.linesTotal ? "text-emerald-500" : "text-amber-500")
+    : device.vowifiActive ? "text-emerald-500"
     : !has ? "text-gray-400"
     : up.includes("5G") || up.includes("NR") ? "text-purple-500"
     : up.includes("4G") || up.includes("LTE") ? "text-blue-500"
@@ -58,15 +60,22 @@ export function DeviceCard({ device, onOpen }: { device: DashboardDevice; onOpen
             <div className="flex min-w-0 items-center gap-2">
               <div className="flex items-center gap-1.5 opacity-80">
                 <NetIcon className={cx("h-[18px] w-[18px]", netColor)} />
-                {!device.vowifiActive && mode && second ? (
+                {!device.vowifiActive && !multi && mode && second ? (
                   <span className={cx("text-[11px] font-bold leading-none tracking-tighter", isLte ? "hidden xl:inline" : "")}>{second}</span>
                 ) : null}
               </div>
               <span className="min-w-0 flex-1 truncate whitespace-nowrap text-sm font-medium text-gray-700 dark:text-gray-300">
-                {device.vowifiActive ? "Wi-Fi Calling" : device.operator || t("检测中...")}
+                {multi ? `${t("多隧道")} · ${multi.linesReady}/${multi.linesTotal}` : device.vowifiActive ? "Wi-Fi Calling" : device.operator || t("检测中...")}
               </span>
             </div>
-            {!device.vowifiActive && (
+            {multi ? (
+              <div className="flex items-center gap-1" title={multi.lines.map((l) => `${l.phoneNumber || l.name || l.iccidSuffix}: ${l.smsReady ? t("可接收短信") : l.phase}`).join("\n")}>
+                {multi.lines.map((l) => (
+                  <span key={l.sessionId} className={cx("inline-block h-2 w-2 rounded-full", l.smsReady ? "bg-emerald-500" : "bg-amber-500")} />
+                ))}
+              </div>
+            ) : null}
+            {!device.vowifiActive && !multi && (
               <div className="flex items-center gap-1" title={t("信号强度")}>
                 <div className="flex h-3 items-end gap-[2px]">
                   {[1, 2, 3, 4].map((b) => (

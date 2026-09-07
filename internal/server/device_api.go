@@ -2021,6 +2021,7 @@ func (s *Server) dashboardDevices() []map[string]any {
 			"network_duplex":    modemStatus["network_duplex"],
 			"vowifi_active":     vowifiActive,
 			"vowifi_runtime":    runtime,
+			"multisim":          entry["multisim"],
 			"network_connected": entry["network_connected"],
 			"model":             modemStatus["model"],
 		})
@@ -2108,6 +2109,9 @@ func (s *Server) configuredDeviceSummary(
 	result["id"] = config.ID
 	result["name"] = config.Name
 	result["device_type"] = store.NormalizeDeviceType(config.DeviceType)
+	if summary := s.multiSIMSummary(context.Background(), config.ID); summary != nil {
+		result["multisim"] = summary
+	}
 	result["interface"] = config.Interface
 	result["proxy_port"] = config.ProxyPort
 	result["esim_transport"] = config.ESIMTransport

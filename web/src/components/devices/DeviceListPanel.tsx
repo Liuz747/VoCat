@@ -1,6 +1,6 @@
 import type { DeviceListItem } from "../../types";
 import { Input, Select, Tag, ListSkeleton, EmptyState } from "../ui";
-import { isDeviceOnline, isRegistered, isVoWiFiInUse, lifecycleLabel } from "./shared";
+import { isDeviceOnline, isMultiSIMActive, isRegistered, isVoWiFiInUse, lifecycleLabel, multiSIMStatusText } from "./shared";
 import { DeviceListItemCard } from "./DeviceListItemCard";
 import type { RotationTaskSummary } from "./types";
 import { tl, useI18n } from "../../lib/i18n";
@@ -42,6 +42,7 @@ function primaryLine(d: DeviceListItem): string {
 }
 
 function statusLine(d: DeviceListItem): string {
+  if (isMultiSIMActive(d)) return multiSIMStatusText(d);
   if (isVoWiFiInUse(d)) return "WiFi-Calling";
   return primaryLine(d);
 }
