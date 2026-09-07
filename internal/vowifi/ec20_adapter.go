@@ -49,6 +49,12 @@ type EC20SensitiveATExecutor interface {
 	ExecuteSensitiveAT(context.Context, string, string) (modem.Response, error)
 }
 
+// EC20UICCTransactions pins the physical reader while serializing a complete
+// identity/application/APDU transaction with eSIM profile management.
+type EC20UICCTransactions interface {
+	BeginUICCTransaction(context.Context, string) (context.Context, func(), error)
+}
+
 type EC20UICCLocker interface {
 	LockUICC()
 	UnlockUICC()
@@ -79,7 +85,7 @@ type EC20Adapter struct {
 	executor EC20ATExecutor
 	options  EC20AdapterOptions
 
-	apduMu      sync.Mutex
+	apduReaders sync.Map // device ID -> *sync.Mutex
 	mu          sync.Mutex
 	bindings    map[string]ec20SIMBinding
 	checkpoints map[string]ec20RadioCheckpoint
@@ -128,6 +134,12 @@ func (adapter *EC20Adapter) ReadIdentity(
 	if deviceID == "" {
 		return SIMIdentity{}, errors.New("vocat: EC20 device ID is required")
 	}
+
+	ctx, release, err := adapter.beginUICC(ctx, deviceID)
+	if err != nil {
+		return SIMIdentity{}, err
+	}
+	defer release()
 
 	pin, err := adapter.execute(ctx, deviceID, "AT+CPIN?")
 	if err != nil {
@@ -417,18 +429,24 @@ func (adapter *EC20Adapter) CheckReady(
 	if err != nil {
 		return AKAEvidence{}, err
 	}
-	if err := adapter.verifyLiveICCID(ctx, binding); err != nil {
+	ctx, release, err := adapter.beginUICC(ctx, binding.deviceID)
+	if err != nil {
 		return AKAEvidence{}, err
 	}
+	defer release()
+	return adapter.checkReadyLocked(ctx, identity, binding.deviceID)
+}
 
-	// CCHO/CGLA/GET RESPONSE/CCHC is one UICC transaction. Serialize it
-	// across the adapter so periodic device refreshes or another AKA exchange
-	// cannot insert an APDU between a 61xx response and GET RESPONSE.
-	adapter.apduMu.Lock()
-	defer adapter.apduMu.Unlock()
-	if locker, ok := adapter.executor.(EC20UICCLocker); ok {
-		locker.LockUICC()
-		defer locker.UnlockUICC()
+func (adapter *EC20Adapter) checkReadyLocked(ctx context.Context, identity SIMIdentity, deviceID string) (AKAEvidence, error) {
+	binding, err := adapter.bindingFor(identity)
+	if err != nil {
+		return AKAEvidence{}, err
+	}
+	if binding.deviceID != deviceID {
+		return AKAEvidence{}, ErrEC20IdentityChanged
+	}
+	if err := adapter.verifyLiveICCID(ctx, binding); err != nil {
+		return AKAEvidence{}, err
 	}
 
 	aid, application, err := adapter.discoverAKAApplication(ctx, binding.deviceID)
@@ -439,6 +457,7 @@ func (adapter *EC20Adapter) CheckReady(
 	basicChannel := false
 	if err == nil {
 		if err := adapter.closeLogicalChannelWithCleanup(
+			ctx,
 			binding.deviceID,
 			channel,
 		); err != nil {
@@ -496,6 +515,23 @@ func (adapter *EC20Adapter) authenticateWithApplication(
 	if err != nil {
 		return AKAResult{}, err
 	}
+	lockedDeviceID := binding.deviceID
+	ctx, release, err := adapter.beginUICC(ctx, binding.deviceID)
+	if err != nil {
+		return AKAResult{}, err
+	}
+	defer release()
+	// Another transaction may have refreshed the cached application while we waited.
+	binding, err = adapter.bindingFor(identity)
+	if err != nil {
+		return AKAResult{}, err
+	}
+	if binding.deviceID != lockedDeviceID {
+		return AKAResult{}, ErrEC20IdentityChanged
+	}
+	if err := adapter.verifyLiveICCID(ctx, binding); err != nil {
+		return AKAResult{}, err
+	}
 	if strings.EqualFold(strings.TrimSpace(preference), "isim_strict") && binding.application != "ISIM" {
 		aid, application, err := adapter.discoverPreferredAKAApplication(
 			ctx,
@@ -514,7 +550,7 @@ func (adapter *EC20Adapter) authenticateWithApplication(
 		adapter.mu.Unlock()
 	}
 	if binding.aid == "" {
-		if _, err := adapter.CheckReady(ctx, identity); err != nil {
+		if _, err := adapter.checkReadyLocked(ctx, identity, binding.deviceID); err != nil {
 			return AKAResult{}, err
 		}
 		binding, err = adapter.bindingFor(identity)
@@ -530,17 +566,6 @@ func (adapter *EC20Adapter) authenticateWithApplication(
 			binding.aid,
 		)
 	}
-	if err := adapter.verifyLiveICCID(ctx, binding); err != nil {
-		return AKAResult{}, err
-	}
-
-	adapter.apduMu.Lock()
-	defer adapter.apduMu.Unlock()
-	if locker, ok := adapter.executor.(EC20UICCLocker); ok {
-		locker.LockUICC()
-		defer locker.UnlockUICC()
-	}
-
 	apdu := buildUSIMAuthenticateAPDU(challenge)
 	var raw []byte
 	if binding.basicChannel {
@@ -578,6 +603,7 @@ func (adapter *EC20Adapter) authenticateWithApplication(
 			true,
 		)
 		closeErr := adapter.closeLogicalChannelWithCleanup(
+			ctx,
 			binding.deviceID,
 			channel,
 		)
@@ -1171,11 +1197,12 @@ func (adapter *EC20Adapter) closeLogicalChannel(
 }
 
 func (adapter *EC20Adapter) closeLogicalChannelWithCleanup(
+	parent context.Context,
 	deviceID string,
 	channel int,
 ) error {
 	ctx, cancel := context.WithTimeout(
-		context.Background(),
+		context.WithoutCancel(parent),
 		channelCleanupTimeout,
 	)
 	defer cancel()
@@ -1684,4 +1711,54 @@ func sameIntegers(left, right []int) bool {
 		}
 	}
 	return true
+}
+
+// The local per-reader lock also protects lightweight executors without a
+// device-manager boundary. Production additionally locks the shared physical
+// reader, so separate adapters and eSIM HTTP handlers cannot interleave APDUs.
+func (adapter *EC20Adapter) beginUICC(ctx context.Context, deviceID string) (context.Context, func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	value, _ := adapter.apduReaders.LoadOrStore(deviceID, &sync.Mutex{})
+	local := value.(*sync.Mutex)
+	for {
+		if err := ctx.Err(); err != nil {
+			return ctx, nil, err
+		}
+		if local.TryLock() {
+			break
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx, nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		local.Unlock()
+		return ctx, nil, err
+	}
+	if transactions, ok := adapter.executor.(EC20UICCTransactions); ok {
+		transactionCtx, release, err := transactions.BeginUICCTransaction(ctx, deviceID)
+		if err != nil {
+			local.Unlock()
+			return ctx, nil, err
+		}
+		return transactionCtx, func() { release(); local.Unlock() }, nil
+	}
+	if locker, ok := adapter.executor.(EC20UICCLocker); ok {
+		// Legacy executors have no cancelable API. Production implements the keyed
+		// interface above. Keep compatibility without breaking mutual exclusion.
+		locker.LockUICC()
+		if err := ctx.Err(); err != nil {
+			locker.UnlockUICC()
+			local.Unlock()
+			return ctx, nil, err
+		}
+		return ctx, func() { locker.UnlockUICC(); local.Unlock() }, nil
+	}
+	return ctx, local.Unlock, nil
 }

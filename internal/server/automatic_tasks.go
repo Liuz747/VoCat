@@ -269,6 +269,14 @@ func (scheduler *automaticTaskScheduler) execute(run store.AutomaticTaskRun) {
 }
 
 func (s *Server) executeAutomaticTask(ctx context.Context, task store.AutomaticTask, progress automaticTaskProgress) (output string, err error) {
+	unlock, lockErr := s.lockMultiSIMDevice(ctx, task.DeviceID)
+	if lockErr != nil {
+		return "", lockErr
+	}
+	defer unlock()
+	if s.multiSIMOwned(ctx, task.DeviceID) {
+		return "", automaticTaskExecutionError{err: errors.New("多隧道已接管此设备，自动任务不能执行"), retryable: false}
+	}
 	if err := validateAutomaticTaskAvailability(s.developerActive(ctx), task.TaskType, task.Environment); err != nil {
 		return "", automaticTaskExecutionError{err: err, retryable: false}
 	}
@@ -917,6 +925,10 @@ func (s *Server) handleAutomaticTasks(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid_automatic_task", err.Error())
 			return
 		}
+		if task.Enabled && s.multiSIMOwned(r.Context(), task.DeviceID) {
+			writeMultiSIMConflict(w)
+			return
+		}
 		saved, err := s.store.SaveAutomaticTask(r.Context(), task)
 		if err != nil {
 			s.writeStoreError(w, err)
@@ -935,6 +947,10 @@ func (s *Server) handleAutomaticTask(w http.ResponseWriter, r *http.Request, id 
 		task, err := s.decodeAutomaticTask(r, id)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_automatic_task", err.Error())
+			return
+		}
+		if task.Enabled && s.multiSIMOwned(r.Context(), task.DeviceID) {
+			writeMultiSIMConflict(w)
 			return
 		}
 		saved, err := s.store.SaveAutomaticTask(r.Context(), task)
@@ -988,6 +1004,10 @@ func (s *Server) handleAutomaticTaskRunNow(w http.ResponseWriter, r *http.Reques
 	task, err := s.store.AutomaticTask(r.Context(), id)
 	if err != nil {
 		s.writeStoreError(w, err)
+		return
+	}
+	if s.multiSIMOwned(r.Context(), task.DeviceID) {
+		writeMultiSIMConflict(w)
 		return
 	}
 	config, err := s.store.Device(r.Context(), task.DeviceID)

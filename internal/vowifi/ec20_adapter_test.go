@@ -713,8 +713,8 @@ func TestEC20AdapterISIMStrictUsesCUADFullAID(t *testing.T) {
 			{command: "AT+CIMI", lines: []string{"310280000000001"}},
 			{command: "AT+CCID", lines: []string{"+CCID: 8901000000000000001"}},
 			{command: "AT+CGSN", lines: []string{"860000000000001"}},
-			{command: "AT+CUAD", lines: []string{`+CUAD: "` + cuad + `"`}},
 			{command: "AT+CCID", lines: []string{"+CCID: 8901000000000000001"}},
+			{command: "AT+CUAD", lines: []string{`+CUAD: "` + cuad + `"`}},
 			{command: `AT+CCHO="` + fullISIM + `"`, lines: []string{"+CCHO: 1"}},
 			{
 				command:   authCommand,

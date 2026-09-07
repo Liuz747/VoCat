@@ -36,11 +36,12 @@ func (router linuxChildSAInstallerRouter) Install(ctx context.Context, config Ch
 }
 
 type linuxXFRMHandle struct {
-	mu        sync.Mutex
-	ipCommand string
-	config    ChildSAConfig
-	reqid     string
-	closed    bool
+	mu               sync.Mutex
+	ipCommand        string
+	config           ChildSAConfig
+	reqid            string
+	closed           bool
+	releaseAddresses func()
 }
 
 func (*linuxXFRMHandle) DataplaneMode() string { return "xfrm" }
@@ -62,10 +63,15 @@ func (installer linuxXFRMInstaller) Install(ctx context.Context, config ChildSAC
 	if _, err := exec.LookPath(command); err != nil {
 		return nil, errors.New("Linux iproute2 is required to install the CHILD_SA")
 	}
+	releaseAddresses, err := reserveInnerAddresses(config)
+	if err != nil {
+		return nil, err
+	}
 	handle := &linuxXFRMHandle{
-		ipCommand: command,
-		config:    cloneChildSAConfig(config),
-		reqid:     strconv.FormatUint(uint64(config.InboundSPI), 10),
+		releaseAddresses: releaseAddresses,
+		ipCommand:        command,
+		config:           cloneChildSAConfig(config),
+		reqid:            strconv.FormatUint(uint64(config.InboundSPI), 10),
 	}
 	if err := handle.install(ctx); err != nil {
 		_ = handle.Close(context.Background())
@@ -285,6 +291,9 @@ func (handle *linuxXFRMHandle) Close(ctx context.Context) error {
 		return nil
 	}
 	handle.closed = true
+	if handle.releaseAddresses != nil {
+		defer handle.releaseAddresses()
+	}
 	config := handle.config
 	var errs []error
 	deletePolicy := func(family, source, destination, direction string) {

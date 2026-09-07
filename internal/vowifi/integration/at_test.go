@@ -219,3 +219,46 @@ func TestATMapperIgnoresNodeNamesInheritedByAnotherModem(t *testing.T) {
 		t.Fatalf("ExecuteAT physical ID = %q, want the modem at the configured USB position", devices.executedID)
 	}
 }
+
+type transactionATDevices struct {
+	fakeATDevices
+	lockedID string
+	released bool
+}
+
+func (devices *transactionATDevices) BeginUICCTransaction(ctx context.Context, id string) (context.Context, func(), error) {
+	devices.lockedID = id
+	return ctx, func() { devices.released = true }, nil
+}
+func TestATMapperPinsPhysicalReaderForWholeTransaction(t *testing.T) {
+	database := testStore(t)
+	config := store.Device{ID: "line", Name: "line", ATPort: "/dev/stable-reader"}
+	if err := database.UpsertDevice(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
+	devices := &transactionATDevices{fakeATDevices: fakeATDevices{entries: []device.Device{{ID: "reader-a", Discovered: true, Candidate: modem.Candidate{ATPort: modem.Port{Path: "/dev/stable-reader"}}}}}}
+	mapper := ATMapper{Store: database, Devices: devices}
+	transactions, ok := any(mapper).(interface {
+		BeginUICCTransaction(context.Context, string) (context.Context, func(), error)
+	})
+	if !ok {
+		t.Fatal("mapper has no keyed transaction boundary")
+	}
+	ctx, release, err := transactions.BeginUICCTransaction(context.Background(), "line")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	// A concurrent discovery/configuration change must not redirect an APDU to
+	// another physical reader after reader-a's lock has been acquired.
+	devices.entries = []device.Device{{ID: "reader-b", Discovered: true, Candidate: modem.Candidate{ATPort: modem.Port{Path: "/dev/stable-reader"}}}}
+	if _, err := mapper.ExecuteAT(ctx, "line", "AT+CCID"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mapper.ExecuteSensitiveAT(ctx, "line", "AT+CSIM"); err != nil {
+		t.Fatal(err)
+	}
+	if devices.lockedID != "reader-a" || devices.executedID != devices.lockedID || devices.sensitiveID != devices.lockedID {
+		t.Fatalf("transaction changed readers: lock=%s AT=%s sensitive=%s", devices.lockedID, devices.executedID, devices.sensitiveID)
+	}
+}

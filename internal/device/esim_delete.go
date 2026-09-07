@@ -69,8 +69,10 @@ func (manager *Manager) ESIMDeleteProfile(ctx context.Context, id, iccid, aidHex
 	if err != nil {
 		return nil, err
 	}
-	manager.lockESIM()
-	defer manager.unlockESIM()
+	if err := manager.lockESIMContext(ctx, id); err != nil {
+		return nil, err
+	}
+	defer manager.unlockESIM(id)
 	if err := manager.waitForESIMRecovery(ctx, id); err != nil {
 		return nil, err
 	}

@@ -208,6 +208,16 @@ func (s *Server) handleSMSSend(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "device_required", "a sending device is required")
 		return
 	}
+	unlock, lockErr := s.lockMultiSIMDevice(r.Context(), request.DeviceID)
+	if lockErr != nil {
+		writeMultiSIMConflict(w)
+		return
+	}
+	defer unlock()
+	if s.multiSIMOwned(r.Context(), request.DeviceID) {
+		writeMultiSIMConflict(w)
+		return
+	}
 	// Validate the logical message before consuming a global send slot. Both
 	// cellular AT and VoWiFi IMS use this same encoder/validator.
 	if _, err := device.PrepareSMSSubmitTPDUs(request.Phone, request.Message); err != nil {
@@ -594,6 +604,9 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 		if onlyDevice != "" && config.ID != onlyDevice {
 			continue
 		}
+		if s.multiSIMOwned(ctx, config.ID) {
+			continue
+		}
 		// A PC/SC USB reader has no modem storage or AT command channel. Its
 		// messages are delivered by the active VoWiFi IMS session, so attempting
 		// an AT+CMGL catch-up scan would only poison the reader's health state
@@ -867,6 +880,38 @@ func modemSMSStorageKey(message device.SMSMessage) string {
 }
 
 func (s *Server) deleteSMSMessages(ctx context.Context, messages []store.SMSMessage) error {
+	// Take device leases before smsSyncMu, matching the task/switch lock order.
+	// IMS-only deletion never accesses the modem and remains available.
+	ids := map[string]bool{}
+	for _, message := range messages {
+		if message.Source != "cellular_at" {
+			continue
+		}
+		configs, err := s.store.ListDevices(ctx)
+		if err != nil {
+			return err
+		}
+		for _, config := range configs {
+			if config.ID == message.DeviceID || (message.ModemIMEI != "" && config.ModemIMEI == message.ModemIMEI) {
+				ids[config.ID] = true
+			}
+		}
+	}
+	ordered := make([]string, 0, len(ids))
+	for id := range ids {
+		ordered = append(ordered, id)
+	}
+	sort.Strings(ordered)
+	for _, id := range ordered {
+		unlock, err := s.lockMultiSIMDevice(ctx, id)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+		if s.multiSIMOwned(ctx, id) {
+			return errMultiSIMActive
+		}
+	}
 	s.smsSyncMu.Lock()
 	defer s.smsSyncMu.Unlock()
 	for _, message := range messages {
@@ -1045,6 +1090,10 @@ func queryLimit(r *http.Request, fallback int) int {
 }
 
 func (s *Server) writeStoreError(w http.ResponseWriter, err error) {
+	if errors.Is(err, store.ErrMultiSIMConflict) || strings.Contains(err.Error(), "multisim_enabled") {
+		writeError(w, http.StatusConflict, "multisim_active", "此设备的多隧道与自动任务不能同时运行，请先停止当前模式。")
+		return
+	}
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "not_found", "the requested record was not found")
 		return

@@ -274,6 +274,16 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) bool {
 			config.NetworkEnabled = false
 		}
 		fillConfigFromPhysical(&config, *selected)
+		unlockBindings, gateErr := s.lockMultiSIMBindings(r.Context())
+		if gateErr != nil {
+			writeMultiSIMConflict(w)
+			return true
+		}
+		defer unlockBindings()
+		if s.multiSIMBindingConflict(r.Context(), config) {
+			writeMultiSIMConflict(w)
+			return true
+		}
 		if pinSetter, ok := s.devices.(interface{ SetSIMPin(string, string) error }); ok {
 			if err := pinSetter.SetSIMPin(selected.ID, config.SIMPIN); err != nil {
 				s.writeDeviceError(w, err)
@@ -296,6 +306,7 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) bool {
 			s.writeStoreError(w, err)
 			return true
 		}
+		unlockBindings()
 		// Persist the physical binding before the first RF command. A newly
 		// enumerated USB modem may still be settling, or ModemManager may not yet
 		// have released its AT port. Rejecting the whole add operation in that
@@ -544,6 +555,26 @@ func (s *Server) handleDevicePath(
 		s.writeStoreError(w, err)
 		return true
 	}
+	if len(tail) > 0 && tail[0] == "multisim" {
+		return s.handleMultiSIM(w, r, config, tail[1:])
+	}
+	if (r.Method != http.MethodGet && r.Method != http.MethodHead) || (len(tail) > 0 && tail[0] == "esim") {
+		unlock, lockErr := s.lockMultiSIMDevice(r.Context(), id)
+		if lockErr != nil {
+			writeMultiSIMConflict(w)
+			return true
+		}
+		defer unlock()
+		if len(tail) == 0 && r.Method == http.MethodDelete {
+			if err := s.stopMultiSIMBeforeDelete(r.Context(), id); err != nil {
+				writeMultiSIMConflict(w)
+				return true
+			}
+		} else if s.multiSIMOwned(r.Context(), id) {
+			writeMultiSIMConflict(w)
+			return true
+		}
+	}
 	if len(tail) == 0 {
 		switch r.Method {
 		case http.MethodDelete:
@@ -590,6 +621,16 @@ func (s *Server) handleDevicePath(
 			}
 			if next.SIMPIN == "" || next.SIMPIN == store.SecretMask {
 				next.SIMPIN = config.SIMPIN
+			}
+			unlockBindings, gateErr := s.lockMultiSIMBindings(r.Context())
+			if gateErr != nil {
+				writeMultiSIMConflict(w)
+				return true
+			}
+			defer unlockBindings()
+			if s.multiSIMBindingConflict(r.Context(), next) {
+				writeMultiSIMConflict(w)
+				return true
 			}
 			if _, physicalID, present := s.physicalForConfig(next); present {
 				if pinSetter, ok := s.devices.(interface{ SetSIMPin(string, string) error }); ok {
@@ -1867,6 +1908,10 @@ func (s *Server) requirePhysicalDevice(w http.ResponseWriter, present bool) bool
 }
 
 func (s *Server) writeDeviceError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errMultiSIMActive) {
+		writeMultiSIMConflict(w)
+		return
+	}
 	s.logger.Warn("hardware operation failed",
 		"category", "hardware",
 		"event", "hardware.operation_failed",

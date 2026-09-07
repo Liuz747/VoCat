@@ -674,6 +674,31 @@ type authenticationState struct {
 	nc        uint32
 }
 
+// sipWriteMutex keeps existing synchronous SIP writers serialized while
+// allowing deadline-bound transactions to abandon the wait for a busy writer.
+// Like sync.Mutex it has a usable zero value and must not be copied after use.
+type sipWriteMutex struct {
+	once sync.Once
+	gate chan struct{}
+}
+
+func (mutex *sipWriteMutex) lockContext(ctx context.Context) error {
+	mutex.once.Do(func() { mutex.gate = make(chan struct{}, 1) })
+	select {
+	case mutex.gate <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-mutex.gate
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (mutex *sipWriteMutex) Lock()   { _ = mutex.lockContext(context.Background()) }
+func (mutex *sipWriteMutex) Unlock() { <-mutex.gate }
+
 type Session struct {
 	provider         *Provider
 	request          vowifi.IMSRequest
@@ -702,7 +727,7 @@ type Session struct {
 	protectedUDP       *net.UDPConn
 	failures           chan error
 	failureOnce        sync.Once
-	writeMu            sync.Mutex
+	writeMu            sipWriteMutex
 	transactionsMu     sync.Mutex
 	transactions       map[sipTransactionKey]chan *sipResponse
 	runtimeStarted     bool
@@ -714,6 +739,13 @@ type Session struct {
 	callMu             sync.Mutex
 	calls              map[string]*imsCall
 
+	// registrationGate serializes the full REGISTER and evidence commit. It is
+	// separate from mu so AKA and network waits never hold up inbound RP-ACK.
+	registrationGate    chan struct{}
+	closeDone           chan struct{}
+	transportDone       chan struct{}
+	closing             bool
+	closeErr            error
 	mu                  sync.Mutex
 	closed              bool
 	evidence            vowifi.IMSEvidence
@@ -766,6 +798,8 @@ func newSession(
 		refreshDone:        make(chan struct{}),
 		failures:           make(chan error, 1),
 		transactions:       make(map[sipTransactionKey]chan *sipResponse),
+		registrationGate:   make(chan struct{}, 1),
+		transportDone:      make(chan struct{}),
 		inboundConnections: make(map[net.Conn]struct{}),
 		calls:              make(map[string]*imsCall),
 		evidence: vowifi.IMSEvidence{
@@ -936,9 +970,15 @@ func (session *Session) registrationExpirySeconds() int {
 	return int(session.provider.config.RegistrationExpiry / time.Second)
 }
 
+// register requires mu and exclusive registration ownership. Once runtime
+// receivers exist, transport/security fields stay immutable until teardown.
+// Only local state transitions hold mu; waits release it and recheck closure.
 func (session *Session) register(ctx context.Context, expires int) (*sipResponse, error) {
 	minExpiresApplied := false
 	for challenges := 0; challenges <= maxAuthenticationChallenges; challenges++ {
+		if err := session.registrationError(ctx, expires); err != nil {
+			return nil, err
+		}
 		cseq := session.cseq
 		session.cseq++
 		authorization := ""
@@ -966,7 +1006,19 @@ func (session *Session) register(ctx context.Context, expires int) (*sipResponse
 			return nil, err
 		}
 		session.lastRegister = request
+		// Before startup no other caller can use this session. During refresh,
+		// let MESSAGE construction run while the REGISTER response is pending.
+		runtime := session.runtimeStarted
+		if runtime {
+			session.mu.Unlock()
+		}
 		response, err := session.exchange(ctx, request, cseq)
+		if runtime {
+			session.mu.Lock()
+		}
+		if stateErr := session.registrationError(ctx, expires); stateErr != nil {
+			return nil, stateErr
+		}
 		if err != nil {
 			// Which REGISTER went unanswered decides where to look: the initial
 			// one is plain network silence, while the authenticated one points
@@ -1001,6 +1053,11 @@ func (session *Session) register(ctx context.Context, expires int) (*sipResponse
 		if response.StatusCode != 401 && response.StatusCode != 407 {
 			return response, nil
 		}
+		if expires == 0 {
+			// De-registration is best effort. Starting a fresh physical AKA
+			// here could make Close wait on a reader after its own deadline.
+			return nil, registrationRejectionError(response, "de-registration requires fresh authentication")
+		}
 		if challenges == maxAuthenticationChallenges {
 			break
 		}
@@ -1018,7 +1075,7 @@ func (session *Session) register(ctx context.Context, expires int) (*sipResponse
 		if err != nil {
 			return nil, err
 		}
-		agreement, useSecurity, err := session.securityFromResponse(response)
+		agreement, useSecurity, err := session.registrationSecurity(response)
 		if err != nil {
 			return nil, err
 		}
@@ -1026,7 +1083,18 @@ func (session *Session) register(ctx context.Context, expires int) (*sipResponse
 		if vowifi.IsATT310280(session.request.Identity) {
 			preference = "isim_strict"
 		}
-		material, err := authenticateAKA(ctx, session.provider.aka, session.request.Identity, challenge, preference)
+		identity := session.request.Identity
+		if runtime {
+			session.mu.Unlock()
+		}
+		material, err := authenticateAKA(ctx, session.provider.aka, identity, challenge, preference)
+		if runtime {
+			session.mu.Lock()
+		}
+		if stateErr := session.registrationError(ctx, expires); stateErr != nil {
+			clearAKAMaterial(&material)
+			return nil, stateErr
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1053,6 +1121,7 @@ func (session *Session) register(ctx context.Context, expires int) (*sipResponse
 			return nil, err
 		}
 		auts := base64.StdEncoding.EncodeToString(material.auts)
+		session.clearAuthentication()
 		session.auth = &authenticationState{
 			challenge: challenge,
 			response:  append([]byte(nil), material.response...),
@@ -1062,6 +1131,59 @@ func (session *Session) register(ctx context.Context, expires int) (*sipResponse
 		clearAKAMaterial(&material)
 	}
 	return nil, errors.New("ims: too many SIP authentication challenges")
+}
+
+// acquireRegistration also supports test sessions built without newSession.
+func (session *Session) acquireRegistration(ctx context.Context) error {
+	session.mu.Lock()
+	if session.registrationGate == nil {
+		session.registrationGate = make(chan struct{}, 1)
+	}
+	gate := session.registrationGate
+	session.mu.Unlock()
+	select {
+	case gate <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-gate
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (session *Session) registrationError(ctx context.Context, expires int) error {
+	if session.closed || (session.closing && expires != 0) {
+		return ErrSessionClosed
+	}
+	return ctx.Err()
+}
+
+// Initial negotiation may replace sockets. Reauthentication must not: the
+// active receiver and all in-flight MESSAGE transactions share this transport.
+func (session *Session) registrationSecurity(response *sipResponse) (securityAgreement, bool, error) {
+	if !session.runtimeStarted {
+		return session.securityFromResponse(response)
+	}
+	if !session.securityOffered() {
+		return securityAgreement{}, false, nil
+	}
+	values := response.values("Security-Server")
+	if len(splitHeaderValues(values)) == 0 {
+		if session.provider.config.SecurityMode == SecurityRequired {
+			return securityAgreement{}, false, ErrIPSecAgreementRequired
+		}
+		return securityAgreement{}, false, errors.New("ims: runtime security downgrade requires a new session")
+	}
+	agreement, err := parseSecurityAgreement(values, session.securityProposal)
+	if err != nil {
+		return securityAgreement{}, false, err
+	}
+	if !session.securityActive {
+		return securityAgreement{}, false, errors.New("ims: runtime security activation requires a new session")
+	}
+	return agreement, true, nil
 }
 
 func challengeFromResponse(response *sipResponse) (digestChallenge, error) {
@@ -1703,7 +1825,7 @@ func (session *Session) refreshLoop() {
 	defer close(session.refreshDone)
 	for {
 		session.mu.Lock()
-		if session.closed || !session.evidence.Registered {
+		if session.closed || session.closing || !session.evidence.Registered {
 			session.mu.Unlock()
 			return
 		}
@@ -1720,6 +1842,9 @@ func (session *Session) refreshLoop() {
 		case <-timer.C:
 		}
 		if err := session.refreshOnce(session.refreshContext); err != nil {
+			if session.refreshContext.Err() != nil {
+				return
+			}
 			session.publishFailure(err)
 			return
 		}
@@ -1740,16 +1865,57 @@ func refreshDelay(remaining time.Duration) time.Duration {
 	return delay
 }
 
-func (session *Session) refreshOnce(ctx context.Context) error {
+// RefreshRegistration performs one ordinary re-REGISTER on this session's
+// existing transport. It neither changes the configured expiry nor forces a
+// fresh AKA challenge; the registrar decides whether authentication is needed.
+// The caller's context covers registration contention, AKA and SIP exchange.
+func (session *Session) RefreshRegistration(ctx context.Context) error {
+	return session.refreshOnce(ctx)
+}
+
+func (session *Session) refreshOnce(ctx context.Context) (refreshErr error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	// Explicit refresh callers must stop when Close cancels automatic refresh.
+	if session.refreshContext != nil {
+		stop := context.AfterFunc(session.refreshContext, cancel)
+		defer stop()
+	}
+	if err := session.acquireRegistration(ctx); err != nil {
+		return err
+	}
+	defer func() { <-session.registrationGate }()
 	session.mu.Lock()
-	defer session.mu.Unlock()
-	switch {
-	case session.closed:
-		return ErrSessionClosed
-	case !session.evidence.Registered:
+	attempted := false
+	defer func() {
+		// Maintenance and automatic refresh share the same line failure
+		// signal. A request canceled before it starts must not withdraw a
+		// healthy registration, and Close already owns its terminal state.
+		if attempted && refreshErr != nil && !session.closing && !session.closed {
+			session.publishFailure(refreshErr)
+		}
+		session.mu.Unlock()
+	}()
+	if err := session.registrationError(ctx, session.registrationExpirySeconds()); err != nil {
+		return err
+	}
+	if !session.evidence.Registered {
 		return vowifi.ErrIMSNotRegistered
 	}
+	attempted = true
 	response, err := session.register(ctx, session.registrationExpirySeconds())
+	if stateErr := session.registrationError(ctx, session.registrationExpirySeconds()); stateErr != nil {
+		// Cancellation after a REGISTER started is a failed refresh, unless
+		// Close already owns the terminal state. Gate-wait cancellation above
+		// never touched registration and deliberately leaves it intact.
+		if !session.closing && !session.closed {
+			session.failRefresh()
+		}
+		return stateErr
+	}
 	if err != nil {
 		session.failRefresh()
 		return fmt.Errorf("ims: refresh registration: %w", err)
@@ -1842,7 +2008,7 @@ func (session *Session) Evidence() vowifi.IMSEvidence {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	evidence := cloneEvidence(session.evidence)
-	if session.closed {
+	if session.closed || session.closing {
 		evidence.Registered = false
 		evidence.RegistrationState = "closed"
 	} else if evidence.Registered && !session.expiresAt.IsZero() && !time.Now().Before(session.expiresAt) {
@@ -1865,7 +2031,7 @@ func (session *Session) EnableSMS(ctx context.Context) (vowifi.SMSEvidence, erro
 	// modem CMGS commands, or any dial request. A registrar-confirmed feature
 	// tag on this session's own Contact is the minimum readiness proof.
 	switch {
-	case session.closed:
+	case session.closed || session.closing:
 		return vowifi.SMSEvidence{}, ErrSessionClosed
 	case !session.evidence.Registered:
 		return vowifi.SMSEvidence{}, vowifi.ErrIMSNotRegistered
@@ -1901,21 +2067,41 @@ func (session *Session) Close(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	session.refreshCancel()
-	select {
-	case <-session.refreshDone:
-	case <-ctx.Done():
-		_ = session.conn.Close()
-		<-session.refreshDone
-	}
-
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	session.mu.Lock()
+	if session.closing {
+		done := session.closeDone
+		session.mu.Unlock()
+		select {
+		case <-done:
+			return session.closeErr
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	if session.closed {
 		session.mu.Unlock()
 		return nil
 	}
+	session.closing = true
+	session.closeDone = make(chan struct{})
+	connection := session.conn // Runtime transport is never swapped in place.
+	session.mu.Unlock()
+	// Break a blocked socket Write (including a writer holding writeMu)
+	// without waiting for the de-registration goroutine to reach cleanup.
+	stopInterrupt := context.AfterFunc(ctx, func() { _ = connection.Close() })
+	defer stopInterrupt()
+	session.refreshCancel()
+	// A stuck authenticator may outlive Close, but it cannot commit after
+	// closing becomes true. Do not wait unconditionally for refreshDone.
+	gateErr := session.acquireRegistration(ctx)
+	if gateErr == nil {
+		defer func() { <-session.registrationGate }()
+	}
+	session.mu.Lock()
 	var unregisterErr error
-	if session.evidence.Registered && ctx.Err() == nil {
+	if gateErr == nil && session.evidence.Registered && ctx.Err() == nil {
 		// RFC 3261 §10.2.2: the wildcard Contact is for clients that do not know
 		// their own bindings. This one does, and T-Mobile answers 480 "Function
 		// is not allowed" to the wildcard often enough that leading with it just
@@ -1994,6 +2180,9 @@ func (session *Session) Close(ctx context.Context) error {
 		}
 	}
 	session.closed = true
+	if session.transportDone != nil {
+		close(session.transportDone)
+	}
 	session.evidence.Registered = false
 	session.evidence.RegistrationState = "closed"
 	session.smsContactConfirmed = false
@@ -2013,7 +2202,7 @@ func (session *Session) Close(ctx context.Context) error {
 	// Runtime receive loops block in Read/Accept. Close every socket before
 	// waiting for those goroutines; waiting first deadlocks VoWiFi shutdown and
 	// leaves the modem permanently in CFUN=4.
-	if err := session.conn.Close(); err != nil {
+	if err := session.conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		cleanupErrors = append(cleanupErrors, err)
 	}
 	if session.protectedTCP != nil {
@@ -2040,7 +2229,9 @@ func (session *Session) Close(ctx context.Context) error {
 			cleanupErrors = append(cleanupErrors, err)
 		}
 	}
-	return errors.Join(cleanupErrors...)
+	session.closeErr = errors.Join(cleanupErrors...)
+	close(session.closeDone)
+	return session.closeErr
 }
 
 func cloneEvidence(evidence vowifi.IMSEvidence) vowifi.IMSEvidence {

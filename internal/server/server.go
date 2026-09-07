@@ -38,6 +38,7 @@ type Options struct {
 	Auth                *auth.Service
 	Devices             DeviceController
 	VoWiFi              VoWiFiController
+	MultiSIM            MultiSIMController
 	Logs                *loghub.Hub
 	Assets              fs.FS
 	Logger              *slog.Logger
@@ -57,6 +58,9 @@ type Server struct {
 	auth                *auth.Service
 	devices             DeviceController
 	vowifi              VoWiFiController
+	multisim            MultiSIMController
+	multisimDeviceLocks sync.Map
+	multisimBindingsMu  sync.Mutex
 	ussdSessions        ussdSessionStore
 	logs                *loghub.Hub
 	assets              fs.FS
@@ -128,6 +132,7 @@ func New(options Options) (*Server, error) {
 		auth:                options.Auth,
 		devices:             options.Devices,
 		vowifi:              options.VoWiFi,
+		multisim:            options.MultiSIM,
 		ussdSessions:        newUSSDSessionStore(),
 		logs:                options.Logs,
 		assets:              options.Assets,

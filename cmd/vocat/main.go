@@ -545,19 +545,6 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 	if err != nil {
 		return fmt.Errorf("configure VoWiFi runtime: %w", err)
 	}
-	// Start background consumers only after the synchronous radio/VoWiFi
-	// startup sequence. A snapshot refresh also takes the device operation
-	// mutex; starting it earlier can strand cold boot forever behind a serial
-	// read from an unstable USB enumeration.
-	go pollDeviceSnapshots(pollContext, deviceLogger, database, deviceManager)
-	go collectCellularTraffic(pollContext, logger, database)
-	go persistLogsToStore(pollContext, logger, logs, database)
-	if !developerEnabled {
-		go disableAllDeveloperCellularData(pollContext, logger, database, deviceManager)
-	} else {
-		go watchDeveloperDisable(pollContext, logger, database, deviceManager, exportProxyManager, legacyExportProxyConfig)
-	}
-	go reconcileCardPolicies(pollContext, logger, database, deviceManager, vowifiManager)
 	defer func() {
 		stopContext, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
@@ -565,12 +552,35 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 			logger.Warn("stop VoWiFi runtime", "error", err)
 		}
 	}()
+	multiSIMBridge, multiSIMManager := newMultiSIMIntegration(database, deviceManager, vowifiManager, logger)
+	defer func() {
+		if err := closeMultiSIM(multiSIMBridge, multiSIMManager); err != nil {
+			logger.Warn("stop multi-tunnel runtime", "error", err)
+		}
+	}()
+	if err := startConfiguredMultiSIM(deviceStartupContext, database, multiSIMManager, logger); err != nil {
+		return fmt.Errorf("configure multi-tunnel runtime: %w", err)
+	}
+	// Start background consumers only after the synchronous radio/VoWiFi
+	// startup sequence. A snapshot refresh also takes the device operation
+	// mutex; starting it earlier can strand cold boot forever behind a serial
+	// read from an unstable USB enumeration.
+	go pollDeviceSnapshots(pollContext, deviceLogger, database, deviceManager, multiSIMManager)
+	go collectCellularTraffic(pollContext, logger, database)
+	go persistLogsToStore(pollContext, logger, logs, database)
+	if !developerEnabled {
+		go disableAllDeveloperCellularData(pollContext, logger, database, deviceManager)
+	} else {
+		go watchDeveloperDisable(pollContext, logger, database, deviceManager, exportProxyManager, legacyExportProxyConfig)
+	}
+	go reconcileCardPolicies(pollContext, logger, database, deviceManager, vowifiManager, multiSIMManager)
 
 	handler, err := server.New(server.Options{
 		Store:               database,
 		Auth:                authService,
 		Devices:             deviceManager,
 		VoWiFi:              vowifiManager,
+		MultiSIM:            multiSIMManager,
 		Logs:                logs,
 		Assets:              web.Dist,
 		Logger:              logger,
@@ -748,7 +758,7 @@ func restoreDefaultCellularRadios(
 		if config.DeviceType == store.DeviceTypeUSBSIMReader {
 			continue
 		}
-		if config.VoWiFiEnabled {
+		if config.VoWiFiEnabled || configuredMultiSIM(ctx, database, config.ID) {
 			continue
 		}
 		entry, err := mapper.Get(config.ID)
@@ -957,7 +967,7 @@ func configureVoWiFiRuntime(
 			_ = manager.Close(context.Background())
 			return nil, fmt.Errorf("register device %q VoWiFi runtime: %w", deviceConfig.ID, err)
 		}
-		if deviceConfig.VoWiFiEnabled {
+		if deviceConfig.VoWiFiEnabled && !configuredMultiSIM(ctx, database, deviceConfig.ID) {
 			if entry, mapErr := mapper.Get(deviceConfig.ID); mapErr == nil {
 				flightErr := protectVoWiFiStartupRadio(ctx, deviceManager, entry.ID)
 				if flightErr != nil {
@@ -1136,7 +1146,14 @@ func newVoWiFiOrchestrator(
 	adapter vowifiDeviceAdapter,
 	logger *slog.Logger,
 	onIncomingCall func(context.Context, ims.ReceivedCall) error,
+	physicalDeviceIDs ...string,
 ) (*vowifi.Orchestrator, error) {
+	storageDeviceID := deviceConfig.ID
+	registrationTimeout := time.Duration(0)
+	if len(physicalDeviceIDs) > 0 && physicalDeviceIDs[0] != "" {
+		storageDeviceID = physicalDeviceIDs[0]
+		registrationTimeout = 30 * time.Second
+	}
 	apn := deviceConfig.APN
 	if apn == "" {
 		apn = "ims"
@@ -1163,6 +1180,7 @@ func newVoWiFiOrchestrator(
 		TransactionTimeout: 4 * time.Second,
 		OnIncomingCall:     onIncomingCall,
 		OnSMS: func(ctx context.Context, message ims.ReceivedSMS) error {
+			message = physicalIMSSMS(message, storageDeviceID)
 			localPhone, _ := database.PhoneNumberForICCID(ctx, message.ICCID)
 			modemIMEI := firstNonEmpty(message.ModemIMEI, deviceConfig.ModemIMEI)
 			extra, _ := json.Marshal(map[string]any{
@@ -1202,6 +1220,7 @@ func newVoWiFiOrchestrator(
 			return saveErr
 		},
 		OnSMSStatus: func(ctx context.Context, report ims.ReceivedSMSStatus) error {
+			report.DeviceID = storageDeviceID
 			deliveryReport := store.SMSDeliveryReport{
 				DeviceID:          report.DeviceID,
 				ModemIMEI:         firstNonEmpty(report.ModemIMEI, deviceConfig.ModemIMEI),
@@ -1234,6 +1253,7 @@ func newVoWiFiOrchestrator(
 			return nil
 		},
 		OnUSSD: func(ctx context.Context, message ims.ReceivedUSSD) error {
+			message.DeviceID = storageDeviceID
 			localPhone, _ := database.PhoneNumberForICCID(ctx, message.ICCID)
 			extra, _ := json.Marshal(map[string]any{
 				"transport":   "ims-ussd",
@@ -1269,13 +1289,14 @@ func newVoWiFiOrchestrator(
 		SIM:    adapter,
 		AKA:    adapter,
 		Radio:  adapter,
-		Proxy:  integration.ProxyResolver{Store: database},
+		Proxy:  physicalProxyResolver{store: database, deviceID: storageDeviceID},
 		Tunnel: tunnelProvider,
 		IMS:    imsProvider,
-		Phones: integration.PhoneStore{Store: database, DeviceID: deviceConfig.ID},
+		Phones: integration.PhoneStore{Store: database, DeviceID: storageDeviceID},
 	}, vowifi.Options{
-		DeviceID:           deviceConfig.ID,
-		AllowIMSWithoutSMS: true,
+		DeviceID:               deviceConfig.ID,
+		AllowIMSWithoutSMS:     true,
+		IMSRegistrationTimeout: registrationTimeout,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("device %q VoWiFi orchestrator: %w", deviceConfig.ID, err)
@@ -1398,6 +1419,7 @@ func pollDeviceSnapshots(
 	logger *slog.Logger,
 	database *store.Store,
 	manager *device.Manager,
+	owners ...multiSIMOwner,
 ) {
 	recoveryTracker := newRegistrationRecoveryTracker(ec20RegistrationGrace, ec20RegistrationEscalation)
 	recoverRegistration := func(entry device.Device, snapshot device.Snapshot, action registrationRecoveryAction) {
@@ -1439,6 +1461,9 @@ func pollDeviceSnapshots(
 		refreshSlots := make(chan struct{}, 4)
 		for _, entry := range entries {
 			if !entry.Discovered || entry.Candidate.DiscoveryIssue != "" {
+				continue
+			}
+			if multiSIMOwnsPhysical(ctx, database, manager, entry.ID, owners...) {
 				continue
 			}
 			entry := entry
@@ -1547,6 +1572,7 @@ func reconcileCardPolicies(
 	database *store.Store,
 	manager *device.Manager,
 	vowifiManager *vowifiruntime.Manager,
+	owners ...multiSIMOwner,
 ) {
 	observedCards := make(map[string]string)
 	wifi410StartupNotBefore := time.Now().Add(wifi410VoWiFiStartupDelay)
@@ -1570,6 +1596,9 @@ func reconcileCardPolicies(
 		}
 		mapper := integration.ATMapper{Store: database, Devices: manager}
 		for _, config := range configs {
+			if multiSIMOwnsConfig(ctx, database, config.ID, owners...) {
+				continue
+			}
 			entry, mapErr := mapper.Get(config.ID)
 			if mapErr != nil || entry.Snapshot == nil {
 				if config.DeviceType == store.DeviceTypeUSBSIMReader && observedCards[config.ID] != "missing" {

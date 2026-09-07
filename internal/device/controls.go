@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf16"
 
@@ -34,15 +35,11 @@ func (manager *Manager) USSD(
 	if !validServiceCode(code) {
 		return USSDResult{}, errors.New("invalid USSD service code")
 	}
-	result, err := manager.runUSSD(ctx, id, fmt.Sprintf(`AT+CUSD=1,"%s",15`, code))
+	result, err := manager.runUSSD(ctx, id, fmt.Sprintf(`AT+CUSD=1,"%s",15`, code), "")
 	if err != nil {
 		return result, err
 	}
 	result.Code = code
-	if result.Status == ussdStatusAwaitingInput {
-		result.SessionID = manager.openUSSDSession(id)
-		result.Continueable = true
-	}
 	return result, nil
 }
 
@@ -60,17 +57,11 @@ func (manager *Manager) ContinueUSSD(
 	if input == "" || len(input) > 182 || strings.ContainsAny(input, "\"\r\n") {
 		return USSDResult{}, errors.New("invalid USSD input")
 	}
-	result, err := manager.runUSSD(ctx, deviceID, fmt.Sprintf(`AT+CUSD=1,"%s",15`, input))
+	result, err := manager.runUSSD(ctx, deviceID, fmt.Sprintf(`AT+CUSD=1,"%s",15`, input), sessionID)
 	if err != nil {
 		return result, err
 	}
 	result.Code = input
-	if result.Status == ussdStatusAwaitingInput {
-		result.SessionID = sessionID
-		result.Continueable = true
-	} else {
-		manager.dropUSSDSession(sessionID)
-	}
 	return result, nil
 }
 
@@ -82,13 +73,18 @@ func (manager *Manager) CancelUSSD(ctx context.Context, sessionID string) error 
 	if err != nil {
 		return err
 	}
-	defer manager.dropUSSDSession(sessionID)
 	state, err := manager.lookup(deviceID)
 	if err != nil {
 		return err
 	}
-	state.opMu.Lock()
+	if err := lockMutexContext(ctx, &state.opMu); err != nil {
+		return err
+	}
 	defer state.opMu.Unlock()
+	if err := manager.validateUSSDAllowed(deviceID, sessionID); err != nil {
+		return err
+	}
+	defer manager.dropUSSDSession(sessionID)
 	if err := manager.validateActive(deviceID, state); err != nil {
 		return err
 	}
@@ -109,13 +105,19 @@ func (manager *Manager) runUSSD(
 	ctx context.Context,
 	id string,
 	command string,
+	sessionID string,
 ) (USSDResult, error) {
 	state, err := manager.lookup(id)
 	if err != nil {
 		return USSDResult{}, err
 	}
-	state.opMu.Lock()
+	if err := lockMutexContext(ctx, &state.opMu); err != nil {
+		return USSDResult{}, err
+	}
 	defer state.opMu.Unlock()
+	if err := manager.validateUSSDAllowed(id, sessionID); err != nil {
+		return USSDResult{}, err
+	}
 	if err := manager.validateActive(id, state); err != nil {
 		return USSDResult{}, err
 	}
@@ -143,6 +145,17 @@ func (manager *Manager) runUSSD(
 	}
 	result, err := parseUSSDResponse(line)
 	manager.setResult(id, state, nil, err)
+	if err == nil {
+		if result.Status == ussdStatusAwaitingInput {
+			if sessionID == "" {
+				sessionID = manager.openUSSDSession(id)
+			}
+			result.SessionID = sessionID
+			result.Continueable = true
+		} else if sessionID != "" {
+			manager.dropUSSDSession(sessionID)
+		}
+	}
 	return result, err
 }
 
@@ -170,6 +183,67 @@ func (manager *Manager) dropUSSDSession(sessionID string) {
 	manager.mu.Lock()
 	delete(manager.ussdSessions, strings.TrimSpace(sessionID))
 	manager.mu.Unlock()
+}
+
+// ErrUSSDSuspended means an exclusive owner has disabled USSD on this reader.
+var ErrUSSDSuspended = errors.New("ussd is suspended for this device")
+
+// SuspendUSSD is a reader-scoped ownership barrier. It waits for an in-flight
+// CUSD operation, invalidates its retained dialogs, and refuses new/queued USSD
+// until the returned resume function is called. It sends no modem commands.
+// Call before changing the reader's profile; resume only after restoring it.
+func (manager *Manager) SuspendUSSD(ctx context.Context, id string) (func(), error) {
+	state, err := manager.lookup(id)
+	if err != nil {
+		return nil, err
+	}
+	if err := lockMutexContext(ctx, &state.opMu); err != nil {
+		return nil, err
+	}
+	defer state.opMu.Unlock()
+	if err := manager.validateActive(id, state); err != nil {
+		return nil, err
+	}
+	manager.mu.Lock()
+	if manager.ussdSuspensions == nil {
+		manager.ussdSuspensions = make(map[string]int)
+	}
+	manager.ussdSuspensions[id]++
+	for sessionID, session := range manager.ussdSessions {
+		if session.deviceID == id {
+			delete(manager.ussdSessions, sessionID)
+		}
+	}
+	manager.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			manager.mu.Lock()
+			defer manager.mu.Unlock()
+			if manager.ussdSuspensions[id] <= 1 {
+				delete(manager.ussdSuspensions, id)
+			} else {
+				manager.ussdSuspensions[id]--
+			}
+		})
+	}, nil
+}
+
+// Called only after acquiring the reader's opMu: resolving a session before
+// waiting for that mutex cannot authorize an AT command after invalidation.
+func (manager *Manager) validateUSSDAllowed(id, sessionID string) error {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	if sessionID != "" {
+		session, ok := manager.ussdSessions[strings.TrimSpace(sessionID)]
+		if !ok || session.deviceID != id {
+			return ErrUSSDSessionNotFound
+		}
+	}
+	if manager.ussdSuspensions[id] > 0 {
+		return ErrUSSDSuspended
+	}
+	return nil
 }
 
 // parseUSSDResponse parses a +CUSD unsolicited result line, capturing the dialog

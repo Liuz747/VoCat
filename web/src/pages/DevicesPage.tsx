@@ -782,6 +782,8 @@ export default function DevicesPage() {
                   {activeTab === "esim" ? (
                     <DeviceEsimTab
                       deviceId={detail.id}
+                      deviceType={detail.deviceType}
+                      backendMode={detail.backendMode}
                       deviceImei={detail.modem?.imei || ""}
                       isActive={activeTab === "esim"}
                       deviceOnline={detailOnline}

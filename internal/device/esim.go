@@ -372,6 +372,22 @@ func (manager *Manager) openEuiccOnce(ctx context.Context, id string) (*euiccCha
 	return manager.openEuiccOnceAID(ctx, id, isdRAID)
 }
 
+// ESIMUsesAT reports the effective eUICC transport without opening the card.
+// A USB modem configured for QMI still uses AT unless it supports the native
+// QMI UIM path selected by openEuiccOnceAID.
+func (manager *Manager) ESIMUsesAT(id string) (bool, error) {
+	state, err := manager.lookup(id)
+	if err != nil {
+		return false, err
+	}
+	candidate := manager.candidateFor(state)
+	return candidate.HardwareKind != pcsc.HardwareKind && !euiccUsesQMI(candidate, manager.esimTransportFor(state)), nil
+}
+
+func euiccUsesQMI(candidate modem.Candidate, transport string) bool {
+	return strings.EqualFold(transport, "qmi") && isNativeQMICandidate(candidate)
+}
+
 func (manager *Manager) openEuiccOnceAID(ctx context.Context, id, aidHex string) (*euiccChannel, error) {
 	state, lookupErr := manager.lookup(id)
 	if lookupErr != nil {
@@ -381,7 +397,7 @@ func (manager *Manager) openEuiccOnceAID(ctx context.Context, id, aidHex string)
 	if candidate.HardwareKind == pcsc.HardwareKind {
 		return manager.openPCSCEuiccOnceAID(ctx, id, candidate, aidHex)
 	}
-	if strings.EqualFold(manager.esimTransportFor(state), "qmi") && isNativeQMICandidate(candidate) {
+	if euiccUsesQMI(candidate, manager.esimTransportFor(state)) {
 		return manager.openQMIEuiccOnceAID(ctx, id, candidate, aidHex)
 	}
 	// MANAGE CHANNEL (open): 00 70 00 00 01 -> "<channel> 90 00". This EC20
@@ -777,10 +793,10 @@ func validProfileICCID(iccid string) bool {
 func (manager *Manager) ESIMListProfiles(ctx context.Context, id string) (EsimInfo, error) {
 	ctx, cancel := boundESIMContext(ctx)
 	defer cancel()
-	if err := manager.lockESIMContext(ctx); err != nil {
+	if err := manager.lockESIMContext(ctx, id); err != nil {
 		return EsimInfo{}, err
 	}
-	defer manager.unlockESIM()
+	defer manager.unlockESIM(id)
 	if manager.esimRecoveryActive(id) {
 		if cached, ok := manager.cachedESIMInfo(id); ok {
 			return cached, nil
@@ -833,15 +849,17 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 	timer := newProfileSwitchTimer(manager.logger, id, iccid, nil)
 	defer func() { timer.finish(err) }()
 	manager.holdPhoneReads(id, phoneReadHoldAfterSwitch)
-	manager.lockESIM()
+	if err := manager.lockESIMContext(ctx, id); err != nil {
+		return err
+	}
 	if err := manager.waitForESIMRecovery(ctx, id); err != nil {
-		manager.unlockESIM()
+		manager.unlockESIM(id)
 		return err
 	}
 	timer.stage("lock_and_prior_recovery")
 	channel, err := manager.openEuiccAID(ctx, id, targetEuiccAID(aidHex))
 	if err != nil {
-		manager.unlockESIM()
+		manager.unlockESIM(id)
 		return err
 	}
 	timer.stage("open_channel")
@@ -856,7 +874,7 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 		}
 		if err != nil {
 			channel.close(context.Background())
-			manager.unlockESIM()
+			manager.unlockESIM(id)
 			return fmt.Errorf("esim: register QMI UIM refresh: %w", err)
 		}
 		// After a refresh=true attempt reports catBusy, retry without asking the
@@ -871,7 +889,7 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 	der, err := buildEnableProfileRequestWithRefresh(iccid, refreshRequested)
 	if err != nil {
 		channel.close(context.Background())
-		manager.unlockESIM()
+		manager.unlockESIM(id)
 		return err
 	}
 
@@ -932,7 +950,7 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 		// detached reset is safe in either case and prevents an uncertain switch
 		// from leaving the modem's SIM cache unusable.
 		manager.startProfileSwitchRecovery(id)
-		manager.unlockESIM()
+		manager.unlockESIM(id)
 		return err
 	}
 	// A transport SW 9000 only means the APDU reached the eUICC. The real outcome
@@ -941,14 +959,14 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 	result, ok := enableProfileResult(payload)
 	if !ok {
 		manager.startProfileSwitchRecovery(id)
-		manager.unlockESIM()
+		manager.unlockESIM(id)
 		return fmt.Errorf("esim: unexpected EnableProfile response %s", strings.ToUpper(hex.EncodeToString(payload)))
 	}
 	if err := enableProfileResponseError(byte(result), payload); err != nil {
 		if errors.Is(err, ErrESIMEnableCATBusy) {
 			attempt, _ := ctx.Value(esimCATBusyRetryKey{}).(int)
 			if attempt < 11 {
-				manager.unlockESIM()
+				manager.unlockESIM(id)
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
@@ -957,7 +975,7 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 				return manager.ESIMSwitchProfile(context.WithValue(ctx, esimCATBusyRetryKey{}, attempt+1), id, iccid, aidHex)
 			}
 		}
-		manager.unlockESIM()
+		manager.unlockESIM(id)
 		return err
 	}
 	manager.markCachedProfileEnabled(id, iccid)
@@ -999,7 +1017,7 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 			if manager.logger != nil && refreshErr != nil {
 				manager.logger.Info("eSIM profile switch snapshot after probe failed", "device_id", id, "error", refreshErr)
 			}
-			manager.unlockESIM()
+			manager.unlockESIM(id)
 			mbnContext, cancelMBN := context.WithTimeout(context.WithoutCancel(ctx), profileSwitchVerificationTimeout(manager))
 			defer cancelMBN()
 			manager.reconcileEC20MBNAfterProfileSwitchBestEffort(mbnContext, id, iccid)
@@ -1011,7 +1029,7 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 	// a detached recovery so it survives an HTTP disconnect, but keep this API
 	// call pending until the live modem ICCID proves that the switch took effect.
 	manager.startProfileSwitchRecovery(id)
-	manager.unlockESIM()
+	manager.unlockESIM(id)
 
 	verifyContext, cancelVerify := context.WithTimeout(context.WithoutCancel(ctx), profileSwitchVerificationTimeout(manager))
 	defer cancelVerify()
@@ -1068,6 +1086,15 @@ func (manager *Manager) waitForESIMRecovery(ctx context.Context, id string) erro
 	case <-ctx.Done():
 		return fmt.Errorf("esim: wait for profile-switch recovery: %w", ctx.Err())
 	}
+}
+
+// WaitESIMProfileRecovery is a completion barrier for callers that own a
+// reader across several SIM operations. Cancelling the initiating request
+// does not cancel an already committed profile switch's detached recovery.
+// A timeout here does not prove the reader is free; callers must wait again
+// before issuing another card operation.
+func (manager *Manager) WaitESIMProfileRecovery(ctx context.Context, id string) error {
+	return manager.waitForESIMRecovery(ctx, id)
 }
 
 func (manager *Manager) esimRecoveryActive(id string) bool {

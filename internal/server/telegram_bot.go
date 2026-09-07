@@ -1062,6 +1062,12 @@ func telegramSignalLine(snapshot *device.Snapshot) string {
 }
 
 func (bot *telegramBot) sendESIMProfiles(ctx context.Context, config telegramRuntimeConfig, chatID, adminID int64, deviceID string) {
+	unlock, gateErr := bot.server.lockMultiSIMUnowned(ctx, deviceID)
+	if gateErr != nil {
+		bot.sendText(ctx, config, chatID, gateErr.Error(), nil)
+		return
+	}
+	defer unlock()
 	if deviceID == "" {
 		bot.sendText(ctx, config, chatID, "用法：/esim <设备ID>", nil)
 		return
@@ -1113,6 +1119,12 @@ func (bot *telegramBot) sendESIMProfiles(ctx context.Context, config telegramRun
 }
 
 func (bot *telegramBot) confirmESIMSwitch(ctx context.Context, config telegramRuntimeConfig, chatID, adminID int64, deviceID, iccid string) {
+	unlock, gateErr := bot.server.lockMultiSIMUnowned(ctx, deviceID)
+	if gateErr != nil {
+		bot.sendText(ctx, config, chatID, gateErr.Error(), nil)
+		return
+	}
+	defer unlock()
 	_, _, physicalID, err := bot.device(deviceID)
 	if err != nil {
 		bot.sendText(ctx, config, chatID, "无法切换："+err.Error(), nil)
@@ -1397,6 +1409,11 @@ func (bot *telegramBot) executeSMS(ctx context.Context, action telegramPendingAc
 }
 
 func (bot *telegramBot) executeESIMSwitch(ctx context.Context, action telegramPendingAction) (string, error) {
+	unlock, gateErr := bot.server.lockMultiSIMUnowned(ctx, action.DeviceID)
+	if gateErr != nil {
+		return "", gateErr
+	}
+	defer unlock()
 	stored, _, physicalID, err := bot.device(action.DeviceID)
 	if err != nil {
 		return "", err
@@ -1432,6 +1449,11 @@ func (bot *telegramBot) executeESIMSwitch(ctx context.Context, action telegramPe
 }
 
 func (bot *telegramBot) executeTimedCall(ctx context.Context, config telegramRuntimeConfig, action telegramPendingAction) (string, error) {
+	unlock, gateErr := bot.server.lockMultiSIMUnowned(ctx, action.DeviceID)
+	if gateErr != nil {
+		return "", gateErr
+	}
+	defer unlock()
 	stored, entry, physicalID, err := bot.device(action.DeviceID)
 	if err != nil {
 		return "", err
@@ -1452,6 +1474,12 @@ func (bot *telegramBot) executeTimedCall(ctx context.Context, config telegramRun
 }
 
 func (bot *telegramBot) executeSimpleCallAction(ctx context.Context, config telegramRuntimeConfig, chatID, adminID int64, deviceID, action string) {
+	unlock, gateErr := bot.server.lockMultiSIMUnowned(ctx, deviceID)
+	if gateErr != nil {
+		bot.sendText(ctx, config, chatID, gateErr.Error(), nil)
+		return
+	}
+	defer unlock()
 	if deviceID == "" {
 		bot.sendText(ctx, config, chatID, fmt.Sprintf("用法：/%s <设备ID>", map[string]string{"status": "calls", "answer": "answer", "hangup": "hangup"}[action]), nil)
 		return
@@ -2008,6 +2036,11 @@ func (bot *telegramBot) handleATCommand(ctx context.Context, config telegramRunt
 }
 
 func (bot *telegramBot) executeATCommand(ctx context.Context, deviceID, command string) (string, error) {
+	unlock, gateErr := bot.server.lockMultiSIMUnowned(ctx, deviceID)
+	if gateErr != nil {
+		return "", gateErr
+	}
+	defer unlock()
 	command = strings.TrimSpace(command)
 	if err := validateATCommand(command, false); err != nil {
 		return "", err
@@ -2038,6 +2071,11 @@ func (bot *telegramBot) handleUSSDCommand(ctx context.Context, config telegramRu
 }
 
 func (bot *telegramBot) executeUSSDCommand(ctx context.Context, deviceID, code string) (device.USSDResult, error) {
+	unlock, gateErr := bot.server.lockMultiSIMUnowned(ctx, deviceID)
+	if gateErr != nil {
+		return device.USSDResult{}, gateErr
+	}
+	defer unlock()
 	_, _, physicalID, err := bot.device(deviceID)
 	if err != nil {
 		return device.USSDResult{}, err
@@ -2147,6 +2185,12 @@ func (bot *telegramBot) handleVoWiFi(ctx context.Context, config telegramRuntime
 		bot.sendVoWiFiMenu(ctx, config, chatID, adminID, deviceID)
 		return
 	}
+	unlock, gateErr := bot.server.lockMultiSIMUnowned(ctx, deviceID)
+	if gateErr != nil {
+		bot.sendText(ctx, config, chatID, gateErr.Error(), nil)
+		return
+	}
+	defer unlock()
 	var state vowifi.State
 	switch operation {
 	case "on", "off":
@@ -2300,6 +2344,9 @@ func (bot *telegramBot) device(deviceID string) (store.Device, device.Device, st
 	deviceID = strings.TrimSpace(deviceID)
 	if deviceID == "" {
 		return store.Device{}, device.Device{}, "", errors.New("设备 ID 不能为空")
+	}
+	if bot.server.multiSIMOwned(context.Background(), deviceID) {
+		return store.Device{}, device.Device{}, "", errMultiSIMActive
 	}
 	stored, err := bot.server.store.Device(context.Background(), deviceID)
 	if err != nil {

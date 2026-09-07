@@ -84,6 +84,7 @@ func (manager *Manager) BeginMaintenance(deviceID string) error {
 		return ErrNotRegistered
 	}
 	item.maintenance = true
+	item.reconnectPending = false
 	return nil
 }
 
@@ -296,11 +297,6 @@ func (manager *Manager) RequestReconnect(deviceID string) (vowifi.State, error) 
 	if err := manager.Ensure(manager.ctx, deviceID); err != nil {
 		return vowifi.State{}, err
 	}
-	manager.mu.Lock()
-	if item := manager.entries[deviceID]; item != nil {
-		item.desiredEnabled = true
-	}
-	manager.mu.Unlock()
 	return manager.startOperation(deviceID, true, func(ctx context.Context, orchestrator *vowifi.Orchestrator) error {
 		_, err := orchestrator.Reconnect(ctx)
 		return err
@@ -428,6 +424,14 @@ func (manager *Manager) startOperation(
 	if item == nil {
 		manager.mu.Unlock()
 		return vowifi.State{}, ErrNotRegistered
+	}
+	if coalesceReconnect {
+		if item.maintenance {
+			state := item.orchestrator.State()
+			manager.mu.Unlock()
+			return state, ErrOperationInProgress
+		}
+		item.desiredEnabled = true
 	}
 	if item.busy {
 		state := item.orchestrator.State()
@@ -699,4 +703,16 @@ func (manager *Manager) Close(ctx context.Context) error {
 	case <-done:
 	}
 	return errors.Join(closeErrors...)
+}
+
+// WaitCleanup observes an existing orchestrator without creating a runtime or
+// touching hardware. Quiesce lifecycle requests before an ownership handoff.
+func (manager *Manager) WaitCleanup(ctx context.Context, deviceID string) error {
+	manager.mu.Lock()
+	item := manager.entries[deviceID]
+	manager.mu.Unlock()
+	if item == nil {
+		return ErrNotRegistered
+	}
+	return item.orchestrator.WaitCleanup(ctx)
 }

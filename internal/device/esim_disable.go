@@ -63,8 +63,10 @@ func (manager *Manager) ESIMDisableProfile(ctx context.Context, id, iccid, aidHe
 	if err != nil {
 		return err
 	}
-	manager.lockESIM()
-	defer manager.unlockESIM()
+	if err := manager.lockESIMContext(ctx, id); err != nil {
+		return err
+	}
+	defer manager.unlockESIM(id)
 	if err := manager.waitForESIMRecovery(ctx, id); err != nil {
 		return err
 	}

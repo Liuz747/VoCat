@@ -89,6 +89,19 @@ func (s *Server) handleUpstreamProxies(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpstreamProxy(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		bindings, err := s.store.ListDeviceProxyBindings(r.Context())
+		if err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+		for _, binding := range bindings {
+			if binding.UpstreamProxyID == id && s.multiSIMOwned(r.Context(), binding.DeviceID) {
+				writeMultiSIMConflict(w)
+				return
+			}
+		}
+	}
 	switch r.Method {
 	case http.MethodPut:
 		var payload upstreamProxyPayload
@@ -216,6 +229,10 @@ func (s *Server) handleProfileProxyBindings(w http.ResponseWriter, r *http.Reque
 		for _, item := range request.Bindings {
 			deviceID := strings.TrimSpace(item.DeviceID)
 			iccid := strings.TrimSpace(item.ICCID)
+			if s.multiSIMOwned(r.Context(), deviceID) {
+				writeMultiSIMConflict(w)
+				return
+			}
 			if !validDeviceID(deviceID) {
 				writeError(w, http.StatusBadRequest, "invalid_device_id", "device ID must use 1-64 safe characters")
 				return
@@ -277,6 +294,12 @@ func (s *Server) handleProfileProxyBindings(w http.ResponseWriter, r *http.Reque
 			writeError(w, http.StatusBadRequest, "invalid_bindings", "select between 1 and 200 profiles")
 			return
 		}
+		for _, iccid := range request.ICCIDs {
+			if s.multiSIMCardOwned(r.Context(), strings.TrimSpace(iccid)) {
+				writeMultiSIMConflict(w)
+				return
+			}
+		}
 		requested := false
 		deleted := 0
 		var reconnectErrors []string
@@ -320,6 +343,16 @@ func (s *Server) handleProfileProxyBindings(w http.ResponseWriter, r *http.Reque
 // returned as advisory information: the chosen route will still be used on
 // the next VoWiFi start/reconnect.
 func (s *Server) requestProfileProxyRouteReconnect(deviceID, iccid string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	unlock, err := s.lockMultiSIMUnowned(ctx, deviceID)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	if s.multiSIMOwned(context.Background(), deviceID) {
+		return false, nil
+	}
 	if s.vowifi == nil {
 		return false, nil
 	}
@@ -359,6 +392,17 @@ func (s *Server) saveAndProbeUpstream(
 	r *http.Request,
 	payload upstreamProxyPayload,
 ) {
+	bindingsBefore, listErr := s.store.ListDeviceProxyBindings(r.Context())
+	if listErr != nil {
+		s.writeStoreError(w, listErr)
+		return
+	}
+	for _, binding := range bindingsBefore {
+		if binding.UpstreamProxyID == payload.ID && s.multiSIMOwned(r.Context(), binding.DeviceID) {
+			writeMultiSIMConflict(w)
+			return
+		}
+	}
 	value := store.UpstreamProxy{
 		ID:       payload.ID,
 		Name:     payload.Name,

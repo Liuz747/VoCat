@@ -1402,6 +1402,10 @@ func (s *Server) liveCardPolicyFlags(ctx context.Context, iccid string) (vowifi,
 
 func (s *Server) handleCardPolicy(w http.ResponseWriter, r *http.Request, iccid string) {
 	iccid = strings.TrimSpace(iccid)
+	if r.Method != http.MethodGet && s.multiSIMCardOwned(r.Context(), iccid) {
+		writeMultiSIMConflict(w)
+		return
+	}
 	if !validICCID(iccid) {
 		writeError(
 			w,
@@ -1605,6 +1609,10 @@ func (s *Server) decodeCardAPNProfilePayload(w http.ResponseWriter, r *http.Requ
 
 func (s *Server) handleCardAPNProfiles(w http.ResponseWriter, r *http.Request, iccid, profileID string) {
 	iccid = strings.TrimSpace(iccid)
+	if r.Method != http.MethodGet && s.multiSIMCardOwned(r.Context(), iccid) {
+		writeMultiSIMConflict(w)
+		return
+	}
 	if !validICCID(iccid) {
 		writeError(w, http.StatusBadRequest, "invalid_iccid", "ICCID must contain between 10 and 32 decimal digits")
 		return

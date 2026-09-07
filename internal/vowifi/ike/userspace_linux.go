@@ -29,13 +29,14 @@ type linuxUserspaceInstaller struct {
 }
 
 type linuxUserspaceHandle struct {
-	ipCommand  string
-	nftCommand string
-	config     ChildSAConfig
-	tunnel     *espTunnel
-	tun        *os.File
-	tunFD      int
-	relay      NATTPacketRelay
+	ipCommand        string
+	nftCommand       string
+	config           ChildSAConfig
+	releaseAddresses func()
+	tunnel           *espTunnel
+	tun              *os.File
+	tunFD            int
+	relay            NATTPacketRelay
 
 	runContext context.Context
 	cancel     context.CancelFunc
@@ -84,6 +85,16 @@ func (installer linuxUserspaceInstaller) Install(
 	if _, err := exec.LookPath(command); err != nil {
 		return nil, errors.New("Linux iproute2 is required to configure the user-space CHILD_SA")
 	}
+	releaseAddresses, err := reserveInnerAddresses(config)
+	if err != nil {
+		return nil, err
+	}
+	installed := false
+	defer func() {
+		if !installed {
+			releaseAddresses()
+		}
+	}()
 	tunnel, err := newESPTunnel(config, nil)
 	if err != nil {
 		return nil, err
@@ -95,16 +106,17 @@ func (installer linuxUserspaceInstaller) Install(
 	config.Name = actualName
 	runContext, cancel := context.WithCancel(context.Background())
 	handle := &linuxUserspaceHandle{
-		ipCommand:  command,
-		nftCommand: "nft",
-		config:     cloneChildSAConfig(config),
-		tunnel:     tunnel,
-		tun:        tun,
-		tunFD:      int(tun.Fd()),
-		relay:      config.Relay,
-		runContext: runContext,
-		cancel:     cancel,
-		failures:   make(chan error, 1),
+		ipCommand:        command,
+		nftCommand:       "nft",
+		releaseAddresses: releaseAddresses,
+		config:           cloneChildSAConfig(config),
+		tunnel:           tunnel,
+		tun:              tun,
+		tunFD:            int(tun.Fd()),
+		relay:            config.Relay,
+		runContext:       runContext,
+		cancel:           cancel,
+		failures:         make(chan error, 1),
 	}
 	if err := handle.configure(ctx); err != nil {
 		cancel()
@@ -116,6 +128,7 @@ func (installer linuxUserspaceInstaller) Install(
 	go handle.copyTUNToRelay()
 	go handle.copyRelayToTUN()
 	go handle.maintainOpenWrtFirewall()
+	installed = true
 	return handle, nil
 }
 
@@ -784,6 +797,9 @@ func (handle *linuxUserspaceHandle) Close(ctx context.Context) error {
 	handle.wait.Wait()
 	cleanupErr := handle.cleanupNetwork(ctx)
 	handle.closeTUN()
+	if handle.releaseAddresses != nil {
+		handle.releaseAddresses()
+	}
 	// A terminal data-plane error is delivered exactly once through Failures.
 	// Close reports only teardown errors so the orchestrator does not record
 	// the same runtime cause again as a cleanup failure.

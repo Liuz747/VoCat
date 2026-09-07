@@ -31,6 +31,37 @@ type uiccLocker interface {
 	UnlockUICC()
 }
 
+type uiccTransactionKey struct{}
+type pinnedUICCReader struct{ configuredID, physicalID string }
+
+// BeginUICCTransaction resolves once and pins all AT calls made with the returned
+// context to the physical reader whose eSIM/AKA lock is held. Re-enumeration or
+// a configuration edit during the transaction cannot redirect the next APDU.
+func (mapper ATMapper) BeginUICCTransaction(ctx context.Context, configuredID string) (context.Context, func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	physicalID, err := mapper.resolve(ctx, configuredID)
+	if err != nil {
+		return ctx, nil, err
+	}
+	release := func() {}
+	if transactions, ok := mapper.Devices.(vowifi.EC20UICCTransactions); ok {
+		ctx, release, err = transactions.BeginUICCTransaction(ctx, physicalID)
+		if err != nil {
+			return ctx, nil, err
+		}
+	} else if locker, ok := mapper.Devices.(uiccLocker); ok {
+		locker.LockUICC()
+		release = locker.UnlockUICC
+	}
+	if err := ctx.Err(); err != nil {
+		release()
+		return ctx, nil, err
+	}
+	return context.WithValue(ctx, uiccTransactionKey{}, pinnedUICCReader{configuredID, physicalID}), release, nil
+}
+
 func (mapper ATMapper) LockUICC() {
 	if locker, ok := mapper.Devices.(uiccLocker); ok {
 		locker.LockUICC()
@@ -138,6 +169,9 @@ func (mapper ATMapper) resolve(
 	ctx context.Context,
 	configuredID string,
 ) (string, error) {
+	if pinned, ok := ctx.Value(uiccTransactionKey{}).(pinnedUICCReader); ok && pinned.configuredID == configuredID {
+		return pinned.physicalID, nil
+	}
 	if mapper.Store == nil || mapper.Devices == nil {
 		return "", errors.New("vowifi AT mapper is not configured")
 	}

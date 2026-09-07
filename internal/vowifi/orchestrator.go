@@ -38,6 +38,10 @@ type Orchestrator struct {
 
 	operation chan struct{}
 
+	cleanupMu      sync.Mutex
+	cleanupPending int
+	cleanupIdle    chan struct{}
+
 	mu             sync.Mutex
 	state          State
 	resources      *runtimeResources
@@ -134,6 +138,11 @@ func (orchestrator *Orchestrator) Enable(ctx context.Context) (State, error) {
 	switch current.Phase {
 	case PhaseSIMReady, PhaseAccessReady, PhaseTunnelReady, PhaseIMSReady, PhaseSMSReady, PhaseStopping:
 		return current, ErrAlreadyEnabled
+	}
+	// A contained Close may still be touching the old TUN/SA. Do not build a
+	// replacement until the provider has actually returned.
+	if err := orchestrator.waitCleanup(ctx); err != nil {
+		return current, err
 	}
 
 	now := time.Now().UTC()
@@ -813,8 +822,23 @@ func (orchestrator *Orchestrator) cleanupSessions(resources *runtimeResources) [
 func (orchestrator *Orchestrator) cleanupCall(call func(context.Context) error) error {
 	ctx, cancel := context.WithTimeout(context.Background(), orchestrator.options.CleanupTimeout)
 	defer cancel()
+	orchestrator.cleanupMu.Lock()
+	if orchestrator.cleanupPending == 0 {
+		orchestrator.cleanupIdle = make(chan struct{})
+	}
+	orchestrator.cleanupPending++
+	orchestrator.cleanupMu.Unlock()
 	done := make(chan error, 1)
-	go func() { done <- call(ctx) }()
+	go func() {
+		err := call(ctx)
+		orchestrator.cleanupMu.Lock()
+		orchestrator.cleanupPending--
+		if orchestrator.cleanupPending == 0 {
+			close(orchestrator.cleanupIdle)
+		}
+		orchestrator.cleanupMu.Unlock()
+		done <- err
+	}()
 	select {
 	case err := <-done:
 		return err
@@ -906,6 +930,18 @@ func (orchestrator *Orchestrator) watchRuntimeFailure(
 			if !current {
 				return
 			}
+			// Withdraw readiness before network teardown, which can block on IMS
+			// de-registration. This generation was checked under the lifecycle lock.
+			orchestrator.mutate(func(state *State) {
+				state.Phase = PhaseStopping
+				state.Active = false
+				state.TunnelReady = false
+				state.IMSReady = false
+				state.SMSReady = false
+				state.LastErrorClass = errorClass
+				state.LastError = cause.Error()
+				state.LastReason = reason
+			})
 			cleanupErrors := orchestrator.cleanupSessions(resources)
 			orchestrator.mu.Lock()
 			if orchestrator.resources == resources {
@@ -1009,5 +1045,44 @@ func mergedContext(caller context.Context, runtime context.Context) (context.Con
 	return merged, func() {
 		stop()
 		cancel()
+	}
+}
+
+// WaitCleanup waits for all provider cleanup calls to actually return, including
+// calls that outlived CleanupTimeout. The caller must first stop the session and
+// prevent new lifecycle requests when using this as a physical ownership handoff.
+// Cancellation only stops waiting; it never marks pending cleanup as complete.
+func (orchestrator *Orchestrator) WaitCleanup(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := orchestrator.lockOperation(ctx); err != nil {
+		return err
+	}
+	defer orchestrator.unlockOperation()
+	return orchestrator.waitCleanup(ctx)
+}
+
+// waitCleanup is called with operation held, so no new lifecycle cleanup can
+// start between observing the completion barrier and building new resources.
+func (orchestrator *Orchestrator) waitCleanup(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		orchestrator.cleanupMu.Lock()
+		pending, idle := orchestrator.cleanupPending, orchestrator.cleanupIdle
+		orchestrator.cleanupMu.Unlock()
+		if pending == 0 {
+			return ctx.Err()
+		}
+		select {
+		case <-idle:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 }

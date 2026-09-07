@@ -4,6 +4,7 @@ import { api, apiMessage } from "../../api";
 import { Button, confirmDialog, message } from "../ui";
 import { readEventStream, useShowSensitive } from "./shared";
 import { EsimLoadingHero } from "./EsimLoadingHero";
+import { DeviceMultiSIMPanel } from "./DeviceMultiSIMPanel";
 import { EsimChipHeader } from "./EsimChipHeader";
 import { EsimEuiccGroup, type SpaceNotice } from "./EsimEuiccGroup";
 import { EsimNotificationsModal } from "./EsimNotificationsModal";
@@ -18,6 +19,8 @@ export interface DeviceEsimTabProps {
   deviceImei: string;
   isActive: boolean;
   deviceOnline: boolean;
+  deviceType?: string;
+  backendMode?: string;
   rebooting?: boolean;
   onRebootModem?: () => Promise<boolean>;
   onProfileChanged?: () => void;
@@ -70,12 +73,13 @@ function applyDisableLocal(groups: EsimProfileGroup[], iccid: string, aidHex?: s
   }));
 }
 
-export function DeviceEsimTab({ deviceId, deviceImei, isActive, deviceOnline, rebooting, onRebootModem, onProfileChanged }: DeviceEsimTabProps) {
+export function DeviceEsimTab({ deviceId, deviceImei, isActive, deviceOnline, deviceType, rebooting, onRebootModem, onProfileChanged }: DeviceEsimTabProps) {
   const { t } = useI18n();
   const [initialLoading, setInitialLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [chipInfo, setChipInfo] = useState<EsimChipInfo | null>(null);
   const [groups, setGroups] = useState<EsimProfileGroup[]>([]);
+  const [multiSIMOwned, setMultiSIMOwned] = useState(false);
   const [switchingIccid, setSwitchingIccid] = useState<string | null>(null);
   const [deletingIccid, setDeletingIccid] = useState<string | null>(null);
   const [renamingIccid, setRenamingIccid] = useState<string | null>(null);
@@ -153,7 +157,8 @@ export function DeviceEsimTab({ deviceId, deviceImei, isActive, deviceOnline, re
         const code = String((e as { code?: string })?.code || "");
         const channelStuck = isEUICCChannelStuck(code, detail);
         setLoadFailure({ code, message: detail, channelStuck });
-        if (!quiet && !channelStuck) message.error(detail);
+        if (code === "multisim_active") setMultiSIMOwned(true);
+        if (!quiet && !channelStuck && code !== "multisim_active") message.error(detail);
         return false;
       } finally {
         if (seq === loadSeq.current) {
@@ -446,15 +451,21 @@ export function DeviceEsimTab({ deviceId, deviceImei, isActive, deviceOnline, re
     },
     [],
   );
+  const multiSIMPanel = <DeviceMultiSIMPanel deviceId={deviceId} isActive={isActive} deviceOnline={deviceOnline}
+    supported={deviceType === "pcie_ec20_ec25"} groups={groups} onOwnedChange={setMultiSIMOwned} />;
   if (initialLoading) {
     return (
       <div className="space-y-5">
+        {multiSIMPanel}
         <EsimLoadingHero />
       </div>
     );
   }
   return (
     <div className="space-y-5">
+      {multiSIMPanel}
+      {multiSIMOwned ? <div className="rounded-xl border p-4 text-sm text-gray-500">{t("多隧道运行中暂停读卡和卡片操作。请先停止多隧道，再刷新或编辑 eSIM 列表。")}</div> : <>
+      {!chipInfo ? <Button loading={refreshing} disabled={!deviceOnline} onClick={() => void loadOverview(true)} icon={<ArrowSyncRegular />}>{t("读取 eSIM 列表")}</Button> : null}
       {loadFailure?.channelStuck ? (
         <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-amber-900 dark:border-amber-500/25 dark:bg-amber-500/10 dark:text-amber-100">
           <div className="flex items-start gap-3">
@@ -547,6 +558,7 @@ export function DeviceEsimTab({ deviceId, deviceImei, isActive, deviceOnline, re
         onCancel={() => setDeleteTarget(null)}
         onConfirm={confirmDelete}
       />
+      </>}
     </div>
   );
 }

@@ -153,10 +153,7 @@ func (session *Session) readMainConnection() {
 			return
 		}
 		session.dispatchPacket(packet, func(response []byte) error {
-			session.writeMu.Lock()
-			defer session.writeMu.Unlock()
-			_, err := session.conn.Write(response)
-			return err
+			return session.writeRuntime(context.Background(), response)
 		})
 	}
 }
@@ -280,11 +277,64 @@ func (session *Session) dispatchPacket(packet sipPacket, respond func([]byte) er
 	}
 }
 
+// writeRuntime covers both writer contention and a blocked socket Write.
+// Read deadlines are untouched, so an outgoing transaction cannot interrupt
+// the receiver that dispatches responses and inbound SMS for this session.
+func (session *Session) writeRuntime(ctx context.Context, request []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, session.provider.config.TransactionTimeout)
+	defer cancel()
+	if err := session.writeMu.lockContext(ctx); err != nil {
+		return err
+	}
+	defer session.writeMu.Unlock()
+	deadline, _ := ctx.Deadline()
+	if err := session.conn.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = session.conn.SetWriteDeadline(time.Now())
+		close(interrupted)
+	})
+	defer func() {
+		// Do not let an already-started cancellation callback set a stale
+		// deadline after the next writer has acquired the shared connection.
+		if !stop() {
+			<-interrupted
+		}
+		_ = session.conn.SetWriteDeadline(time.Time{})
+	}()
+	written, err := session.conn.Write(request)
+	if written != len(request) {
+		// A TCP prefix cannot be followed by a different SIP message: that
+		// would corrupt framing for every subsequent transaction. Let the
+		// receive failure drive recovery of this session's transport.
+		if written > 0 && session.transport == "tcp" {
+			_ = session.conn.Close()
+		}
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+	}
+	if contextErr := ctx.Err(); contextErr != nil {
+		return contextErr
+	}
+	if err != nil && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return err
+}
+
 func (session *Session) exchangeRuntime(
 	ctx context.Context,
 	request []byte,
 	key sipTransactionKey,
 ) (*sipResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, session.provider.config.TransactionTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	responses := make(chan *sipResponse, 4)
 	session.transactionsMu.Lock()
 	if _, duplicate := session.transactions[key]; duplicate {
@@ -299,12 +349,7 @@ func (session *Session) exchangeRuntime(
 		session.transactionsMu.Unlock()
 	}()
 
-	writeRequest := func() error {
-		session.writeMu.Lock()
-		defer session.writeMu.Unlock()
-		_, err := session.conn.Write(request)
-		return err
-	}
+	writeRequest := func() error { return session.writeRuntime(ctx, request) }
 	if err := writeRequest(); err != nil {
 		return nil, fmt.Errorf("ims: send SIP %s: %w", key.method, err)
 	}
@@ -323,6 +368,8 @@ func (session *Session) exchangeRuntime(
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		case <-session.transportDone:
+			return nil, ErrSessionClosed
 		case <-timer.C:
 			if retransmitTimer != nil {
 				return nil, fmt.Errorf(
@@ -830,7 +877,7 @@ func (session *Session) SendUSSI(ctx context.Context, request vowifi.USSISubmitR
 	defer session.smsMu.Unlock()
 
 	session.mu.Lock()
-	if session.closed || !session.evidence.Registered {
+	if session.closed || session.closing || !session.evidence.Registered {
 		session.mu.Unlock()
 		return vowifi.USSISubmitResult{}, vowifi.ErrUSSINotReady
 	}
@@ -950,8 +997,10 @@ func (session *Session) sendDeliveryReport(request *sipRequest, report []byte) e
 	if target == "" {
 		return errors.New("ims: SMS MESSAGE omitted a delivery-report target")
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), session.provider.config.TransactionTimeout)
+	defer cancel()
 	response, err := session.sendSIPMessage(
-		context.Background(),
+		ctx,
 		target,
 		report,
 		strings.TrimSpace(request.value("Call-ID")),
@@ -973,7 +1022,7 @@ func (session *Session) SendSMS(ctx context.Context, request vowifi.SMSSubmitReq
 	defer session.smsMu.Unlock()
 
 	session.mu.Lock()
-	if session.closed || !session.evidence.Registered || !session.smsCapabilityReady() {
+	if session.closed || session.closing || !session.evidence.Registered || !session.smsCapabilityReady() {
 		session.mu.Unlock()
 		return vowifi.SMSSubmitResult{}, vowifi.ErrSMSNotReady
 	}
@@ -1149,6 +1198,14 @@ func (session *Session) sendSIPMessageWith(
 	}
 	callID := callToken + "@" + addressHost(session.conn.LocalAddr())
 	session.mu.Lock()
+	if session.closed || session.closing {
+		session.mu.Unlock()
+		return nil, ErrSessionClosed
+	}
+	if err := ctx.Err(); err != nil {
+		session.mu.Unlock()
+		return nil, err
+	}
 	cseq := session.cseq
 	session.cseq++
 	serviceRoutes := append([]string(nil), session.evidence.ServiceRoute...)
@@ -1345,7 +1402,7 @@ func firstURI(value string) string {
 func (session *Session) isClosed() bool {
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	return session.closed
+	return session.closed || session.closing
 }
 
 func (session *Session) closeInboundConnections() {

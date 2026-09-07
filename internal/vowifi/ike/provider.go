@@ -571,6 +571,7 @@ func (provider *Provider) start(ctx context.Context, request vowifi.TunnelReques
 		messageID+1,
 		natDetected,
 		provider.config.KeepaliveInterval,
+		relayOptions{ChildInboundSPI: childInboundSPI, ChildOutboundSPI: childOutboundSPI},
 	)
 	cleanupPendingIKE = false
 	installed, err := provider.config.Installer.Install(ctx, ChildSAConfig{
@@ -638,6 +639,7 @@ func (provider *Provider) start(ctx context.Context, request vowifi.TunnelReques
 		relay:     relay,
 		transport: transport,
 	}
+	session.Failures()
 	closeTransport = false
 	return session, nil
 }
@@ -1049,6 +1051,8 @@ type Session struct {
 	relay     *sessionRelay
 	transport datagramTransport
 	closed    bool
+	failures  chan error
+	watchStop chan struct{}
 }
 
 func (session *Session) Evidence() vowifi.TunnelEvidence {
@@ -1068,13 +1072,51 @@ func (session *Session) Network() NetworkEvidence {
 	return network
 }
 
+// Failures has exactly one lifecycle consumer. Relay failures are forwarded even
+// when a kernel XFRM handle has no user-space ESP worker to relay them.
 func (session *Session) Failures() <-chan error {
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	if notifier, ok := session.child.(DataplaneFailureNotifier); ok {
-		return notifier.Failures()
+	if session.failures != nil {
+		return session.failures
 	}
-	return nil
+	session.failures = make(chan error, 1)
+	session.watchStop = make(chan struct{})
+	if session.closed {
+		return session.failures
+	}
+	var childFailures <-chan error
+	if notifier, ok := session.child.(DataplaneFailureNotifier); ok {
+		childFailures = notifier.Failures()
+	}
+	var relayDone <-chan struct{}
+	relay := session.relay
+	if relay != nil {
+		relayDone = relay.done
+	}
+	stop := session.watchStop
+	go func() {
+		var cause error
+		select {
+		case <-stop:
+			return
+		case err, ok := <-childFailures:
+			cause = err
+			if !ok || cause == nil {
+				cause = errors.New("ike: dataplane stopped")
+			}
+		case <-relayDone:
+			cause = relay.terminalError()
+		}
+		session.mu.Lock()
+		defer session.mu.Unlock()
+		if session.closed {
+			return
+		}
+		session.evidence.Established = false
+		session.failures <- cause
+	}()
+	return session.failures
 }
 
 func (session *Session) Close(ctx context.Context) error {
@@ -1084,6 +1126,9 @@ func (session *Session) Close(ctx context.Context) error {
 		return nil
 	}
 	session.closed = true
+	if session.watchStop != nil {
+		close(session.watchStop)
+	}
 	child := session.child
 	relay := session.relay
 	transport := session.transport

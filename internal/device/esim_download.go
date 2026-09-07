@@ -48,8 +48,10 @@ func (manager *Manager) ESIMDownloadProfile(ctx context.Context, id string, para
 		}
 	}
 
-	manager.lockESIM()
-	defer manager.unlockESIM()
+	if err := manager.lockESIMContext(ctx, id); err != nil {
+		return nil, err
+	}
+	defer manager.unlockESIM(id)
 
 	report("preflight", "正在检查 eUICC 剩余空间...", 10)
 	channel, err := manager.openEuiccAID(ctx, id, targetEuiccAID(params.AIDHex))
@@ -228,8 +230,10 @@ type EsimChipInfo struct {
 // ESIMChipInfo reads the eUICC's EID, EUICCInfo2, and configured addresses for
 // the chip header. It takes the eSIM lock like the other card ops.
 func (manager *Manager) ESIMChipInfo(ctx context.Context, id string) (*EsimChipInfo, error) {
-	manager.lockESIM()
-	defer manager.unlockESIM()
+	if err := manager.lockESIMContext(ctx, id); err != nil {
+		return nil, err
+	}
+	defer manager.unlockESIM(id)
 
 	var lastErr error
 	for _, aid := range manager.discoverEuiccAIDs(ctx, id) {
@@ -288,10 +292,10 @@ func readEsimChipInfo(ctx context.Context, channel *euiccChannel, aidHex string)
 func (manager *Manager) ESIMInventory(ctx context.Context, id string) ([]EsimInventoryEntry, error) {
 	ctx, cancel := boundESIMContext(ctx)
 	defer cancel()
-	if err := manager.lockESIMContext(ctx); err != nil {
+	if err := manager.lockESIMContext(ctx, id); err != nil {
 		return nil, err
 	}
-	defer manager.unlockESIM()
+	defer manager.unlockESIM(id)
 	if manager.esimRecoveryActive(id) {
 		return nil, errESIMRecovering
 	}

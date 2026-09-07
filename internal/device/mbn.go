@@ -216,8 +216,10 @@ func (manager *Manager) reconcileEC20MBNAfterProfileSwitch(ctx context.Context, 
 		return nil
 	}
 
-	manager.lockESIM()
-	defer manager.unlockESIM()
+	if err := manager.lockESIMContext(ctx, id); err != nil {
+		return err
+	}
+	defer manager.unlockESIM(id)
 	timer := newProfileSwitchTimer(manager.logger, id, expectedICCID, nil)
 	if err := manager.waitForESIMRecovery(ctx, id); err != nil {
 		return err

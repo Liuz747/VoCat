@@ -27,8 +27,8 @@ type Options struct {
 
 type Manager struct {
 	mu             sync.RWMutex
-	uiccMu         sync.Mutex // serializes all multi-command UICC/APDU transactions
-	esimMu         sync.Mutex // serializes eSIM card access (list/switch/download)
+	uiccMu         sync.RWMutex // legacy callers exclude all keyed transactions
+	uiccReaders    sync.Map     // stable physical device ID -> *sync.Mutex
 	esimRecoveryMu sync.Mutex
 	esimRecoveries map[string]chan struct{}
 	esimCacheMu    sync.RWMutex
@@ -54,60 +54,10 @@ type Manager struct {
 	nativeQMIRegistrationMu       sync.Mutex
 	nativeQMIRegistrationInFlight map[string]struct{}
 
-	started      bool
-	devices      map[string]*managedDevice
-	ussdSessions map[string]ussdSession
-}
-
-// LockUICC and UnlockUICC allow another in-process UICC client (currently the
-// VoWiFi AKA adapter) to share the same transaction boundary as eSIM ES10.
-// Individual AT commands are already serialized per modem, but a logical-
-// channel transaction spans several commands and must not be interleaved.
-func (manager *Manager) LockUICC()   { manager.uiccMu.Lock() }
-func (manager *Manager) UnlockUICC() { manager.uiccMu.Unlock() }
-
-func (manager *Manager) lockESIM() {
-	manager.esimMu.Lock()
-	manager.uiccMu.Lock()
-}
-
-// lockESIMContext keeps HTTP eSIM reads cancellable when another modem
-// operation is slow. A plain Mutex.Lock here used to leave the eSIM page
-// spinning forever behind a wedged refresh transaction.
-func (manager *Manager) lockESIMContext(ctx context.Context) error {
-	if err := lockMutexContext(ctx, &manager.esimMu); err != nil {
-		return err
-	}
-	if err := lockMutexContext(ctx, &manager.uiccMu); err != nil {
-		manager.esimMu.Unlock()
-		return err
-	}
-	return nil
-}
-
-func lockMutexContext(ctx context.Context, mutex *sync.Mutex) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	for {
-		if mutex.TryLock() {
-			return nil
-		}
-		timer := time.NewTimer(10 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
-}
-
-func (manager *Manager) unlockESIM() {
-	manager.uiccMu.Unlock()
-	manager.esimMu.Unlock()
+	started         bool
+	devices         map[string]*managedDevice
+	ussdSessions    map[string]ussdSession
+	ussdSuspensions map[string]int
 }
 
 // ussdSession tracks an open USSD dialog on a device so a follow-up Continue or
@@ -791,7 +741,9 @@ func (manager *Manager) ExecuteAT(
 	if err != nil {
 		return modem.Response{}, err
 	}
-	state.opMu.Lock()
+	if err := lockMutexContext(ctx, &state.opMu); err != nil {
+		return modem.Response{}, err
+	}
 	defer state.opMu.Unlock()
 	if err := manager.validateActive(id, state); err != nil {
 		return modem.Response{}, err
@@ -821,7 +773,9 @@ func (manager *Manager) ExecuteSensitiveAT(
 	if err != nil {
 		return modem.Response{}, err
 	}
-	state.opMu.Lock()
+	if err := lockMutexContext(ctx, &state.opMu); err != nil {
+		return modem.Response{}, err
+	}
 	defer state.opMu.Unlock()
 	if err := manager.validateActive(id, state); err != nil {
 		return modem.Response{}, err

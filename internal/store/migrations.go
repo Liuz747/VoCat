@@ -504,6 +504,27 @@ func migrationStatements(version int) []string {
 			// One-off end instant for rotation tasks (0 = no end).
 			`ALTER TABLE automatic_tasks ADD COLUMN end_at INTEGER NOT NULL DEFAULT 0`,
 		}
+	case 26:
+		return []string{
+			`CREATE TABLE IF NOT EXISTS device_multisim (
+				device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+				enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+				profiles_json TEXT NOT NULL DEFAULT '[]',
+				created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+			)`,
+			`CREATE TRIGGER IF NOT EXISTS multisim_task_insert BEFORE INSERT ON automatic_tasks
+			 WHEN NEW.enabled=1 AND EXISTS(SELECT 1 FROM device_multisim WHERE device_id=NEW.device_id AND enabled=1)
+			 BEGIN SELECT RAISE(ABORT,'multisim_enabled'); END`,
+			`CREATE TRIGGER IF NOT EXISTS multisim_task_update BEFORE UPDATE OF enabled,device_id ON automatic_tasks
+			 WHEN NEW.enabled=1 AND EXISTS(SELECT 1 FROM device_multisim WHERE device_id=NEW.device_id AND enabled=1)
+			 BEGIN SELECT RAISE(ABORT,'multisim_enabled'); END`,
+			`CREATE TRIGGER IF NOT EXISTS multisim_run_insert BEFORE INSERT ON automatic_task_runs
+			 WHEN NEW.status IN ('queued','running') AND EXISTS(SELECT 1 FROM device_multisim WHERE device_id=NEW.device_id AND enabled=1)
+			 BEGIN SELECT RAISE(ABORT,'multisim_enabled'); END`,
+			`CREATE TRIGGER IF NOT EXISTS multisim_run_update BEFORE UPDATE OF status,device_id ON automatic_task_runs
+			 WHEN NEW.status IN ('queued','running') AND EXISTS(SELECT 1 FROM device_multisim WHERE device_id=NEW.device_id AND enabled=1)
+			 BEGIN SELECT RAISE(ABORT,'multisim_enabled'); END`,
+		}
 	default:
 		return nil
 	}
