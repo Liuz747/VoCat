@@ -93,7 +93,14 @@ func newSessionRelay(
 		o.DPDTimeout = 5 * time.Second
 	}
 	if o.DPDAttempts <= 0 {
-		o.DPDAttempts = 3
+		// 8 x 5 s = 40 s before an SA is declared dead. Captures on the
+		// 2026-09-07 SOCKS5 relays showed 20-40% loss on individual DPD
+		// exchanges (the reply always arrived ~190 ms after *some* retransmit),
+		// so three attempts (15 s) tore down healthy tunnels every few minutes
+		// while ESP was still flowing. RFC 7296 §2.4 expects retransmission for
+		// "several minutes" before giving up; 40 s stays well inside the NAT
+		// mapping lifetime and the IMS refresh budget.
+		o.DPDAttempts = 8
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	relay := &sessionRelay{
