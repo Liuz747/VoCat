@@ -189,7 +189,7 @@ export function formsFromNotifications(data: Partial<NotificationSettings>): Not
     bark: {
       enabled: !!bark.enabled,
       urls: strList(bark.urls),
-      group: str(bark.group) || "vocat",
+      group: str(bark.group) || "notifications",
       icon: str(bark.icon),
       level: str(bark.level) || "active",
     },

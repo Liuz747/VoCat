@@ -53,7 +53,7 @@ export function CellularIMSConfigCard({ deviceId, deviceOnline }: CellularIMSCon
     const confirmed = await confirmDialog(
       <div className="space-y-2">
         {selectedMode === "mbn_default" ? (
-          <p>{t("将清除 VoCat 的 IMS 强制覆盖，改由当前 MBN / 运营商配置决定是否启用 IMS。")}</p>
+          <p>{t("将清除软件的 IMS 强制覆盖，改由当前 MBN / 运营商配置决定是否启用 IMS。")}</p>
         ) : selectedMode === "force_enabled" ? (
           <p>{t("这会强制启用模组的整个蜂窝 IMS，而不只是 IMS 短信；VoLTE 等语音功能也会受到影响。")}</p>
         ) : (

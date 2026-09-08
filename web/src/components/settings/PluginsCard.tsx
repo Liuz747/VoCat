@@ -88,10 +88,10 @@ export function PluginsCard() {
       <CardDecor />
       <div className="relative z-10 mb-6 flex items-center gap-3">
         <CardIcon><PlugConnectedRegular className="text-[24px]" /></CardIcon>
-        <CardTitle title={t("插件")} subtitle={t("通过 URL 或本地插件包扩展 VoCat 功能")} />
+        <CardTitle title={t("插件")} subtitle={t("通过 URL 或本地插件包扩展功能")} />
       </div>
       <div className="relative z-10 grid gap-3 md:grid-cols-[1fr_18rem_auto]">
-        <Input value={url} onChange={(event) => setURL(event.target.value)} placeholder="https://example.com/plugin.vocat-plugin" />
+        <Input value={url} onChange={(event) => setURL(event.target.value)} placeholder="https://example.com/plugin.zip" />
         <Input value={sha256} onChange={(event) => setSHA256(event.target.value)} placeholder={t("SHA-256（可选，推荐）")} />
         <Button variant="primary" icon={<AddRegular />} loading={busy === "install"} onClick={() => void installURL()}>{t("从 URL 安装")}</Button>
       </div>

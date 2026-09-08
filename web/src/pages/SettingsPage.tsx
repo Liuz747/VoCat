@@ -382,8 +382,8 @@ export default function SettingsPage() {
     if (updateInfo.isDocker) {
       await confirmDialog(
         lang === "zh"
-          ? "检测到当前系统运行在 Docker 环境下。不建议在容器内直接执行文件热替换，请拉取最新镜像（如 docker pull vocat:latest）并重启容器来完成升级！"
-          : "The system is running inside Docker. In-place binary replacement is not recommended; pull the latest image (e.g. docker pull vocat:latest) and restart the container to upgrade!",
+          ? "检测到当前系统运行在 Docker 环境下。不建议在容器内直接执行文件热替换，请拉取最新镜像并重启容器来完成升级！"
+          : "The system is running inside Docker. In-place binary replacement is not recommended; pull the latest image and restart the container to upgrade!",
         t("环境警告"),
         { confirmText: t("知道了"), type: "warning" },
       );

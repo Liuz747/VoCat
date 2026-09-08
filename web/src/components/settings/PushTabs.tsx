@@ -61,7 +61,7 @@ export function BarkTab({ value, onChange, testing, onTest }: PushChannelProps<B
           emptyText={t("尚未配置任何 Bark URL，点击右侧添加按钮。")}
         />
         <Field label={t("分组 (Group)")} hint={t("iOS 设备上的通知分组。")}>
-          <Input value={value.group} onChange={(e) => onChange({ group: e.target.value })} disabled={off} placeholder={t("例如 vocat")} />
+          <Input value={value.group} onChange={(e) => onChange({ group: e.target.value })} disabled={off} placeholder={t("例如通知")} />
         </Field>
         <Field label={t("通知级别 (Level)")} hint={t("iOS 的专注模式/打扰规则会根据此级别决定是否亮屏。")}>
           <Select

@@ -61,7 +61,7 @@ export const EN_DICT: Record<string, string> = {
 
   // External extensions.
   "插件": "Plugins",
-  "通过 URL 或本地插件包扩展 VoCat 功能": "Extend VoCat with a URL or a local plugin package",
+  "通过 URL 或本地插件包扩展功能": "Extend functionality with a URL or a local plugin package",
   "插件列表加载失败": "Failed to load plugins",
   "请输入插件包 URL": "Enter a plugin package URL",
   "插件页面以当前管理员权限运行，插件后端还可以运行外部代码。仅安装你完全信任的插件。":
@@ -475,7 +475,7 @@ export const EN_DICT: Record<string, string> = {
   "支持完整飞书 / Lark 群自定义机器人 JSON。变量必须作为 JSON 值使用，例如":
     "Supports a complete Feishu / Lark custom group bot JSON payload. Use variables as JSON values, for example",
   "分组 (Group)": "Group",
-  "例如 vocat": "e.g. vocat",
+  "例如通知": "e.g. notifications",
   "iOS 设备上的通知分组。": "Notification group on iOS devices.",
   "通知级别 (Level)": "Level",
   选择通知级别: "Select a level",
@@ -757,7 +757,7 @@ export const EN_DICT: Record<string, string> = {
   "WiFi-Calling · 全部就绪": "WiFi Calling · All Ready",
   "[空响应]": "[Empty response]",
   "eUICC 安装 profile 时空间不足，请删除未使用的 profile 后重试。": "Insufficient space on the eUICC for this profile; delete unused profiles and retry.",
-  "vocat 最终用户许可与免责声明": "vocat End User License Agreement & Disclaimer",
+  "最终用户许可与免责声明": "End User License Agreement & Disclaimer",
   "⚠️ 删除 Profile": "⚠️ Delete Profile",
   "下载失败": "Download failed",
   "下载新 Profile": "Download New Profile",
@@ -1263,8 +1263,8 @@ export const EN_DICT: Record<string, string> = {
   "强制启用整个 IMS": "Force-enable all IMS",
   "强制关闭整个 IMS": "Force-disable all IMS",
   "读取蜂窝 IMS 模组配置失败": "Failed to read the modem IMS configuration",
-  "将清除 VoCat 的 IMS 强制覆盖，改由当前 MBN / 运营商配置决定是否启用 IMS。":
-    "Clear the VoCat IMS override and let the active MBN / carrier configuration decide whether IMS is enabled.",
+  "将清除软件的 IMS 强制覆盖，改由当前 MBN / 运营商配置决定是否启用 IMS。":
+    "Clear the software IMS override and let the active MBN / carrier configuration decide whether IMS is enabled.",
   "这会强制启用模组的整个蜂窝 IMS，而不只是 IMS 短信；VoLTE 等语音功能也会受到影响。":
     "This force-enables all cellular IMS services, not only IMS SMS; voice services such as VoLTE are also affected.",
   "这会强制关闭整个蜂窝 IMS，可能导致 VoLTE、IMS 短信及 IMS 语音不可用。":

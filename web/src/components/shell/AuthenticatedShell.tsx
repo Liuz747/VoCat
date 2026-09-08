@@ -20,7 +20,6 @@ import { SwitchDark } from "../ui/SwitchDark";
 import { Drawer } from "../ui/Drawer";
 import { ErrorBoundary } from "../ui/ErrorBoundary";
 import { cx } from "../../lib/utils";
-import { BrandLogo } from "./BrandLogo";
 import { VersionBadge } from "./VersionBadge";
 import { listPlugins, type InstalledPlugin } from "../../extensions";
 import { api } from "../../api";
@@ -187,11 +186,9 @@ export function AuthenticatedShell({
           )}
         >
           <div className={cx("flex h-14 items-center px-4", collapsed && "justify-center px-0")}>
-            <BrandLogo className="sidebar-brand-logo" />
             {!collapsed && (
               <div className="ml-3">
-                <div className="sidebar-brand-title">vocat</div>
-                <div className="text-[10px] font-medium leading-tight tracking-wide text-gray-400 dark:text-gray-500">{t("高通模块测试工具")}</div>
+                <div className="sidebar-brand-title">{t("高通模块测试工具")}</div>
               </div>
             )}
           </div>
@@ -203,10 +200,8 @@ export function AuthenticatedShell({
       <Drawer open={isMobile && mobileOpen} onClose={() => setMobileOpen(false)} className="mobile-drawer">
         <div className="sidebar-shell relative h-full bg-white/95 backdrop-blur-md dark:bg-[#141418]/95">
           <div className="flex h-16 items-center px-4">
-            <BrandLogo className="sidebar-brand-logo" />
             <div className="ml-3">
-              <div className="sidebar-brand-title">vocat</div>
-              <div className="text-[10px] font-medium leading-tight tracking-wide text-gray-400 dark:text-gray-500">{t("高通模块测试工具")}</div>
+              <div className="sidebar-brand-title">{t("高通模块测试工具")}</div>
             </div>
           </div>
           {menuList(false)}

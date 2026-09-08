@@ -33,7 +33,7 @@ function ZhItems() {
   return (
     <>
       <Item index={1}>
-        本软件（vocat）依据 MIT License 分发，允许使用、复制、修改、合并、发布、分发、再许可及销售软件副本；完整条款见 LICENSE。
+        本软件依据 MIT License 分发，允许使用、复制、修改、合并、发布、分发、再许可及销售软件副本；完整条款见 LICENSE。
       </Item>
       <Item index={2}>
         本项目用于对自研 / 定制高通模组（首发 Quectel EC20）进行功能验证与故障诊断。仅应使用测试卡、开发卡、实验室卡、授权 eSIM profile，或本人拥有 / 被明确授权测试的 SIM/eSIM 资源；
@@ -65,7 +65,7 @@ function EnItems() {
   return (
     <>
       <Item index={1}>
-        This software (vocat) is distributed under the MIT License, which permits use, copying, modification, merging, publication, distribution, sublicensing, and sale of copies. See LICENSE for the full terms.
+        This software is distributed under the MIT License, which permits use, copying, modification, merging, publication, distribution, sublicensing, and sale of copies. See LICENSE for the full terms.
       </Item>
       <Item index={2}>
         This project is for function verification and fault diagnosis of custom Qualcomm modules (primarily Quectel
@@ -132,7 +132,7 @@ export function Disclaimer({
             <WarningGlyph />
           </div>
           <h2 className="disclaimer-title mb-5 text-center text-2xl font-extrabold tracking-tight text-gray-900 dark:text-white">
-            {zh ? t("vocat 最终用户许可与免责声明") : "vocat End User License Agreement & Disclaimer"}
+            {zh ? t("最终用户许可与免责声明") : "End User License Agreement & Disclaimer"}
           </h2>
           <div className="disclaimer-body space-y-4 text-[14px] font-medium leading-relaxed text-gray-600 dark:text-gray-300">
             {zh ? <ZhItems /> : <EnItems />}
