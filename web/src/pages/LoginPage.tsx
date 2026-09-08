@@ -45,7 +45,7 @@ export default function LoginPage() {
           <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-indigo-500/8 to-transparent opacity-0 transition-opacity duration-500 group-hover:opacity-100" />
           <div className="relative z-10 mb-10 text-center">
             <h2 className="bg-gradient-to-r from-gray-900 to-gray-600 bg-clip-text text-3xl font-bold text-transparent dark:from-white dark:to-gray-400">
-              {t("高通模块测试工具")}
+              SIMHub
             </h2>
             <p className="mt-3 text-sm tracking-wide text-gray-500 dark:text-gray-400">{t("高通模块专业测试工具")}</p>
           </div>

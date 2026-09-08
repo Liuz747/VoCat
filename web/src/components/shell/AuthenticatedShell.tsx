@@ -188,7 +188,7 @@ export function AuthenticatedShell({
           <div className={cx("flex h-14 items-center px-4", collapsed && "justify-center px-0")}>
             {!collapsed && (
               <div className="ml-3">
-                <div className="sidebar-brand-title">{t("高通模块测试工具")}</div>
+                <div className="sidebar-brand-title">SIMHub</div>
               </div>
             )}
           </div>
@@ -201,7 +201,7 @@ export function AuthenticatedShell({
         <div className="sidebar-shell relative h-full bg-white/95 backdrop-blur-md dark:bg-[#141418]/95">
           <div className="flex h-16 items-center px-4">
             <div className="ml-3">
-              <div className="sidebar-brand-title">{t("高通模块测试工具")}</div>
+              <div className="sidebar-brand-title">SIMHub</div>
             </div>
           </div>
           {menuList(false)}
