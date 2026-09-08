@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -18,6 +19,8 @@ import (
 	"vocat/internal/device"
 	"vocat/internal/loghub"
 	"vocat/internal/store"
+	"vocat/internal/vowifi"
+	"vocat/internal/vowifi/multisim"
 )
 
 type smsDeletionController struct {
@@ -530,5 +533,139 @@ func TestHandleSMSSendEnforcesGlobalHourlyLimit(t *testing.T) {
 	}
 	if envelope.Error.Code != "sms_rate_limited" {
 		t.Fatalf("error code = %q, want sms_rate_limited", envelope.Error.Code)
+	}
+}
+
+func multiSIMSendTestServer(t *testing.T, controller *fakeMultiSIMController) (*Server, *store.Store) {
+	t.Helper()
+	ctx := context.Background()
+	database, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.UpsertDevice(ctx, store.Device{ID: "ec20", Name: "EC20", VoWiFiEnabled: true, ModemIMEI: "861234567890123"}); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{
+		store:               database,
+		logger:              regionTestLogger(),
+		maxRequestBodyBytes: 4096,
+		devices:             fakeDeviceController{},
+		multisim:            controller,
+	}
+	return server, database
+}
+
+func postSMSSend(t *testing.T, server *Server, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPost, "/api/sms/send", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	server.handleSMSSend(response, request)
+	return response
+}
+
+func TestHandleSMSSendRoutesThroughSelectedMultiSIMLine(t *testing.T) {
+	controller := &fakeMultiSIMController{
+		owned:      true,
+		sendResult: vowifi.SMSSubmitResult{Encoding: "gsm7_pdu", PartsTotal: 1, PartsAttempted: 1, PartsAccepted: 1, AllPartsAccepted: true, SubmissionStatus: "accepted_by_ims"},
+		sendLine:   multisim.LineIdentity{DeviceID: "ec20", SessionID: "multisim-abc", ICCID: "8944100000000000002", IMSI: "310240000000002", PhoneNumber: "+18605550002"},
+	}
+	server, database := multiSIMSendTestServer(t, controller)
+	response := postSMSSend(t, server, `{"device_id":"ec20","iccid":"8944100000000000002","phone":"+447700900123","message":"hello"}`)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", response.Code, response.Body.String())
+	}
+	if controller.sentDevice != "ec20" || controller.sentLine != "8944100000000000002" || len(controller.sent) != 1 || controller.sent[0].Text != "hello" {
+		t.Fatalf("multisim send = device %q line %q requests %+v", controller.sentDevice, controller.sentLine, controller.sent)
+	}
+	messages, err := database.ListSMSMessages(context.Background(), store.SMSFilter{DeviceID: "ec20", Peer: "+447700900123", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("stored %d messages, want 1", len(messages))
+	}
+	saved := messages[0]
+	if saved.Direction != "outbound" || saved.Source != "ims" || saved.ICCID != "8944100000000000002" || saved.IMSI != "310240000000002" || saved.LocalPhone != "+18605550002" || saved.ModemIMEI != "861234567890123" || saved.Status != "accepted_by_ims" {
+		t.Fatalf("stored message = %+v", saved)
+	}
+	var envelope struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Data["transport"] != "ims" || envelope.Data["submission_accepted"] != true {
+		t.Fatalf("response data = %+v", envelope.Data)
+	}
+}
+
+func TestHandleSMSSendMultiSIMAcceptsSessionSelectorAndReportsLineErrors(t *testing.T) {
+	cases := []struct {
+		name     string
+		body     string
+		sendErr  error
+		wantCode int
+		wantErr  string
+		wantLine string
+	}{
+		{name: "session selector", body: `{"device_id":"ec20","session_id":"multisim-abc","phone":"+447700900123","message":"hello"}`, wantCode: http.StatusAccepted, wantLine: "multisim-abc"},
+		{name: "line required", body: `{"device_id":"ec20","phone":"+447700900123","message":"hello"}`, sendErr: multisim.ErrLineRequired, wantCode: http.StatusConflict, wantErr: "multisim_line_required"},
+		{name: "unknown line", body: `{"device_id":"ec20","iccid":"8944100000000000009","phone":"+447700900123","message":"hello"}`, sendErr: multisim.ErrNotRegistered, wantCode: http.StatusConflict, wantErr: "multisim_line_unavailable", wantLine: "8944100000000000009"},
+		{name: "line not ready", wantLine: "8944100000000000002", body: `{"device_id":"ec20","iccid":"8944100000000000002","phone":"+447700900123","message":"hello"}`, sendErr: vowifi.ErrSMSNotReady, wantCode: http.StatusConflict, wantErr: "multisim_line_not_ready"},
+		{name: "group busy", wantLine: "8944100000000000002", body: `{"device_id":"ec20","iccid":"8944100000000000002","phone":"+447700900123","message":"hello"}`, sendErr: multisim.ErrOperationInProgress, wantCode: http.StatusConflict, wantErr: "multisim_active"},
+		{name: "ims rejected", wantLine: "8944100000000000002", body: `{"device_id":"ec20","iccid":"8944100000000000002","phone":"+447700900123","message":"hello"}`, sendErr: errors.New("ims: 403"), wantCode: http.StatusBadGateway, wantErr: "ims_sms_submission_failed"},
+		{name: "invalid recipient never reaches the line", body: `{"device_id":"ec20","iccid":"8944100000000000002","phone":"abc","message":"hello"}`, wantCode: http.StatusBadGateway},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			controller := &fakeMultiSIMController{
+				owned:      true,
+				sendErr:    tc.sendErr,
+				sendResult: vowifi.SMSSubmitResult{PartsTotal: 1, PartsAttempted: 1, PartsAccepted: 1, AllPartsAccepted: true, SubmissionStatus: "accepted_by_ims"},
+				sendLine:   multisim.LineIdentity{DeviceID: "ec20", SessionID: "multisim-abc", ICCID: "8944100000000000002"},
+			}
+			server, _ := multiSIMSendTestServer(t, controller)
+			response := postSMSSend(t, server, tc.body)
+			if response.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d; body=%s", response.Code, tc.wantCode, response.Body.String())
+			}
+			if tc.wantErr != "" {
+				var envelope errorEnvelope
+				if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+					t.Fatal(err)
+				}
+				if envelope.Error.Code != tc.wantErr {
+					t.Fatalf("error code = %q, want %q; body=%s", envelope.Error.Code, tc.wantErr, response.Body.String())
+				}
+			}
+			if controller.sentLine != tc.wantLine {
+				t.Fatalf("selector passed to the group = %q, want %q", controller.sentLine, tc.wantLine)
+			}
+			if tc.name == "invalid recipient never reaches the line" && len(controller.sent) != 0 {
+				t.Fatal("an invalid recipient reached the multisim line")
+			}
+		})
+	}
+}
+
+func TestHandleSMSSendMultiSIMCountsAgainstGlobalHourlyLimit(t *testing.T) {
+	controller := &fakeMultiSIMController{owned: true, sendResult: vowifi.SMSSubmitResult{PartsTotal: 1, PartsAttempted: 1, PartsAccepted: 1, AllPartsAccepted: true, SubmissionStatus: "accepted_by_ims"}}
+	server, database := multiSIMSendTestServer(t, controller)
+	ctx := context.Background()
+	if err := developer.SetSMSHourlyLimit(ctx, database, 1); err != nil {
+		t.Fatal(err)
+	}
+	if reservation, err := database.ReserveSMSSend(ctx, "another-device", 1, time.Now().UTC()); err != nil || !reservation.Allowed {
+		t.Fatalf("seed global SMS reservation = %+v, %v", reservation, err)
+	}
+	response := postSMSSend(t, server, `{"device_id":"ec20","iccid":"8944100000000000002","phone":"+447700900123","message":"hello"}`)
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429; body=%s", response.Code, response.Body.String())
+	}
+	if len(controller.sent) != 0 {
+		t.Fatal("a rate-limited request reached the multisim line")
 	}
 }

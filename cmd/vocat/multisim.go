@@ -31,9 +31,25 @@ type multiSIMIntegration struct {
 	closing  atomic.Bool
 }
 
+// multiSIMStartupConcurrency bounds how many lines of one group run their
+// setup (identity read, EAP-AKA, IMS AKA) at the same time. Every line shares
+// one physical eUICC and a profile switch costs 2-5 s, so a wider window only
+// makes AKA exchanges time out behind each other (broker RequestTimeout 30 s).
+const multiSIMStartupConcurrency = 2
+
+// multiSIMLineOptions marks an orchestrator as one line of a multi-tunnel
+// group: SMS storage and phone records use the physical device ID, and setup
+// queues on the group's startup gate. A nil *multiSIMLineOptions is a
+// single-line device.
+type multiSIMLineOptions struct {
+	physicalDeviceID string
+	admission        vowifi.Admission
+}
+
 type multiSIMReader struct {
 	backend          *multiSIMBackend
 	broker           *multisim.AuthBroker
+	gate             *multisim.StartupGate
 	original         multisim.Profile
 	resumeSingle     bool
 	radio            vowifi.RadioSnapshot
@@ -206,7 +222,9 @@ func newMultiSIMIntegration(database *store.Store, devices *device.Manager, sing
 	bridge := &multiSIMIntegration{database: database, devices: devices, singles: singles, logger: logger,
 		mapper: integration.ATMapper{Store: database, Devices: devices}, readers: make(map[string]*multiSIMReader)}
 	manager := multisim.New(multisim.Options{Logger: logger.With("category", "multisim"),
-		OperationTimeout: 2 * time.Minute, CleanupTimeout: 60 * time.Second,
+		// One line's Enable now includes queueing behind the startup gate; a
+		// 20-profile group needs several minutes of reader time in total.
+		OperationTimeout: 6 * time.Minute, CleanupTimeout: 60 * time.Second,
 		RetryInitial: 5 * time.Second, RetryMaximum: 2 * time.Minute,
 		Prepare: bridge.prepare, Restore: bridge.restore, Factory: bridge.factory})
 	return bridge, manager
@@ -315,6 +333,7 @@ func (bridge *multiSIMIntegration) prepare(ctx context.Context, config multisim.
 		}
 	}
 	reader.broker, err = multisim.NewAuthBroker(multisim.BrokerOptions{DeviceID: config.DeviceID, Backend: reader.backend, RequestTimeout: 30 * time.Second, Logger: bridge.logger.With("category", "multisim", "device_id", config.DeviceID)})
+	reader.gate = multisim.NewStartupGate(multiSIMStartupConcurrency)
 	return err
 }
 
@@ -333,7 +352,8 @@ func (bridge *multiSIMIntegration) factory(ctx context.Context, config multisim.
 	if err != nil {
 		return nil, err
 	}
-	return newVoWiFiOrchestrator(deviceConfig, bridge.database, &multiSIMLineAdapter{adapter}, bridge.logger, nil, config.DeviceID)
+	return newVoWiFiOrchestrator(deviceConfig, bridge.database, &multiSIMLineAdapter{adapter}, bridge.logger, nil,
+		&multiSIMLineOptions{physicalDeviceID: config.DeviceID, admission: reader.gate})
 }
 
 func (bridge *multiSIMIntegration) restore(ctx context.Context, config multisim.Config) error {

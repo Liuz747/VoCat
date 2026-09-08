@@ -66,8 +66,8 @@ func scanMultiSIMConfig(row rowScanner) (MultiSIMConfig, error) {
 }
 func (s *Store) SaveMultiSIMConfig(ctx context.Context, v MultiSIMConfig) (MultiSIMConfig, error) {
 	v.DeviceID = strings.TrimSpace(v.DeviceID)
-	if v.DeviceID == "" || len(v.Profiles) > 8 || (v.Enabled && len(v.Profiles) < 2) {
-		return v, errors.New("multi-SIM requires a device and 2-8 profiles when enabled")
+	if v.DeviceID == "" || (v.Enabled && len(v.Profiles) < 1) {
+		return v, errors.New("multi-SIM requires a device and at least one profile when enabled")
 	}
 	seen := map[string]bool{}
 	for i := range v.Profiles {

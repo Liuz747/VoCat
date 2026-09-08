@@ -987,3 +987,27 @@ func (*fakeConn) RemoteAddr() net.Addr {
 func (*fakeConn) SetDeadline(time.Time) error      { return nil }
 func (*fakeConn) SetReadDeadline(time.Time) error  { return nil }
 func (*fakeConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestOriginatingIdentityUsesAssociatedE164OverTemporaryIdentity(t *testing.T) {
+	registered := "sip:310240000000123@ims.mnc240.mcc310.3gppnetwork.org"
+	cases := []struct {
+		name       string
+		associated []string
+		want       string
+		wantSource string
+	}{
+		{name: "tel preferred", associated: []string{"<sip:310240000000123@ims.mnc240.mcc310.3gppnetwork.org>", "<sip:+18605550123@msg.pc.t-mobile.com>", "<tel:+18605550123>"}, want: "tel:+18605550123", wantSource: "p_associated_uri_tel"},
+		{name: "sip e164 when no tel", associated: []string{"<sip:310240000000123@ims.mnc240.mcc310.3gppnetwork.org>", "<sip:+18605550123@msg.pc.t-mobile.com>"}, want: "sip:+18605550123@msg.pc.t-mobile.com", wantSource: "p_associated_uri_sip"},
+		{name: "temporary identity never chosen", associated: []string{"<sip:310240000000123@ims.mnc240.mcc310.3gppnetwork.org>"}, want: registered, wantSource: "registered_public_identity"},
+		{name: "no associated identities", associated: nil, want: registered, wantSource: "registered_public_identity"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			session := &Session{identity: identitySet{public: registered}, evidence: vowifi.IMSEvidence{PAssociatedURI: tc.associated}}
+			got, source := session.originatingIdentity()
+			if got != tc.want || source != tc.wantSource {
+				t.Fatalf("originatingIdentity() = %q, %q; want %q, %q", got, source, tc.want, tc.wantSource)
+			}
+		})
+	}
+}

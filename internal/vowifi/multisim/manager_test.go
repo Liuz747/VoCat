@@ -439,3 +439,73 @@ func TestGroupWaitsForRealProviderAfterOrchestratorCleanupDeadline(t *testing.T)
 	close(release)
 	waitFor(t, func() bool { return restored.Load() && !m.Owns(cfg.DeviceID) })
 }
+
+type sendIMS struct{ requests chan sendIMSRequest }
+
+type sendIMSRequest struct {
+	session string
+	request vowifi.SMSSubmitRequest
+}
+
+func (p sendIMS) Start(_ context.Context, request vowifi.IMSRequest) (vowifi.IMSSession, error) {
+	return &sendIMSSession{session: request.DeviceID, p: p}, nil
+}
+
+type sendIMSSession struct {
+	lifecycleIMSSession
+	session string
+	p       sendIMS
+}
+
+func (s *sendIMSSession) SendSMS(_ context.Context, request vowifi.SMSSubmitRequest) (vowifi.SMSSubmitResult, error) {
+	s.p.requests <- sendIMSRequest{session: s.session, request: request}
+	return vowifi.SMSSubmitResult{To: request.Recipient, PartsTotal: 1, PartsAttempted: 1, PartsAccepted: 1, AllPartsAccepted: true, SubmissionStatus: "accepted_by_ims"}, nil
+}
+
+func TestSendSMSSelectsLineByICCIDOrSessionAndRequiresSelectorForGroups(t *testing.T) {
+	cfg := testConfig()
+	requests := make(chan sendIMSRequest, 4)
+	m := New(Options{CleanupTimeout: 15 * time.Millisecond, Factory: func(_ context.Context, _ Config, p Profile, id string) (*vowifi.Orchestrator, error) {
+		return lifecycleOrchestrator(p, id, lifecycleTunnel{}, sendIMS{requests})
+	}})
+	if err := m.Apply(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		s := m.State(cfg.DeviceID)
+		return s.Phase == "running" && len(s.Lines) == 2 && s.Lines[0].State.SMSReady && s.Lines[1].State.SMSReady
+	})
+	second := LineID(cfg.DeviceID, cfg.Profiles[1].ICCID)
+	if _, _, err := m.SendSMS(context.Background(), cfg.DeviceID, "", vowifi.SMSSubmitRequest{Recipient: "+12025550100", Text: "hi"}); !errors.Is(err, ErrLineRequired) {
+		t.Fatalf("group send without selector = %v, want ErrLineRequired", err)
+	}
+	if _, _, err := m.SendSMS(context.Background(), cfg.DeviceID, "8910000000000000009", vowifi.SMSSubmitRequest{Recipient: "+12025550100", Text: "hi"}); !errors.Is(err, ErrNotRegistered) {
+		t.Fatalf("unknown line = %v, want ErrNotRegistered", err)
+	}
+	if _, _, err := m.SendSMS(context.Background(), "other-reader", cfg.Profiles[0].ICCID, vowifi.SMSSubmitRequest{Recipient: "+12025550100", Text: "hi"}); !errors.Is(err, ErrNotRegistered) {
+		t.Fatalf("unknown group = %v, want ErrNotRegistered", err)
+	}
+	result, identity, err := m.SendSMS(context.Background(), cfg.DeviceID, cfg.Profiles[1].ICCID, vowifi.SMSSubmitRequest{Recipient: "+12025550100", Text: "by iccid"})
+	if err != nil || !result.AllPartsAccepted {
+		t.Fatalf("send by ICCID = %+v, %v", result, err)
+	}
+	if identity.DeviceID != cfg.DeviceID || identity.SessionID != second || identity.ICCID != cfg.Profiles[1].ICCID {
+		t.Fatalf("identity = %+v", identity)
+	}
+	got := <-requests
+	if got.session != second || got.request.Text != "by iccid" {
+		t.Fatalf("request reached %q with %+v", got.session, got.request)
+	}
+	if _, identity, err := m.SendSMS(context.Background(), cfg.DeviceID, second, vowifi.SMSSubmitRequest{Recipient: "+12025550100", Text: "by session"}); err != nil || identity.SessionID != second {
+		t.Fatalf("send by session = %+v, %v", identity, err)
+	}
+	if got := <-requests; got.session != second || got.request.Text != "by session" {
+		t.Fatalf("request reached %q with %+v", got.session, got.request)
+	}
+	if len(requests) != 0 {
+		t.Fatal("rejected sends still reached a line")
+	}
+	if err := m.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}

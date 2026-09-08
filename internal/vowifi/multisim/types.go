@@ -19,7 +19,18 @@ var (
 	ErrClosed              = errors.New("multisim: manager is closed")
 	ErrNotRegistered       = errors.New("multisim: line is not registered")
 	ErrIdentityMismatch    = errors.New("multisim: live SIM identity does not match the requested profile")
+	ErrLineRequired        = errors.New("multisim: the group has several lines; select one by ICCID or session ID")
 )
+
+// LineIdentity names the subscription that carried a line operation. DeviceID
+// is the physical reader; SessionID is the line's own runtime identity.
+type LineIdentity struct {
+	DeviceID    string
+	SessionID   string
+	ICCID       string
+	IMSI        string
+	PhoneNumber string
+}
 
 type Profile struct {
 	ICCID string `json:"iccid"`
@@ -37,8 +48,11 @@ func (config Config) Validate() error {
 	if config.DeviceID == "" || config.DeviceID != strings.TrimSpace(config.DeviceID) {
 		return errors.New("multisim: physical device ID is required")
 	}
-	if len(config.Profiles) > 8 || (config.Enabled && len(config.Profiles) < 2) {
-		return errors.New("multisim: enabled groups require between two and eight profiles")
+	// No upper bound: one eUICC may carry dozens of profiles and the startup
+	// admission gate (StartupGate) keeps reader contention bounded regardless
+	// of the group size.
+	if config.Enabled && len(config.Profiles) < 1 {
+		return errors.New("multisim: enabled groups require at least one profile")
 	}
 	iccids := make(map[string]bool)
 	for _, profile := range config.Profiles {

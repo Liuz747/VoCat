@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -595,4 +596,57 @@ func (m *Manager) Refresh(deviceID, iccid string) error {
 		m.mu.Unlock()
 	}()
 	return nil
+}
+
+// SendSMS submits one SMS through the line selected by ICCID or session ID.
+// An empty selector is accepted only when the group has exactly one line. The
+// group's own restoration waits for the submission, as it does for Refresh.
+func (m *Manager) SendSMS(ctx context.Context, deviceID, selector string, request vowifi.SMSSubmitRequest) (vowifi.SMSSubmitResult, LineIdentity, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return vowifi.SMSSubmitResult{}, LineIdentity{}, ErrClosed
+	}
+	g := m.groups[deviceID]
+	if g == nil || !g.owned || !g.state.Enabled {
+		m.mu.Unlock()
+		return vowifi.SMSSubmitResult{}, LineIdentity{}, ErrNotRegistered
+	}
+	if g.state.Busy || g.state.Phase != "running" {
+		m.mu.Unlock()
+		return vowifi.SMSSubmitResult{}, LineIdentity{}, ErrOperationInProgress
+	}
+	selector = strings.TrimSpace(selector)
+	var item *line
+	if selector == "" {
+		if len(g.lines) != 1 {
+			m.mu.Unlock()
+			return vowifi.SMSSubmitResult{}, LineIdentity{}, ErrLineRequired
+		}
+		item = g.lines[0]
+	} else {
+		for _, candidate := range g.lines {
+			if candidate.profile.ICCID == selector || candidate.sessionID == selector {
+				item = candidate
+				break
+			}
+		}
+	}
+	if item == nil || item.orchestrator == nil {
+		m.mu.Unlock()
+		return vowifi.SMSSubmitResult{}, LineIdentity{}, ErrNotRegistered
+	}
+	orchestrator := item.orchestrator
+	identity := LineIdentity{DeviceID: deviceID, SessionID: item.sessionID, ICCID: item.profile.ICCID}
+	g.actions.Add(1)
+	m.mu.Unlock()
+	defer g.actions.Done()
+	result, err := orchestrator.SendSMS(ctx, request)
+	state := orchestrator.State()
+	identity.IMSI = state.IMSI
+	identity.PhoneNumber = state.PhoneNumber
+	return result, identity, err
 }

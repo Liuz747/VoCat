@@ -44,25 +44,22 @@ function Detail({ label, value, mono }: { label: string; value?: string | number
 export function DeviceMultiSIMPanel({ deviceId, isActive, deviceOnline, supported, groups, onOwnedChange }: Props) {
   const { t } = useI18n();
   const [status, setStatus] = useState<MultiSIMStatus | null>(null);
-  const [selected, setSelected] = useState<Profile[]>([]);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
   const [pending, setPending] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [, setTick] = useState(0);
-  const dirty = useRef(false);
   const callback = useRef(onOwnedChange); callback.current = onOwnedChange;
   const currentDevice = useRef(deviceId); currentDevice.current = deviceId;
 
   const applyStatus = useCallback((value: MultiSIMStatus) => {
     setStatus(value);
-    if (!dirty.current || value.config.enabled || value.owned) setSelected(value.config.profiles || []);
     callback.current(value.config.enabled || value.owned);
     setError("");
   }, []);
 
   useEffect(() => {
-    dirty.current = false; setStatus(null); setSelected([]); setError(""); callback.current(false);
+    setStatus(null); setError(""); callback.current(false);
     if (!isActive) return;
     const controller = new AbortController(); let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
@@ -80,26 +77,29 @@ export function DeviceMultiSIMPanel({ deviceId, isActive, deviceOnline, supporte
     return () => { controller.abort(); clearTimeout(timer); clearInterval(ticker); };
   }, [deviceId, isActive, applyStatus]);
 
-  const options = useMemo(() => {
+  const owned = Boolean(status?.owned || status?.config.enabled);
+  // No manual selection: starting the group takes every profile currently on
+  // the eUICC. While the group runs, the saved configuration is the truth (the
+  // eSIM list is not re-read then, so `groups` may be empty).
+  const profiles = useMemo<Profile[]>(() => {
+    if (owned) return status?.config.profiles || [];
     const map = new Map<string, Profile>();
-    for (const p of status?.config.profiles || []) map.set(p.iccid, p);
     for (const group of groups) for (const p of group.profiles) map.set(p.iccid, {
       iccid: p.iccid, aid: group.aidHex || "", name: p.name || p.serviceProviderName,
     });
+    if (map.size === 0) for (const p of status?.config.profiles || []) map.set(p.iccid, p);
     return [...map.values()];
-  }, [groups, status?.config.profiles]);
-  const owned = Boolean(status?.owned || status?.config.enabled);
-  const locked = owned || saving || Boolean(status?.state.busy);
+  }, [groups, owned, status?.config.profiles]);
 
   const save = async (enabled: boolean) => {
-    if (enabled && (selected.length < 2 || selected.length > 8)) { message.warning(t("请选择 2–8 个 eSIM Profile")); return; }
+    if (enabled && profiles.length < 1) { message.warning(t("卡片上没有可用的 eSIM Profile")); return; }
     const id = deviceId; setSaving(true);
     try {
       const value = await api<MultiSIMStatus>(`/devices/${encodeURIComponent(id)}/multisim`, {
-        method: "PUT", body: { enabled, profiles: owned ? status?.config.profiles || [] : selected },
+        method: "PUT", body: { enabled, profiles: owned ? status?.config.profiles || [] : profiles },
       });
       if (currentDevice.current !== id) return;
-      dirty.current = false; applyStatus(value);
+      applyStatus(value);
       message.success(enabled ? t("已提交启动，请等待各线路就绪") : t("已提交停止，请等待设备恢复"));
     } catch (err) { if (currentDevice.current === id) message.error(apiMessage(err) || t("保存多隧道配置失败")); }
     finally { if (currentDevice.current === id) setSaving(false); }
@@ -128,28 +128,24 @@ export function DeviceMultiSIMPanel({ deviceId, isActive, deviceOnline, supporte
       <div><h3 className="font-semibold">{t("多号码常驻接收")}</h3>
         <p className="mt-1 text-sm text-gray-500">{t("每个号码保留独立的 VoWiFi 线路，收到短信后直接进入收件箱。")}</p>
       </div>
-      <div className="flex items-center gap-2 text-sm">
+      <div className="flex items-center gap-3 text-sm">
+        <span className="rounded-lg bg-sky-50 px-2.5 py-1 font-semibold text-sky-700 dark:bg-sky-500/15 dark:text-sky-300" title={owned ? t("本次多隧道包含的号码数") : t("卡片上的 eSIM Profile 数，启动后全部建立线路")}>
+          {t("号码")} <span className="font-mono text-base">{profiles.length}</span>{owned ? <span className="ml-1 text-xs font-normal text-sky-600/80 dark:text-sky-300/80">· {t("可收")} {readyCount}</span> : null}
+        </span>
         <StatusDot tone={headTone} size="sm" animated={headTone === "success"} />
         <span className={cx(headTone === "success" ? "text-green-600" : headTone === "danger" ? "text-red-600" : "text-gray-500")}>{headline}</span>
       </div>
     </div>
-    <p className="mt-3 text-xs text-gray-500">{t("首版仅支持 EC20/EC25 AT 设备，配置上限为 8 个号码；实际并发容量仍需验证。启用前请停止本设备的自动任务。")}</p>
+    <p className="mt-3 text-xs text-gray-500">{t("启动后卡片上的全部号码各自保持一条 VoWiFi 线路，不需要逐个勾选。线路按 2 条并发建立（共用一张卡的读卡器），20 个号码约需 3–5 分钟全部就绪。仅支持 EC20/EC25 AT 设备；启动前请停止本设备的自动任务。")}</p>
     {error ? <p className="mt-3 text-sm text-red-600" role="alert">{error}</p> : null}
     {status?.state.lastError ? <p className="mt-3 break-words text-sm text-red-600" role="alert">{status.state.lastError}</p> : null}
     {status && !status.available ? <p className="mt-3 text-sm text-amber-600">{t("多隧道运行服务不可用")}</p> : null}
     {status && status.config.enabled && !status.owned && !status.state.busy ? <p className="mt-3 text-sm text-amber-600">{t("配置已启用但设备尚未被接管：若长时间停留，请停止后重新启用。")}</p> : null}
-    <div className="mt-4 grid gap-2 sm:grid-cols-2">
-      {options.map((p) => <label key={p.iccid} className={`flex items-center gap-3 rounded-lg border p-3 text-sm ${locked ? "opacity-70" : "cursor-pointer"}`}>
-        <input type="checkbox" checked={selected.some((item) => item.iccid === p.iccid)} disabled={locked || !supported}
-          onChange={() => { dirty.current = true; setSelected((old) => old.some((item) => item.iccid === p.iccid) ? old.filter((item) => item.iccid !== p.iccid) : [...old, p]); }} />
-        <span>{p.name || t("未命名号码")}<span className="ml-2 font-mono text-xs text-gray-400">…{p.iccid.slice(-6)}</span></span>
-      </label>)}
-    </div>
-    {!options.length ? <p className="mt-3 text-sm text-gray-500">{t("读取下方 eSIM 列表后，可在这里选择号码。")}</p> : null}
+    {!owned && !profiles.length ? <p className="mt-3 text-sm text-gray-500">{t("先读取下方 eSIM 列表，读到 Profile 后即可启动。")}</p> : null}
     <div className="mt-4 flex flex-wrap items-center gap-3">
       {owned ? <Button variant="danger" loading={saving} onClick={() => void save(false)}>{t("停止多隧道")}</Button>
-        : <Button variant="primary" loading={saving} disabled={!supported || !deviceOnline || !status?.available || selected.length < 2 || selected.length > 8 || Boolean(status?.state.busy)} onClick={() => void save(true)}>{t("启用多隧道")}</Button>}
-      {!error && status ? <span className="text-sm text-gray-500">{t("可接收短信")}：{readyCount} / {total}</span> : null}
+        : <Button variant="primary" loading={saving} disabled={!supported || !deviceOnline || !status?.available || profiles.length < 1 || Boolean(status?.state.busy)} onClick={() => void save(true)}>{tf("启动多隧道（{n} 个号码）", { n: profiles.length })}</Button>}
+      {!error && status && owned ? <span className="text-sm text-gray-500">{t("可接收短信")}：{readyCount} / {total}</span> : null}
       {status?.state.updatedAt ? <span className="text-xs text-gray-400" title={formatDateTime(status.state.updatedAt)}>{t("组状态更新于")} {ageText(status.state.updatedAt, t) || "--"}{t("前")}</span> : null}
     </div>
     {lines.length > 0 ? <div className="mt-4 divide-y rounded-lg border">

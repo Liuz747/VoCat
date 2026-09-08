@@ -946,3 +946,68 @@ func TestNewRejectsMissingProvidersAndInvalidOptions(t *testing.T) {
 		t.Fatal("New() accepted empty device ID")
 	}
 }
+
+type recordingAdmission struct {
+	mu       sync.Mutex
+	acquired int
+	released int
+	block    chan struct{}
+}
+
+func (a *recordingAdmission) Acquire(ctx context.Context) (func(), error) {
+	if a.block != nil {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-a.block:
+		}
+	}
+	a.mu.Lock()
+	a.acquired++
+	a.mu.Unlock()
+	return func() {
+		a.mu.Lock()
+		a.released++
+		a.mu.Unlock()
+	}, nil
+}
+
+func TestEnableHoldsStartupAdmissionForTheWholeSetupAndReleasesOnAnyExit(t *testing.T) {
+	environment := newFakeEnvironment()
+	admission := &recordingAdmission{}
+	orchestrator := newTestOrchestratorWithOptions(t, environment, Options{
+		DeviceID: "EC20", CleanupTimeout: time.Second, StartupAdmission: admission,
+	})
+	if _, err := orchestrator.Enable(context.Background()); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	if admission.acquired != 1 || admission.released != 1 {
+		t.Fatalf("admission after success: acquired=%d released=%d", admission.acquired, admission.released)
+	}
+	if _, err := orchestrator.Disable(context.Background()); err != nil {
+		t.Fatalf("Disable() error = %v", err)
+	}
+
+	environment.setFailure("tunnel.start", 1)
+	if _, err := orchestrator.Enable(context.Background()); err == nil {
+		t.Fatal("Enable() succeeded despite tunnel failure")
+	}
+	if admission.acquired != 2 || admission.released != 2 {
+		t.Fatalf("admission after failure: acquired=%d released=%d", admission.acquired, admission.released)
+	}
+
+	// A queued line that never gets a slot fails before touching any dependency.
+	blocked := &recordingAdmission{block: make(chan struct{})}
+	queued := newTestOrchestratorWithOptions(t, newFakeEnvironment(), Options{
+		DeviceID: "EC20", CleanupTimeout: time.Second, StartupAdmission: blocked,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	state, err := queued.Enable(ctx)
+	if err == nil || state.Phase != PhaseFailed {
+		t.Fatalf("queued Enable() = %+v, %v", state, err)
+	}
+	if blocked.acquired != 0 {
+		t.Fatal("admission granted after the context expired")
+	}
+}

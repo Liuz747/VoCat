@@ -902,7 +902,7 @@ func (session *Session) SendUSSI(ctx context.Context, request vowifi.USSISubmitR
 	message := make([]byte, 0, 2+len(stringOctets))
 	message = append(message, byte(length), byte(*dcs))
 	message = append(message, stringOctets...)
-	response, sendErr := session.sendSIPMessageWith(ctx, target, message, "", ussiContentType, "ussd")
+	response, sendErr := session.sendSIPMessageWith(ctx, target, message, "", ussiContentType, "ussd", session.identity.public)
 	result := vowifi.USSISubmitResult{
 		SubmissionStatus: "pending",
 	}
@@ -1065,9 +1065,10 @@ func (session *Session) SendSMS(ctx context.Context, request vowifi.SMSSubmitReq
 		SubmissionStatus: "pending",
 		PartResults:      make([]vowifi.SMSSubmitPart, 0, len(parts)),
 	}
+	originator, originatorSource := session.originatingIdentity()
 	session.logOutboundSMS(slog.LevelInfo, "IMS outbound SMS submission started",
 		"stage", "prepare", "parts", len(parts), "smsc_source", smscSource,
-		"recipient_type", smsRecipientType(parts[0].To))
+		"recipient_type", smsRecipientType(parts[0].To), "originator_source", originatorSource)
 	psi := "tel:" + normalizeE164(smsc)
 	for _, part := range parts {
 		reference := session.allocateRPReference()
@@ -1082,7 +1083,7 @@ func (session *Session) SendSMS(ctx context.Context, request vowifi.SMSSubmitReq
 			return result, buildErr
 		}
 		result.PartsAttempted++
-		response, sendErr := session.sendSIPMessage(ctx, psi, rpdu, "")
+		response, sendErr := session.sendSIPMessageWith(ctx, psi, rpdu, "", smsContentType, "smsip", originator)
 		partResult := vowifi.SMSSubmitPart{
 			Part: part.Part, Total: part.Total, Reference: int(reference), SubmittedAt: time.Now().UTC(),
 		}
@@ -1174,12 +1175,47 @@ func (session *Session) sendSIPMessage(
 	body []byte,
 	inReplyTo string,
 ) (*sipResponse, error) {
-	return session.sendSIPMessageWith(ctx, target, body, inReplyTo, smsContentType, "smsip")
+	return session.sendSIPMessageWith(ctx, target, body, inReplyTo, smsContentType, "smsip", session.identity.public)
+}
+
+// originatingIdentity is the public identity a mobile-originated SMS is sent
+// as. 3GPP TS 24.229 §5.1.2A.1 bars the IMSI-derived temporary identity from
+// every request except REGISTER; a UE originates with one of the implicitly
+// registered identities, and for SMS the tel URI (or sip:+E.164) from
+// P-Associated-URI is the one the IP-SM-GW maps to the sender's MSISDN.
+// Without an E.164 identity in the registration answer, the registered
+// public identity is the only one available.
+func (session *Session) originatingIdentity() (identity string, source string) {
+	session.mu.Lock()
+	associated := append([]string(nil), session.evidence.PAssociatedURI...)
+	registered := session.identity.public
+	session.mu.Unlock()
+	preferred := ""
+	for _, raw := range associated {
+		uri := strings.Trim(strings.TrimSpace(raw), "<>\"'")
+		if uri == "" {
+			continue
+		}
+		if _, _, ok := vowifi.ExtractAssociatedMSISDN(vowifi.IMSEvidence{PAssociatedURI: []string{uri}}); !ok {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(uri), "tel:") {
+			return uri, "p_associated_uri_tel"
+		}
+		if preferred == "" {
+			preferred = uri
+		}
+	}
+	if preferred != "" {
+		return preferred, "p_associated_uri_sip"
+	}
+	return registered, "registered_public_identity"
 }
 
 // sendSIPMessageWith is the parameterized MESSAGE transaction used by both SMS
 // and USSI. acceptContactTag is the 3gpp feature tag (e.g. "smsip" or "ussd")
 // advertised via Accept-Contact; pass an empty string to omit the header.
+// fromIdentity is the public identity placed in From and P-Preferred-Identity.
 func (session *Session) sendSIPMessageWith(
 	ctx context.Context,
 	target string,
@@ -1187,6 +1223,7 @@ func (session *Session) sendSIPMessageWith(
 	inReplyTo string,
 	contentType string,
 	acceptContactTag string,
+	fromIdentity string,
 ) (*sipResponse, error) {
 	callToken, err := randomHex(18)
 	if err != nil {
@@ -1228,12 +1265,15 @@ func (session *Session) sendSIPMessageWith(
 			lines = append(lines, "Route: "+route)
 		}
 	}
+	if strings.TrimSpace(fromIdentity) == "" {
+		fromIdentity = session.identity.public
+	}
 	lines = append(lines,
-		"From: <"+session.identity.public+">;tag="+session.fromTag,
+		"From: <"+fromIdentity+">;tag="+session.fromTag,
 		"To: <"+target+">",
 		"Call-ID: "+callID,
 		fmt.Sprintf("CSeq: %d MESSAGE", cseq),
-		"P-Preferred-Identity: <"+session.identity.public+">",
+		"P-Preferred-Identity: <"+fromIdentity+">",
 	)
 	if pani := session.pAccessNetworkInfo(); pani != "" {
 		lines = append(lines, "P-Access-Network-Info: "+pani)

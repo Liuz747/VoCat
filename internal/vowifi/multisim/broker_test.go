@@ -57,6 +57,8 @@ type testBackend struct {
 	wrongSwitch     bool
 	authError       error
 	ignoreCancel    bool
+	smscReads       int
+	smscError       error
 }
 
 func newBackend() *testBackend {
@@ -264,5 +266,93 @@ func TestCanceledAuthenticationHoldsReaderUntilBackendReturns(t *testing.T) {
 	}
 	if _, err := b.ReadIdentity(context.Background(), "line-b"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The backend exposes the service-centre address of the profile that is
+// switched in, the same way the single-line EC20 adapter answers AT+CSCA?.
+type smscBackend struct{ *testBackend }
+
+func (b *smscBackend) ReadSMSCenter(_ context.Context, id string) (string, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.smscReads++
+	if id != "physical-reader" {
+		return "", errors.New("logical ID reached physical backend")
+	}
+	if b.smscError != nil {
+		return "", b.smscError
+	}
+	return "+1206313000" + b.active[len(b.active)-1:], nil
+}
+
+func TestProfileAdapterReadsServiceCentreOfItsOwnProfileAndCachesIt(t *testing.T) {
+	backend := &smscBackend{newBackend()}
+	broker, err := NewAuthBroker(BrokerOptions{DeviceID: "physical-reader", Backend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig()
+	a, err := broker.ForProfile(cfg.Profiles[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := broker.ForProfile(cfg.Profiles[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.ReadIdentity(context.Background(), "line-b"); err != nil {
+		t.Fatal(err)
+	}
+	smsc, err := a.ReadSMSCenter(context.Background(), "line-b")
+	if err != nil || smsc != "+12063130002" {
+		t.Fatalf("line B service centre = %q, %v", smsc, err)
+	}
+	switches := backend.switches
+	if smsc, err := a.ReadSMSCenter(context.Background(), "line-b"); err != nil || smsc != "+12063130002" || backend.switches != switches || backend.smscReads != 1 {
+		t.Fatalf("cached read = %q, %v (switches %d→%d, reads %d)", smsc, err, switches, backend.switches, backend.smscReads)
+	}
+	// Reading through a sibling adapter switches the card and reads that
+	// sibling's own address; it must not return the cached value of line B.
+	if smsc, err := b.ReadSMSCenter(context.Background(), "line-a"); err != nil || smsc != "+12063130001" || backend.active != cfg.Profiles[0].ICCID {
+		t.Fatalf("line A service centre = %q, %v (active %s)", smsc, err, backend.active)
+	}
+	plain, err := NewAuthBroker(BrokerOptions{DeviceID: "physical-reader", Backend: newBackend()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := plain.ForProfile(cfg.Profiles[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if smsc, err := c.ReadSMSCenter(context.Background(), "line-a"); err == nil || smsc != "" {
+		t.Fatalf("backend without a service-centre reader answered %q, %v", smsc, err)
+	}
+}
+
+func TestProfileAdapterServiceCentreFailureDoesNotBreakIdentityReads(t *testing.T) {
+	backend := &smscBackend{newBackend()}
+	backend.smscError = errors.New("+CMS ERROR: 302")
+	broker, err := NewAuthBroker(BrokerOptions{DeviceID: "physical-reader", Backend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := broker.ForProfile(testConfig().Profiles[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id, err := a.ReadIdentity(context.Background(), "line-b"); err != nil || id.ICCID != testConfig().Profiles[1].ICCID {
+		t.Fatalf("identity = %+v, %v", id, err)
+	}
+	smsc, readErr := a.ReadSMSCenter(context.Background(), "line-b")
+	if readErr == nil || smsc != "" {
+		t.Fatalf("failed service-centre read answered %q, %v", smsc, readErr)
+	}
+	if strings.Contains(readErr.Error(), "+CMS ERROR") {
+		t.Fatal("raw modem text leaked through the broker")
+	}
+	backend.smscError = nil
+	if smsc, err := a.ReadSMSCenter(context.Background(), "line-b"); err != nil || smsc != "+12063130002" {
+		t.Fatalf("retry after failure = %q, %v", smsc, err)
 	}
 }

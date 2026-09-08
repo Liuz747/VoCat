@@ -953,7 +953,7 @@ func configureVoWiFiRuntime(
 			} else if deviceConfig.DeviceType == store.DeviceTypeWiFi410 {
 				adapter = nativeQMIAdapter
 			}
-			return newVoWiFiOrchestrator(deviceConfig, database, adapter, logger, onIncomingCall)
+			return newVoWiFiOrchestrator(deviceConfig, database, adapter, logger, onIncomingCall, nil)
 		},
 	})
 
@@ -1146,13 +1146,17 @@ func newVoWiFiOrchestrator(
 	adapter vowifiDeviceAdapter,
 	logger *slog.Logger,
 	onIncomingCall func(context.Context, ims.ReceivedCall) error,
-	physicalDeviceIDs ...string,
+	line *multiSIMLineOptions,
 ) (*vowifi.Orchestrator, error) {
 	storageDeviceID := deviceConfig.ID
 	registrationTimeout := time.Duration(0)
-	if len(physicalDeviceIDs) > 0 && physicalDeviceIDs[0] != "" {
-		storageDeviceID = physicalDeviceIDs[0]
+	var admission vowifi.Admission
+	if line != nil && line.physicalDeviceID != "" {
+		storageDeviceID = line.physicalDeviceID
 		registrationTimeout = 30 * time.Second
+		if line.admission != nil {
+			admission = line.admission
+		}
 	}
 	apn := deviceConfig.APN
 	if apn == "" {
@@ -1297,6 +1301,7 @@ func newVoWiFiOrchestrator(
 		DeviceID:               deviceConfig.ID,
 		AllowIMSWithoutSMS:     true,
 		IMSRegistrationTimeout: registrationTimeout,
+		StartupAdmission:       admission,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("device %q VoWiFi orchestrator: %w", deviceConfig.ID, err)

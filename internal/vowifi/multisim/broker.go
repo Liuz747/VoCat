@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"time"
 
 	"vocat/internal/vowifi"
@@ -18,6 +19,10 @@ type AuthBroker struct {
 	// Accessed only while holding transaction. Once learned, IMSI cannot change
 	// during this broker's lifetime, including through another profile adapter.
 	imsis map[string]string
+	// Service-centre addresses by ICCID, learned while the profile is switched
+	// in. Read outside the transaction by ReadSMSCenter, hence the mutex.
+	smscMu sync.Mutex
+	smscs  map[string]string
 }
 
 type ProfileAdapter struct {
@@ -27,6 +32,9 @@ type ProfileAdapter struct {
 
 var _ vowifi.SIMIdentityReader = (*ProfileAdapter)(nil)
 var _ vowifi.PreferredAKAProvider = (*ProfileAdapter)(nil)
+var _ vowifi.SMSCenterReader = (*ProfileAdapter)(nil)
+
+var errSMSCenterUnsupported = errors.New("multisim: reader does not expose the SMS service-centre address")
 
 func NewAuthBroker(options BrokerOptions) (*AuthBroker, error) {
 	if options.DeviceID == "" || options.Backend == nil {
@@ -38,7 +46,7 @@ func NewAuthBroker(options BrokerOptions) (*AuthBroker, error) {
 	if options.Logger == nil {
 		options.Logger = slog.Default()
 	}
-	b := &AuthBroker{options: options, transaction: make(chan struct{}, 1), imsis: make(map[string]string)}
+	b := &AuthBroker{options: options, transaction: make(chan struct{}, 1), imsis: make(map[string]string), smscs: make(map[string]string)}
 	b.transaction <- struct{}{}
 	return b, nil
 }
@@ -56,6 +64,60 @@ func (a *ProfileAdapter) ReadIdentity(ctx context.Context, _ string) (identity v
 		return vowifi.SIMIdentity{}, err
 	}
 	return identity, nil
+}
+
+// ReadSMSCenter answers with this profile's own service-centre address. The
+// address is read from the card while the profile is switched in (normally
+// as a side effect of the identity read that precedes it) and cached for the
+// broker's lifetime, so later submissions never switch the card just for it.
+func (a *ProfileAdapter) ReadSMSCenter(ctx context.Context, _ string) (string, error) {
+	if smsc, ok := a.broker.cachedSMSCenter(a.profile.ICCID); ok {
+		return smsc, nil
+	}
+	if _, ok := a.broker.options.Backend.(vowifi.SMSCenterReader); !ok {
+		return "", errSMSCenterUnsupported
+	}
+	var readErr error
+	err := a.withProfile(ctx, nil, nil, func(ctx context.Context, _ vowifi.SIMIdentity) error {
+		readErr = a.broker.learnSMSCenter(ctx, a.profile.ICCID)
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	if readErr != nil {
+		return "", readErr
+	}
+	smsc, _ := a.broker.cachedSMSCenter(a.profile.ICCID)
+	return smsc, nil
+}
+
+func (b *AuthBroker) cachedSMSCenter(iccid string) (string, bool) {
+	b.smscMu.Lock()
+	defer b.smscMu.Unlock()
+	smsc, ok := b.smscs[iccid]
+	return smsc, ok
+}
+
+// learnSMSCenter must run with the profile switched in and the transaction
+// held. A failure is not cached: the next acquisition simply tries again.
+func (b *AuthBroker) learnSMSCenter(ctx context.Context, iccid string) error {
+	reader, ok := b.options.Backend.(vowifi.SMSCenterReader)
+	if !ok {
+		return errSMSCenterUnsupported
+	}
+	smsc, err := reader.ReadSMSCenter(ctx, b.options.DeviceID)
+	if err != nil {
+		b.options.Logger.Debug("multisim service-centre read failed", "profile_suffix", profileSuffix(iccid), "error_class", safeErrorClass(err))
+		return safeBackendError("read SMS service centre", err)
+	}
+	if smsc == "" {
+		return errors.New("multisim: card reported no SMS service-centre address")
+	}
+	b.smscMu.Lock()
+	b.smscs[iccid] = smsc
+	b.smscMu.Unlock()
+	return nil
 }
 
 func (a *ProfileAdapter) CheckReady(ctx context.Context, expected vowifi.SIMIdentity) (evidence vowifi.AKAEvidence, err error) {
@@ -182,6 +244,13 @@ func (a *ProfileAdapter) withProfile(ctx context.Context, expected *vowifi.SIMId
 	a.broker.imsis[a.profile.ICCID] = live.IMSI
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	// The card is switched in and verified: learn its service-centre address
+	// now so SMS submission later needs no switch of its own.
+	if _, cached := a.broker.cachedSMSCenter(a.profile.ICCID); !cached {
+		if _, ok := backend.(vowifi.SMSCenterReader); ok {
+			_ = a.broker.learnSMSCenter(ctx, a.profile.ICCID)
+		}
 	}
 	if err := operation(ctx, live); err != nil {
 		return err

@@ -1,6 +1,7 @@
 package multisim
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -24,7 +25,7 @@ func TestConfigRejectsAmbiguousProfileSelection(t *testing.T) {
 		{"duplicate ICCID", func(c *Config) { c.Profiles[1].ICCID = c.Profiles[0].ICCID }},
 		{"invalid ICCID", func(c *Config) { c.Profiles[0].ICCID = "89wrong" }},
 		{"invalid AID", func(c *Config) { c.Profiles[0].AID = "no-hex" }},
-		{"one enabled line", func(c *Config) { c.Profiles = c.Profiles[:1] }},
+		{"no enabled line", func(c *Config) { c.Profiles = nil }},
 		{"empty device", func(c *Config) { c.DeviceID = "" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -37,6 +38,21 @@ func TestConfigRejectsAmbiguousProfileSelection(t *testing.T) {
 	}
 	if err := (Config{DeviceID: "reader"}).Validate(); err != nil {
 		t.Fatalf("cannot disable empty group: %v", err)
+	}
+}
+
+func TestConfigAllowsOneLineAndLargeGroups(t *testing.T) {
+	one := testConfig()
+	one.Profiles = one.Profiles[:1]
+	if err := one.Validate(); err != nil {
+		t.Fatalf("single-profile group rejected: %v", err)
+	}
+	large := Config{DeviceID: "reader", Enabled: true}
+	for i := 0; i < 20; i++ {
+		large.Profiles = append(large.Profiles, Profile{ICCID: fmt.Sprintf("89100000000000000%02d", i), AID: "A000000001"})
+	}
+	if err := large.Validate(); err != nil {
+		t.Fatalf("20-profile group rejected: %v", err)
 	}
 }
 

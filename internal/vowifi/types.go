@@ -488,6 +488,17 @@ type Options struct {
 	// IMSRegistrationTimeout bounds one IMS registration attempt (see
 	// defaultIMSRegistrationTimeout). Zero selects the default.
 	IMSRegistrationTimeout time.Duration
+	// StartupAdmission, when set, is acquired for the whole Enable sequence
+	// (identity read through SMS readiness) and released when Enable returns.
+	// Orchestrators sharing one scarce dependency, such as a single physical
+	// UICC reader, use it to bound how many of them set up at the same time.
+	StartupAdmission Admission
+}
+
+// Admission limits concurrent setup sequences. Acquire blocks until a slot is
+// free or ctx ends; the returned release must be called exactly once.
+type Admission interface {
+	Acquire(ctx context.Context) (release func(), err error)
 }
 
 func (options Options) validate() error {

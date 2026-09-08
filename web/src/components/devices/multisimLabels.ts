@@ -29,6 +29,7 @@ export function multiSIMReasonLabel(reason: string | undefined, t: Translate): s
   const reasons: Record<string, string> = {
     sms_ready: t("可接收短信"), ims_registered: t("IMS 已注册"), ipsec_tunnel_ready: t("隧道已建立"),
     epdg_access_ready: t("ePDG 可达"), sim_and_aka_ready: t("SIM 与鉴权就绪"), enable_requested: t("已请求启动"),
+    startup_queued: t("排队等待读卡器"),
     enable_failed: t("建立失败"), runtime_tunnel_failed: t("隧道运行中断"), runtime_ims_failed: t("IMS 会话中断"),
     reconnect_requested: t("已请求重连"), disable_requested: t("已请求停止"), disabled: t("已停止"),
     ims_registered_sms_unavailable: t("IMS 已注册但短信能力未确认"),

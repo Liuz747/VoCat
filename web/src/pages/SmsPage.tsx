@@ -459,7 +459,8 @@ export default function SmsPage() {
     }
     setSending(true);
     try {
-      const result = await sendSms({ deviceId, phone: thread.peer, message: text });
+      // A thread on a multi-tunnel device belongs to one profile; send back through that line.
+      const result = await sendSms({ deviceId, phone: thread.peer, message: text, iccid: thread.iccid || undefined });
       showSmsSendOutcome(result);
       setComposer("");
       scrollToBottomNow();
@@ -486,7 +487,7 @@ export default function SmsPage() {
       }
       setSending(true);
       try {
-        const res = await sendSms({ deviceId: payload.deviceId, phone: payload.phone, message: payload.message });
+        const res = await sendSms({ deviceId: payload.deviceId, phone: payload.phone, message: payload.message, sessionId: payload.sessionId || undefined });
         showSmsSendOutcome(res);
         setNewSmsOpen(false);
         window.setTimeout(() => {

@@ -14,6 +14,7 @@ import (
 	"vocat/internal/device"
 	"vocat/internal/modem"
 	"vocat/internal/store"
+	"vocat/internal/vowifi"
 	"vocat/internal/vowifi/multisim"
 )
 
@@ -25,6 +26,12 @@ type fakeMultiSIMController struct {
 	state       multisim.GroupState
 	reconnected string
 	refreshed   string
+	sendErr     error
+	sendResult  vowifi.SMSSubmitResult
+	sendLine    multisim.LineIdentity
+	sentDevice  string
+	sentLine    string
+	sent        []vowifi.SMSSubmitRequest
 }
 
 func (f *fakeMultiSIMController) Apply(_ context.Context, c multisim.Config) error {
@@ -41,6 +48,19 @@ func (f *fakeMultiSIMController) State(string) multisim.GroupState { return f.st
 func (f *fakeMultiSIMController) Reconnect(_ string, iccid string) error {
 	f.reconnected = iccid
 	return nil
+}
+func (f *fakeMultiSIMController) SendSMS(_ context.Context, deviceID, selector string, request vowifi.SMSSubmitRequest) (vowifi.SMSSubmitResult, multisim.LineIdentity, error) {
+	f.sentDevice, f.sentLine = deviceID, selector
+	f.sent = append(f.sent, request)
+	if f.sendErr != nil {
+		return vowifi.SMSSubmitResult{}, multisim.LineIdentity{}, f.sendErr
+	}
+	result := f.sendResult
+	result.To = request.Recipient
+	if result.SubmittedAt.IsZero() {
+		result.SubmittedAt = time.Now().UTC()
+	}
+	return result, f.sendLine, nil
 }
 
 const multiBody = `{"enabled":true,"profiles":[{"iccid":"8944100000000000001","aid":"A000"},{"iccid":"8944100000000000002","aid":"A000"}]}`

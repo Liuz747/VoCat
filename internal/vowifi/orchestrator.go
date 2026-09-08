@@ -219,6 +219,19 @@ func (orchestrator *Orchestrator) Enable(ctx context.Context) (State, error) {
 		return orchestrator.State(), stageError
 	}
 
+	if admission := orchestrator.options.StartupAdmission; admission != nil {
+		// Queue before touching the shared reader. A group of lines on one
+		// eUICC otherwise piles every identity read and AKA challenge onto the
+		// same card at once and the later ones time out behind the queue.
+		orchestrator.mutate(func(state *State) { state.LastReason = "startup_queued" })
+		release, admitErr := admission.Acquire(setupContext)
+		if admitErr != nil {
+			return fail(PhaseSIMReady, fmt.Errorf("startup admission: %w", admitErr))
+		}
+		defer release()
+		orchestrator.mutate(func(state *State) { state.LastReason = "enable_requested" })
+	}
+
 	if !resources.radioChanged {
 		resources.radio, err = orchestrator.deps.Radio.Snapshot(setupContext, orchestrator.options.DeviceID)
 		if err != nil {

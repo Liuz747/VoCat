@@ -11,6 +11,7 @@ import (
 
 	"vocat/internal/device"
 	"vocat/internal/store"
+	"vocat/internal/vowifi"
 	"vocat/internal/vowifi/multisim"
 )
 
@@ -21,6 +22,9 @@ type MultiSIMController interface {
 	Owns(string) bool
 	State(string) multisim.GroupState
 	Reconnect(string, string) error
+	// SendSMS submits through one line of an owned group, selected by ICCID
+	// or line session ID (empty selects the only line of a one-line group).
+	SendSMS(context.Context, string, string, vowifi.SMSSubmitRequest) (vowifi.SMSSubmitResult, multisim.LineIdentity, error)
 }
 
 func runtimeMultiSIMConfig(v store.MultiSIMConfig) multisim.Config {
@@ -293,8 +297,8 @@ func (s *Server) handleMultiSIM(w http.ResponseWriter, r *http.Request, device s
 		writeError(w, http.StatusConflict, "multisim_unsupported", "首版多隧道仅支持 EC20/EC25 AT 设备")
 		return true
 	}
-	if len(request.Profiles) > 8 || (request.Enabled && len(request.Profiles) < 2) {
-		writeError(w, http.StatusBadRequest, "invalid_multisim", "请选择 2–8 个 eSIM Profile")
+	if request.Enabled && len(request.Profiles) < 1 {
+		writeError(w, http.StatusBadRequest, "invalid_multisim", "请至少选择 1 个 eSIM Profile")
 		return true
 	}
 	seen := map[string]bool{}

@@ -53,6 +53,10 @@ export interface SendSmsPayload {
 	deviceId?: string;
 	phone: string;
 	message: string;
+	/** Multi-tunnel devices keep one IMS session per profile; name the line by ICCID … */
+	iccid?: string;
+	/** … or by its line session id (`multisim-…`, from the device's multisim summary). */
+	sessionId?: string;
 }
 
 export interface SmsSendResult {

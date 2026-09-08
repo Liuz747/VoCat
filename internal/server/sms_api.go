@@ -17,6 +17,7 @@ import (
 	"vocat/internal/device"
 	"vocat/internal/store"
 	"vocat/internal/vowifi"
+	"vocat/internal/vowifi/multisim"
 )
 
 type imsSMSController interface {
@@ -195,9 +196,11 @@ func (s *Server) handleSMSSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request struct {
-		Phone    string `json:"phone"`
-		Message  string `json:"message"`
-		DeviceID string `json:"device_id"`
+		Phone     string `json:"phone"`
+		Message   string `json:"message"`
+		DeviceID  string `json:"device_id"`
+		ICCID     string `json:"iccid"`
+		SessionID string `json:"session_id"`
 	}
 	if err := s.decodeJSON(w, r, &request); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -214,10 +217,6 @@ func (s *Server) handleSMSSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer unlock()
-	if s.multiSIMOwned(r.Context(), request.DeviceID) {
-		writeMultiSIMConflict(w)
-		return
-	}
 	// Validate the logical message before consuming a global send slot. Both
 	// cellular AT and VoWiFi IMS use this same encoder/validator.
 	if _, err := device.PrepareSMSSubmitTPDUs(request.Phone, request.Message); err != nil {
@@ -229,35 +228,18 @@ func (s *Server) handleSMSSend(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreError(w, err)
 		return
 	}
+	if s.multiSIMOwned(r.Context(), request.DeviceID) {
+		// A multi-tunnel group keeps one IMS session per profile; the request
+		// names the line and the submission goes through that session only.
+		selector := firstNonEmpty(strings.TrimSpace(request.ICCID), strings.TrimSpace(request.SessionID))
+		s.handleMultiSIMSMSSend(w, r, config, selector, request.Phone, request.Message)
+		return
+	}
 	entry, physicalID, present := s.physicalForConfig(config)
 	if !s.requirePhysicalDevice(w, present) {
 		return
 	}
-	limit := developer.SMSHourlyLimit(r.Context(), s.store)
-	reservation, err := s.store.ReserveSMSSend(r.Context(), request.DeviceID, limit, time.Now().UTC())
-	if err != nil {
-		s.writeStoreError(w, err)
-		return
-	}
-	if !reservation.Allowed {
-		retryAfter := time.Until(reservation.ResetAt)
-		if retryAfter < time.Second {
-			retryAfter = time.Second
-		}
-		w.Header().Set("Retry-After", strconv.FormatInt(int64((retryAfter+time.Second-1)/time.Second), 10))
-		writeJSON(w, http.StatusTooManyRequests, map[string]any{
-			"error": apiError{
-				Code:    "sms_rate_limited",
-				Message: fmt.Sprintf("Global SMS limit reached: at most %d messages may be submitted in a rolling one-hour window.", reservation.Limit),
-			},
-			"data": map[string]any{
-				"limit":       reservation.Limit,
-				"used":        reservation.Used,
-				"remaining":   reservation.Remaining,
-				"reset_at":    reservation.ResetAt,
-				"retry_after": int64((retryAfter + time.Second - 1) / time.Second),
-			},
-		})
+	if !s.reserveSMSSend(w, r, request.DeviceID) {
 		return
 	}
 	if config.VoWiFiEnabled && s.vowifi != nil {
@@ -269,7 +251,7 @@ func (s *Server) handleSMSSend(w http.ResponseWriter, r *http.Request) {
 				Text:      request.Message,
 			})
 			if sendErr == nil || result.PartsAttempted > 0 || !errors.Is(sendErr, vowifi.ErrSMSNotReady) {
-				s.writeIMSSMSSendResult(w, r, request.DeviceID, request.Message, entry, result, sendErr)
+				s.writeIMSSMSSendResult(w, r, s.singleLineIMSOrigin(r.Context(), config, entry), request.Message, result, sendErr)
 				return
 			}
 		}
@@ -411,15 +393,121 @@ func (s *Server) handleSMSSend(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{"data": data})
 }
 
+// reserveSMSSend consumes one slot of the rolling global SMS limit. It writes
+// the 429 response itself and returns false when the submission must stop.
+func (s *Server) reserveSMSSend(w http.ResponseWriter, r *http.Request, deviceID string) bool {
+	limit := developer.SMSHourlyLimit(r.Context(), s.store)
+	reservation, err := s.store.ReserveSMSSend(r.Context(), deviceID, limit, time.Now().UTC())
+	if err != nil {
+		s.writeStoreError(w, err)
+		return false
+	}
+	if reservation.Allowed {
+		return true
+	}
+	retryAfter := time.Until(reservation.ResetAt)
+	if retryAfter < time.Second {
+		retryAfter = time.Second
+	}
+	w.Header().Set("Retry-After", strconv.FormatInt(int64((retryAfter+time.Second-1)/time.Second), 10))
+	writeJSON(w, http.StatusTooManyRequests, map[string]any{
+		"error": apiError{
+			Code:    "sms_rate_limited",
+			Message: fmt.Sprintf("Global SMS limit reached: at most %d messages may be submitted in a rolling one-hour window.", reservation.Limit),
+		},
+		"data": map[string]any{
+			"limit":       reservation.Limit,
+			"used":        reservation.Used,
+			"remaining":   reservation.Remaining,
+			"reset_at":    reservation.ResetAt,
+			"retry_after": int64((retryAfter + time.Second - 1) / time.Second),
+		},
+	})
+	return false
+}
+
+// handleMultiSIMSMSSend submits through one line of a running multi-tunnel
+// group. There is no AT fallback: the physical modem sits in RF-off airplane
+// mode while the group owns it, so only the line's IMS session can send.
+func (s *Server) handleMultiSIMSMSSend(w http.ResponseWriter, r *http.Request, config store.Device, selector, phone, body string) {
+	if s.multisim == nil {
+		writeMultiSIMConflict(w)
+		return
+	}
+	if !s.reserveSMSSend(w, r, config.ID) {
+		return
+	}
+	result, identity, sendErr := s.multisim.SendSMS(r.Context(), config.ID, selector, vowifi.SMSSubmitRequest{
+		Recipient: phone,
+		Text:      body,
+	})
+	if sendErr != nil && result.PartsAttempted == 0 {
+		switch {
+		case errors.Is(sendErr, multisim.ErrLineRequired):
+			writeError(w, http.StatusConflict, "multisim_line_required", "此设备开启了多隧道，发送时请指定线路（iccid 或 session_id）。")
+			return
+		case errors.Is(sendErr, multisim.ErrNotRegistered):
+			writeError(w, http.StatusConflict, "multisim_line_unavailable", "该号码没有启用多隧道")
+			return
+		case errors.Is(sendErr, multisim.ErrOperationInProgress), errors.Is(sendErr, multisim.ErrClosed):
+			writeMultiSIMConflict(w)
+			return
+		case errors.Is(sendErr, vowifi.ErrSMSNotReady):
+			writeError(w, http.StatusConflict, "multisim_line_not_ready", "该线路的 IMS 短信尚未就绪，请等待线路显示 sms_ready 后再发送。")
+			return
+		}
+	}
+	s.writeIMSSMSSendResult(w, r, s.multiSIMIMSOrigin(r.Context(), config, identity), body, result, sendErr)
+}
+
+// imsSMSOrigin is the subscription an IMS submission is recorded against.
+type imsSMSOrigin struct {
+	DeviceID   string
+	ModemIMEI  string
+	Identity   smsSubscriptionIdentity
+	LocalPhone string
+}
+
+func (s *Server) singleLineIMSOrigin(ctx context.Context, config store.Device, entry device.Device) imsSMSOrigin {
+	identity := smsIdentityFromSnapshot(entry.Snapshot)
+	if s.vowifi != nil {
+		if state, stateErr := s.vowifi.State(config.ID); stateErr == nil {
+			identity.ICCID = strings.TrimSpace(state.ICCID)
+			identity.IMSI = strings.TrimSpace(state.IMSI)
+		}
+	}
+	modemIMEI := firstNonEmpty(
+		snapshotString(entry.Snapshot, func(snapshot *device.Snapshot) string { return snapshot.IMEI }),
+		config.ModemIMEI,
+	)
+	return imsSMSOrigin{
+		DeviceID:   config.ID,
+		ModemIMEI:  modemIMEI,
+		Identity:   identity,
+		LocalPhone: s.smsLocalPhone(ctx, config.ID, identity, entry.Snapshot),
+	}
+}
+
+func (s *Server) multiSIMIMSOrigin(ctx context.Context, config store.Device, line multisim.LineIdentity) imsSMSOrigin {
+	identity := smsSubscriptionIdentity{ICCID: strings.TrimSpace(line.ICCID), IMSI: strings.TrimSpace(line.IMSI)}
+	localPhone := strings.TrimSpace(line.PhoneNumber)
+	if localPhone == "" && identity.ICCID != "" {
+		if number, err := s.store.PhoneNumberForICCID(ctx, identity.ICCID); err == nil {
+			localPhone = number
+		}
+	}
+	return imsSMSOrigin{DeviceID: config.ID, ModemIMEI: config.ModemIMEI, Identity: identity, LocalPhone: localPhone}
+}
+
 func (s *Server) writeIMSSMSSendResult(
 	w http.ResponseWriter,
 	r *http.Request,
-	deviceID string,
+	origin imsSMSOrigin,
 	body string,
-	entry device.Device,
 	result vowifi.SMSSubmitResult,
 	sendErr error,
 ) {
+	deviceID := origin.DeviceID
 	if sendErr != nil && result.PartsAttempted == 0 {
 		if errors.Is(sendErr, device.ErrSMSInvalidRecipient) ||
 			errors.Is(sendErr, device.ErrSMSEmpty) ||
@@ -442,24 +530,13 @@ func (s *Server) writeIMSSMSSendResult(
 		"delivery_confirmed": result.DeliveryConfirmed,
 		"submission_status":  result.SubmissionStatus,
 	})
-	identity := smsIdentityFromSnapshot(entry.Snapshot)
-	if s.vowifi != nil {
-		if state, stateErr := s.vowifi.State(deviceID); stateErr == nil {
-			identity.ICCID = strings.TrimSpace(state.ICCID)
-			identity.IMSI = strings.TrimSpace(state.IMSI)
-		}
-	}
-	modemIMEI := snapshotString(entry.Snapshot, func(snapshot *device.Snapshot) string { return snapshot.IMEI })
-	if config, configErr := s.store.Device(r.Context(), deviceID); configErr == nil {
-		modemIMEI = firstNonEmpty(modemIMEI, config.ModemIMEI)
-	}
 	saved, err := s.store.SaveSMSMessage(r.Context(), store.SMSMessage{
-		MessageID:     fmt.Sprintf("ims-submit:%s:%d", firstNonEmpty(modemIMEI, deviceID), result.SubmittedAt.UnixNano()),
+		MessageID:     fmt.Sprintf("ims-submit:%s:%d", firstNonEmpty(origin.ModemIMEI, deviceID), result.SubmittedAt.UnixNano()),
 		DeviceID:      deviceID,
-		ModemIMEI:     modemIMEI,
-		ICCID:         identity.ICCID,
-		IMSI:          identity.IMSI,
-		LocalPhone:    s.smsLocalPhone(r.Context(), deviceID, identity, entry.Snapshot),
+		ModemIMEI:     origin.ModemIMEI,
+		ICCID:         origin.Identity.ICCID,
+		IMSI:          origin.Identity.IMSI,
+		LocalPhone:    origin.LocalPhone,
 		Peer:          result.To,
 		Direction:     "outbound",
 		Body:          body,
