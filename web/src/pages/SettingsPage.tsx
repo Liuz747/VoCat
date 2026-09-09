@@ -180,9 +180,8 @@ export default function SettingsPage() {
   }, [lang]);
 
   const onSaveDeviceLimit = useCallback(async () => {
-    const maximum = developerSettings?.maxDeviceLimit ?? 10;
-    if (!Number.isInteger(deviceLimit) || deviceLimit < 1 || deviceLimit > maximum) {
-      message.error(lang === "zh" ? `设备配额必须是 1 到 ${maximum} 的整数` : `Device quota must be an integer between 1 and ${maximum}`);
+    if (!Number.isInteger(deviceLimit) || deviceLimit < 0) {
+      message.error(lang === "zh" ? "设备配额必须是 0（不限制）或正整数" : "Device quota must be 0 (unlimited) or a positive integer");
       return;
     }
     setSavingDeveloper(true);

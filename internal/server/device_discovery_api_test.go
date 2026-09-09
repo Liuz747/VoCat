@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -125,5 +126,48 @@ func TestAddDevicePersistsConfigWhenInitialAirplaneModeIsTemporarilyUnavailable(
 	}
 	if config.NetworkEnabled || !config.VoWiFiEnabled || config.USBPath != entry.Candidate.USBPath {
 		t.Fatalf("saved safe config = %+v", config)
+	}
+}
+
+// The default device quota is 0 = unlimited. Adding a module must never be
+// refused with device_limit_reached unless an administrator set a positive
+// quota; the fleet size is bounded by USB topology, not by software.
+func TestHandleDevicesAddIsNotRefusedWhenQuotaIsUnlimited(t *testing.T) {
+	database, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	for i := 0; i < 40; i++ {
+		id := fmt.Sprintf("existing-%d", i)
+		if err := database.UpsertDevice(context.Background(), store.Device{ID: id, Name: id}); err != nil {
+			t.Fatalf("seed device %s: %v", id, err)
+		}
+	}
+	entry := device.Device{
+		ID: "usb-2c7c-0125-2-2", Discovered: true,
+		Candidate: modem.Candidate{
+			ID: "usb-2c7c-0125-2-2", VendorID: "2c7c", ProductID: "0125",
+			Product: "Quectel EC20 / EC25", USBPath: "/sys/bus/usb/devices/2-2",
+			ATPort:     modem.Port{Path: "/dev/ttyUSB2", Name: "ttyUSB2", Role: modem.PortRoleAT},
+			QMIControl: "/dev/cdc-wdm0", NetworkInterface: "wwan0",
+		},
+	}
+	server := &Server{
+		store: database, logger: regionTestLogger(),
+		maxRequestBodyBytes: 4096, devices: fakeDeviceController{entry: entry},
+	}
+	body := `{"config":{"id":"ec20-41","name":"EC20","device_type":"pcie_ec20_ec25","usb_path":"/sys/bus/usb/devices/2-2","at_port":"/dev/ttyUSB2","control_device":"/dev/cdc-wdm0","interface":"wwan0","device_backend":"qmi","esim_transport":"qmi"}}`
+	request := httptest.NewRequest(http.MethodPost, "/api/devices", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	if !server.handleDevices(recorder, request) {
+		t.Fatal("handleDevices returned false")
+	}
+	if strings.Contains(recorder.Body.String(), "device_limit_reached") {
+		t.Fatalf("41st device refused by quota although none is set: %s", recorder.Body.String())
+	}
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
 }

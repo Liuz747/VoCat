@@ -26,8 +26,9 @@ const (
 	EnabledSettingKey     = "developer.enabled"
 	DeviceLimitSettingKey = "developer.device_limit"
 	SMSHourlyLimitKey     = "developer.sms_hourly_limit"
-	DefaultDeviceLimit    = 5
-	MaxDeviceLimit        = 32
+	// 0 means unlimited. Module count is bounded by USB topology and host
+	// resources, not by software; the user runs large EC20 fleets behind hubs.
+	DefaultDeviceLimit    = 0
 	DefaultSMSHourlyLimit = 10
 	MaxSMSHourlyLimit     = 20
 )
@@ -43,18 +44,16 @@ func DeviceLimit(ctx context.Context, database *store.Store, enabled bool) int {
 	var document struct {
 		Limit int `json:"limit"`
 	}
-	if json.Unmarshal(setting.Value, &document) != nil || document.Limit < 1 {
+	if json.Unmarshal(setting.Value, &document) != nil || document.Limit < 0 {
 		return DefaultDeviceLimit
-	}
-	if document.Limit > MaxDeviceLimit {
-		return MaxDeviceLimit
 	}
 	return document.Limit
 }
 
+// SetDeviceLimit stores an optional quota; 0 removes it (unlimited).
 func SetDeviceLimit(ctx context.Context, database *store.Store, limit int) error {
-	if limit < 1 || limit > MaxDeviceLimit {
-		return fmt.Errorf("device limit must be between 1 and %d", MaxDeviceLimit)
+	if limit < 0 {
+		return fmt.Errorf("device limit must be 0 (unlimited) or a positive number")
 	}
 	value, err := json.Marshal(map[string]int{"limit": limit})
 	if err != nil {

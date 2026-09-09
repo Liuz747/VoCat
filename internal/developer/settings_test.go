@@ -77,8 +77,40 @@ func TestSetDeviceLimitValidatesRange(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	if SetDeviceLimit(ctx, database, 0) == nil || SetDeviceLimit(ctx, database, MaxDeviceLimit+1) == nil {
-		t.Fatal("out-of-range device limit was accepted")
+	if SetDeviceLimit(ctx, database, -1) == nil {
+		t.Fatal("negative device limit was accepted")
+	}
+	// There is no upper bound on modules: the user runs fleets of EC20s
+	// behind hubs, and any ceiling here would be an artificial wall.
+	if err := SetDeviceLimit(ctx, database, 500); err != nil {
+		t.Fatalf("large device limit was rejected: %v", err)
+	}
+	if got := DeviceLimit(ctx, database, true); got != 500 {
+		t.Fatalf("device limit = %d, want 500", got)
+	}
+	// 0 means unlimited and is a valid explicit setting.
+	if err := SetDeviceLimit(ctx, database, 0); err != nil {
+		t.Fatalf("unlimited (0) device limit was rejected: %v", err)
+	}
+	if got := DeviceLimit(ctx, database, true); got != 0 {
+		t.Fatalf("device limit = %d, want 0 (unlimited)", got)
+	}
+}
+
+func TestDeviceLimitIsUnlimitedByDefaultRegardlessOfDeveloperMode(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "vocat.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	for _, developerEnabled := range []bool{false, true} {
+		if got := DeviceLimit(ctx, database, developerEnabled); got != 0 {
+			t.Fatalf("developer=%v: default device limit = %d, want 0 (unlimited)", developerEnabled, got)
+		}
+	}
+	if DefaultDeviceLimit != 0 {
+		t.Fatalf("DefaultDeviceLimit = %d, want 0 (unlimited)", DefaultDeviceLimit)
 	}
 }
 
@@ -116,8 +148,8 @@ func TestStoredLimitsAboveHardMaximumAreClamped(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if got := DeviceLimit(ctx, database, true); got != MaxDeviceLimit {
-		t.Fatalf("device limit = %d, want %d", got, MaxDeviceLimit)
+	if got := DeviceLimit(ctx, database, true); got != 99 {
+		t.Fatalf("device limit = %d, want 99 (module count is not clamped)", got)
 	}
 	if got := SMSHourlyLimit(ctx, database); got != MaxSMSHourlyLimit {
 		t.Fatalf("SMS hourly limit = %d, want %d", got, MaxSMSHourlyLimit)

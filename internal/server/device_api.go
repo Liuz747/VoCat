@@ -246,7 +246,7 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) bool {
 			s.writeStoreError(w, err)
 			return true
 		}
-		if len(configured) >= deviceLimit {
+		if deviceLimit > 0 && len(configured) >= deviceLimit {
 			writeError(w, http.StatusConflict, "device_limit_reached", i18n.Tf("设备数量已达上限，最多只能添加 %d 台设备", deviceLimit))
 			return true
 		}

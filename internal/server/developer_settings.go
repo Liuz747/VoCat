@@ -27,7 +27,7 @@ func (s *Server) handleDeveloperSettings(w http.ResponseWriter, r *http.Request)
 			writeError(w, http.StatusBadRequest, "invalid_request", "at least one developer setting is required")
 			return
 		}
-		if request.DeviceLimit != nil && (*request.DeviceLimit < 1 || *request.DeviceLimit > developer.MaxDeviceLimit) {
+		if request.DeviceLimit != nil && *request.DeviceLimit < 0 {
 			writeError(w, http.StatusBadRequest, "invalid_device_limit", "device limit is outside the supported range")
 			return
 		}
@@ -60,7 +60,6 @@ func (s *Server) writeDeveloperSettings(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{
 		"device_limit":             developer.DeviceLimit(r.Context(), s.store, true),
 		"default_device_limit":     developer.DefaultDeviceLimit,
-		"max_device_limit":         developer.MaxDeviceLimit,
 		"sms_hourly_limit":         developer.SMSHourlyLimit(r.Context(), s.store),
 		"default_sms_hourly_limit": developer.DefaultSMSHourlyLimit,
 		"max_sms_hourly_limit":     developer.MaxSMSHourlyLimit,

@@ -31,14 +31,13 @@ export function DeviceQuotaCard({
         </CardIcon>
         <CardTitle
           title={zh ? "设备配额" : "Device quota"}
-          subtitle={zh ? "最多允许配置的设备数量" : "Maximum number of configurable devices"}
+          subtitle={zh ? "可选配额，0 表示不限制" : "Optional quota; 0 means unlimited"}
         />
       </div>
       <div className="relative z-10 space-y-4">
         <Input
           type="number"
-          min={1}
-          max={value?.maxDeviceLimit ?? 10}
+          min={0}
           value={Number.isFinite(limit) ? limit : ""}
           disabled={loading || saving}
           onChange={(event) => onLimitChange(Number(event.target.value))}
@@ -46,8 +45,8 @@ export function DeviceQuotaCard({
         />
         <p className="text-xs text-gray-500 dark:text-gray-400">
           {zh
-            ? `恢复默认配置后会自动恢复为 ${value?.defaultDeviceLimit ?? 5} 台，不会删除已经添加的设备。`
-            : `Restoring the default configuration resets the quota to ${value?.defaultDeviceLimit ?? 5}; existing devices are not deleted.`}
+            ? "默认不限制设备数量；填 0 即不限制。恢复默认配置会清除配额，不会删除已经添加的设备。"
+            : "Unlimited by default; enter 0 for no quota. Restoring the default configuration clears the quota; existing devices are not deleted."}
         </p>
         <Button variant="primary" loading={saving} disabled={loading} onClick={onSave} className="w-full !border-0">
           {zh ? "保存设备配额" : "Save device quota"}
