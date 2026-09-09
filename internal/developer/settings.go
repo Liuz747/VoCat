@@ -27,7 +27,7 @@ const (
 	DeviceLimitSettingKey = "developer.device_limit"
 	SMSHourlyLimitKey     = "developer.sms_hourly_limit"
 	DefaultDeviceLimit    = 5
-	MaxDeviceLimit        = 10
+	MaxDeviceLimit        = 32
 	DefaultSMSHourlyLimit = 10
 	MaxSMSHourlyLimit     = 20
 )

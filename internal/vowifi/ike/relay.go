@@ -129,7 +129,12 @@ func newSessionRelay(
 func (relay *sessionRelay) run() {
 	defer close(relay.done)
 	defer close(relay.esp)
-	buffer := make([]byte, 65535)
+	// Carries ESP (<=~1432 at the 1380 tunnel MTU) and post-handshake IKE
+	// INFORMATIONAL/CREATE_CHILD_SA messages (well under 2 KiB). The IKE_AUTH
+	// handshake uses roundTripFragments, which keeps its own 64 KiB buffer.
+	// 16 KiB leaves an order of magnitude of headroom while saving ~48 KiB of
+	// resident heap per line.
+	buffer := make([]byte, relaySocketReadBuffer)
 	lastKeepalive := time.Now()
 	for {
 		if err := relay.ctx.Err(); err != nil {
@@ -195,6 +200,8 @@ func (relay *sessionRelay) run() {
 var errMismatchedSessionSPIs = errors.New("ike: session packet has mismatched SPIs")
 
 var ErrPeerDeleted = errors.New("ike: peer deleted the active SA")
+const relaySocketReadBuffer = 16384
+
 var ErrRekeyUnsupported = errors.New("ike: peer requested unsupported rekey; session recovery required")
 
 func (relay *sessionRelay) handleIKE(packet []byte) error {

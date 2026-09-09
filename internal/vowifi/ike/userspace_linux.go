@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -19,6 +20,30 @@ import (
 )
 
 const userspaceTunnelMTU = 1380
+
+// Policy rule priorities must stay strictly ahead of the built-in main rule at
+// 32766, which leaves this window. userspace_linux_test.go pins the bounds.
+const (
+	userspaceRulePriorityBase = 10000
+	userspaceRulePrioritySpan = 20000
+)
+
+// Reading `ip rule show` and running `ip rule add` is not atomic, so two lines
+// installing at the same time can pick the same free slot. Hold this across both
+// so the kernel's rule table stays the single source of truth; nothing is cached
+// and so nothing leaks when a line goes away.
+var rulePriorityInstall sync.Mutex
+
+// Per-line data-plane buffers. The tunnel MTU is 1380, so an inner packet is
+// at most 1380 bytes and an ESP-wrapped packet at most ~1432 (SPI+seq+IV+pad+
+// ICV). These were 65535 each, which cost ~128 KiB of permanently resident
+// heap per line for no benefit. The margins below are >2x the largest packet
+// the negotiated MTU can produce; ReceiveESP returns io.ErrShortBuffer rather
+// than truncating, so an undersized buffer would fail loudly, never silently.
+const (
+	userspaceTUNReadBuffer = 4096
+	userspaceESPReadBuffer = 8192
+)
 
 const userspaceTunnelPollInterval = 100 * time.Millisecond
 
@@ -401,6 +426,44 @@ func (handle *linuxUserspaceHandle) cleanupOpenWrtFirewall(ctx context.Context) 
 	return errors.Join(errs...)
 }
 
+// installSourceRule picks the first free rule priority at or after the
+// SPI-derived one and installs the rule while holding rulePriorityInstall, so
+// two lines racing on the same slot cannot both win. Returns the priority used.
+func (handle *linuxUserspaceHandle) installSourceRule(
+	ctx context.Context,
+	family string,
+	preferred uint32,
+	localPrefix string,
+	tableValue string,
+) (string, error) {
+	rulePriorityInstall.Lock()
+	defer rulePriorityInstall.Unlock()
+	chosen, err := handle.reserveRulePriority(ctx, family, preferred)
+	if err != nil {
+		return "", err
+	}
+	priorityValue := strconv.FormatUint(uint64(chosen), 10)
+	if chosen != preferred {
+		slog.Default().Info(
+			"policy rule priority taken, using next free slot",
+			"category", "vowifi",
+			"family", family,
+			"preferred", preferred,
+			"chosen", chosen,
+		)
+	}
+	ruleArguments := []string{
+		family, "rule", "add",
+		"priority", priorityValue,
+		"from", localPrefix,
+		"lookup", tableValue,
+	}
+	if err := handle.run(ctx, "install fail-closed source rule", ruleArguments...); err != nil {
+		return "", err
+	}
+	return priorityValue, nil
+}
+
 func (handle *linuxUserspaceHandle) configureFamily(
 	ctx context.Context,
 	family string,
@@ -414,23 +477,12 @@ func (handle *linuxUserspaceHandle) configureFamily(
 		return nil
 	}
 	tableValue := strconv.FormatUint(uint64(table), 10)
-	priorityValue := strconv.FormatUint(uint64(priority), 10)
 	localPrefix := fmt.Sprintf("%s/%d", local.String(), bits)
-	if err := handle.requireUnusedRoutingSlot(
-		ctx,
-		family,
-		tableValue,
-		priorityValue,
-	); err != nil {
+	if err := handle.requireUnusedRoutingTable(ctx, family, tableValue); err != nil {
 		return err
 	}
-	ruleArguments := []string{
-		family, "rule", "add",
-		"priority", priorityValue,
-		"from", localPrefix,
-		"lookup", tableValue,
-	}
-	if err := handle.run(ctx, "install fail-closed source rule", ruleArguments...); err != nil {
+	priorityValue, err := handle.installSourceRule(ctx, family, priority, localPrefix, tableValue)
+	if err != nil {
 		return err
 	}
 	handle.recordCleanup(
@@ -490,15 +542,74 @@ func userspaceRoutingIdentifiers(spi uint32) (table uint32, priority uint32) {
 	// used directly as the priority would usually run too late and leak the
 	// inner source through the host's default route. Keep a SPI-derived slot
 	// strictly ahead of main; requireUnusedRoutingSlot rejects collisions.
-	priority = 10000 + spi%20000
+	priority = userspaceRulePriorityBase + spi%userspaceRulePrioritySpan
 	return table, priority
 }
 
-func (handle *linuxUserspaceHandle) requireUnusedRoutingSlot(
+// The rule priority window is narrow (it must stay ahead of main/32766), so a
+// SPI-derived slot collides by the birthday bound long before the host runs out
+// of room: ~15% at 80 concurrent lines, ~63% at 200. A collision used to fail
+// the whole session install. reserveRulePriority instead treats the SPI-derived
+// value as a starting point and walks forward to the first free slot, so N lines
+// only fail once the window is genuinely exhausted.
+func (handle *linuxUserspaceHandle) reserveRulePriority(
+	ctx context.Context,
+	family string,
+	preferred uint32,
+) (uint32, error) {
+	used, err := handle.usedRulePriorities(ctx, family)
+	if err != nil {
+		return 0, err
+	}
+	offset := (preferred - userspaceRulePriorityBase) % userspaceRulePrioritySpan
+	for step := uint32(0); step < userspaceRulePrioritySpan; step++ {
+		candidate := userspaceRulePriorityBase + (offset+step)%userspaceRulePrioritySpan
+		if !used[candidate] {
+			return candidate, nil
+		}
+	}
+	return 0, fmt.Errorf(
+		"ike: no free policy rule priority in [%d,%d)",
+		userspaceRulePriorityBase,
+		userspaceRulePriorityBase+userspaceRulePrioritySpan,
+	)
+}
+
+// usedRulePriorities lists the policy rule priorities currently installed on the
+// host for one address family, including rules left behind by other processes.
+func (handle *linuxUserspaceHandle) usedRulePriorities(
+	ctx context.Context,
+	family string,
+) (map[uint32]bool, error) {
+	ruleCommand := exec.CommandContext(ctx, handle.ipCommand, family, "rule", "show")
+	ruleOutput, err := ruleCommand.CombinedOutput()
+	if err != nil {
+		message := strings.TrimSpace(string(ruleOutput))
+		if message == "" {
+			message = err.Error()
+		}
+		return nil, fmt.Errorf("ike: inspect policy rules: %s", message)
+	}
+	used := make(map[uint32]bool)
+	for _, line := range strings.Split(string(ruleOutput), "\n") {
+		trimmed := strings.TrimSpace(line)
+		index := strings.Index(trimmed, ":")
+		if index <= 0 {
+			continue
+		}
+		value, err := strconv.ParseUint(trimmed[:index], 10, 32)
+		if err != nil {
+			continue
+		}
+		used[uint32(value)] = true
+	}
+	return used, nil
+}
+
+func (handle *linuxUserspaceHandle) requireUnusedRoutingTable(
 	ctx context.Context,
 	family string,
 	table string,
-	priority string,
 ) error {
 	routeCommand := exec.CommandContext(
 		ctx,
@@ -536,12 +647,9 @@ func (handle *linuxUserspaceHandle) requireUnusedRoutingSlot(
 		}
 		return fmt.Errorf("ike: inspect policy rules: %s", message)
 	}
-	prefix := priority + ":"
 	for _, line := range strings.Split(string(ruleOutput), "\n") {
-		fields := strings.Fields(line)
-		if strings.HasPrefix(strings.TrimSpace(line), prefix) ||
-			containsAdjacentFields(fields, "lookup", table) {
-			return fmt.Errorf("ike: policy rule priority %s is already in use", priority)
+		if containsAdjacentFields(strings.Fields(line), "lookup", table) {
+			return fmt.Errorf("ike: routing table %s is already in use", table)
 		}
 	}
 	return nil
@@ -624,7 +732,7 @@ func (handle *linuxUserspaceHandle) recordCleanup(operation string, arguments ..
 
 func (handle *linuxUserspaceHandle) copyTUNToRelay() {
 	defer handle.wait.Done()
-	buffer := make([]byte, 65535)
+	buffer := make([]byte, userspaceTUNReadBuffer)
 	for {
 		count, err := readTUNPacket(handle.runContext, handle.tunFD, buffer)
 		if err != nil {
@@ -655,7 +763,7 @@ func (handle *linuxUserspaceHandle) copyTUNToRelay() {
 
 func (handle *linuxUserspaceHandle) copyRelayToTUN() {
 	defer handle.wait.Done()
-	buffer := make([]byte, 65535)
+	buffer := make([]byte, userspaceESPReadBuffer)
 	for {
 		count, err := handle.relay.ReceiveESP(handle.runContext, buffer)
 		if err != nil {
