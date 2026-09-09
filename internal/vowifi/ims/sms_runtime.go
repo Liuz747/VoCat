@@ -128,6 +128,10 @@ func (session *Session) startRuntimeReceivers() error {
 		session.receiveDone.Add(1)
 		go session.readProtectedUDP()
 	}
+	// The registration-state subscription needs the inbound path to be live
+	// before the first NOTIFY can arrive, so it starts last and in the
+	// background (TS 24.229 5.1.1.3).
+	session.startRegEventSubscription()
 	return nil
 }
 
@@ -205,9 +209,14 @@ func (session *Session) readInboundTCP(connection net.Conn) {
 	}
 }
 
+const protectedUDPReadBuffer = 16384
+
 func (session *Session) readProtectedUDP() {
 	defer session.receiveDone.Done()
-	buffer := make([]byte, 65535)
+	// A SIP MESSAGE carrying an SMS plus a full IMS header set stays well under
+	// 16 KiB. Unlike the ESP path a UDP read truncates silently, so this keeps a
+	// large margin; it still saves ~48 KiB of resident heap per line.
+	buffer := make([]byte, protectedUDPReadBuffer)
 	for {
 		count, remote, err := session.protectedUDP.ReadFromUDP(buffer)
 		if err != nil {
@@ -419,6 +428,9 @@ func (session *Session) handleSIPRequest(request *sipRequest, respond func([]byt
 	ussiMessage := false
 	switch request.Method {
 	case "OPTIONS":
+	case "NOTIFY":
+		// Answering 405 here would reject the registration-state notifications
+		// this UE subscribes to; RFC 6665 wants a 200 before the body is acted on.
 	case "MESSAGE":
 		switch {
 		case supportsSMSContentType(request.value("Content-Type")):
@@ -438,6 +450,10 @@ func (session *Session) handleSIPRequest(request *sipRequest, respond func([]byt
 	} else if err = respond(response); err != nil {
 		session.logInboundSMS(slog.LevelWarn, "IMS inbound SIP request response failed", request,
 			"stage", "sip_response_send", "sip_status", status, "error", err)
+	}
+	if request.Method == "NOTIFY" && status == 200 {
+		session.handleRegEventNotify(request)
+		return
 	}
 	if status != 200 || request.Method != "MESSAGE" {
 		if request.Method == "MESSAGE" {

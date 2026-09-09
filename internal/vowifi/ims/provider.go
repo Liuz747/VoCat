@@ -65,8 +65,15 @@ type Config struct {
 	// registered, so the retry only delayed the recovery. Kept because it is
 	// the standards-sanctioned move (TS 33.203 §7.3.1.4) and networks differ.
 	RetryLostRegistration bool
-	ProtectedClientPort   int
-	ProtectedServerPort   int
+	// SubscribeRegistrationEvents subscribes to the registration-state event
+	// package after registering, as TS 24.229 subclause 5.1.1.3 requires. The
+	// NOTIFYs are the only standard way to learn that a binding died between
+	// refreshes, which on a 3600 s expiry is otherwise a 48-minute blind spot.
+	// Off by default so existing callers and fixtures keep their exact SIP
+	// footprint, and so it can be switched off in the field without a rollback.
+	SubscribeRegistrationEvents bool
+	ProtectedClientPort         int
+	ProtectedServerPort         int
 	// SMSCenter is an operator-provided fallback when the SIM leaves EF_SMSP
 	// and AT+CSCA empty. It must be an international or national digit string.
 	SMSCenter string
@@ -710,34 +717,37 @@ type Session struct {
 	initialEndpoint  pcscfEndpoint
 	securityDeclined bool
 
-	callID             string
-	fromTag            string
-	instanceID         string
-	lastRegister       []byte
-	deregisterAll      bool
-	pani               string
-	paniResolved       bool
-	cseq               uint32
-	auth               *authenticationState
-	securityProposal   securityProposal
-	securityAgreement  securityAgreement
-	securityActive     bool
-	ipsecHandle        IPSecSAHandle
-	protectedTCP       *net.TCPListener
-	protectedUDP       *net.UDPConn
-	failures           chan error
-	failureOnce        sync.Once
-	writeMu            sipWriteMutex
-	transactionsMu     sync.Mutex
-	transactions       map[sipTransactionKey]chan *sipResponse
-	runtimeStarted     bool
-	receiveDone        sync.WaitGroup
-	inboundMu          sync.Mutex
-	inboundConnections map[net.Conn]struct{}
-	smsMu              sync.Mutex
-	nextRPReference    byte
-	callMu             sync.Mutex
-	calls              map[string]*imsCall
+	callID               string
+	fromTag              string
+	instanceID           string
+	lastRegister         []byte
+	deregisterAll        bool
+	pani                 string
+	paniResolved         bool
+	cseq                 uint32
+	auth                 *authenticationState
+	securityProposal     securityProposal
+	securityAgreement    securityAgreement
+	securityActive       bool
+	keepAliveObserved    bool
+	regEventSubscribed   bool
+	registrarKeepSeconds int
+	ipsecHandle          IPSecSAHandle
+	protectedTCP         *net.TCPListener
+	protectedUDP         *net.UDPConn
+	failures             chan error
+	failureOnce          sync.Once
+	writeMu              sipWriteMutex
+	transactionsMu       sync.Mutex
+	transactions         map[sipTransactionKey]chan *sipResponse
+	runtimeStarted       bool
+	receiveDone          sync.WaitGroup
+	inboundMu            sync.Mutex
+	inboundConnections   map[net.Conn]struct{}
+	smsMu                sync.Mutex
+	nextRPReference      byte
+	callMu               sync.Mutex
+	calls                map[string]*imsCall
 
 	// registrationGate serializes the full REGISTER and evidence commit. It is
 	// separate from mu so AKA and network waits never hold up inbound RP-ACK.
@@ -1171,6 +1181,15 @@ func (session *Session) registrationSecurity(response *sipResponse) (securityAgr
 	}
 	values := response.values("Security-Server")
 	if len(splitHeaderValues(values)) == 0 {
+		if session.securityActive {
+			// A re-challenge without Security-Server (TS 24.229 §5.1.1.5.1;
+			// what T-Mobile's P-CSCF sends every few refreshes) keeps the
+			// established IPsec association and only wants a fresh AKA
+			// response over it. Nothing to negotiate: answer on the current
+			// protected transport. Treating this as a missing agreement used
+			// to tear the whole line down on every re-challenge.
+			return securityAgreement{}, false, nil
+		}
 		if session.provider.config.SecurityMode == SecurityRequired {
 			return securityAgreement{}, false, ErrIPSecAgreementRequired
 		}
@@ -1247,7 +1266,10 @@ func (session *Session) buildRegister(
 
 	lines := []string{
 		"REGISTER " + requestURI + " SIP/2.0",
-		fmt.Sprintf("Via: SIP/2.0/%s %s;branch=z9hG4bK%s;rport", transportUpper, local, branch),
+		// The valueless "keep" advertises that this UE is willing to send
+		// RFC 5626 keep-alives; TS 24.229 5.1.1.2.1 d). The registrar answers
+		// with a period only when it wants them.
+		fmt.Sprintf("Via: SIP/2.0/%s %s;branch=z9hG4bK%s;rport;keep", transportUpper, local, branch),
 		"Max-Forwards: 70",
 		"Route: <" + routeURI + ">",
 		"From: <" + session.identity.public + ">;tag=" + session.fromTag,
@@ -1668,6 +1690,7 @@ func (session *Session) exchange(ctx context.Context, request []byte, cseq uint3
 }
 
 func (session *Session) applyRegistrationEvidence(response *sipResponse) error {
+	session.observeRegistrarKeepAlive(response)
 	if session.provider.config.SecurityMode == SecurityRequired && !session.securityActive {
 		session.evidence.Registered = false
 		session.evidence.RegistrationState = "security_failed"

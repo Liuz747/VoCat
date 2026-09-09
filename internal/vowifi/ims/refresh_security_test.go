@@ -6,9 +6,10 @@ import (
 	"time"
 )
 
-// Optional security may decline during initial negotiation, but doing so
-// during reauthentication would close listeners used by live SMS receivers.
-func TestRuntimeSecurityDowngradeLeavesLiveTransportIntact(t *testing.T) {
+// Optional security may decline during initial negotiation, but a
+// re-challenge without Security-Server during reauthentication must keep the
+// live association (and the listeners used by live SMS receivers) untouched.
+func TestRuntimeRechallengeLeavesLiveTransportIntact(t *testing.T) {
 	tcp, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
 	if err != nil {
 		t.Fatal(err)
@@ -24,10 +25,10 @@ func TestRuntimeSecurityDowngradeLeavesLiveTransportIntact(t *testing.T) {
 		runtimeStarted: true, securityActive: true, protectedTCP: tcp, protectedUDP: udp,
 		securityProposal: securityProposal{spiClient: 1001, spiServer: 1002, portClient: 40666, portServer: 55610},
 	}
-	if _, _, err := session.registrationSecurity(&sipResponse{StatusCode: 401}); err == nil {
-		t.Fatal("runtime security downgrade was accepted instead of requiring a new session")
+	if _, use, err := session.registrationSecurity(&sipResponse{StatusCode: 401}); err != nil || use {
+		t.Fatalf("re-challenge without Security-Server must keep the current association: use=%v err=%v", use, err)
 	}
-	if session.securityDeclined || session.protectedTCP != tcp || session.protectedUDP != udp || session.securityProposal.spiClient != 1001 {
+	if !session.securityActive || session.securityDeclined || session.protectedTCP != tcp || session.protectedUDP != udp || session.securityProposal.spiClient != 1001 {
 		t.Fatal("failed reauthentication mutated the live security transport")
 	}
 	if err := tcp.SetDeadline(time.Now().Add(time.Second)); err != nil {
@@ -60,5 +61,28 @@ func TestProtectedRefreshParsesOfferWithoutReplacingCurrentAgreement(t *testing.
 	session.securityActive = false
 	if _, _, err := session.registrationSecurity(packet.Response); err == nil {
 		t.Fatal("runtime activation accepted without rebuilding its receivers")
+	}
+}
+
+// T-Mobile re-challenges a protected refresh REGISTER with a 401 that carries
+// no Security-Server header: the registrar keeps the existing IPsec
+// association and only wants a fresh AKA response over it. Treating that as
+// a missing security agreement tore the whole line down every time.
+func TestProtectedRechallengeWithoutSecurityServerKeepsCurrentAssociation(t *testing.T) {
+	session := &Session{
+		provider:       &Provider{config: Config{SecurityMode: SecurityRequired}},
+		runtimeStarted: true, securityActive: true,
+		securityProposal:  securityProposal{spiClient: 1001, spiServer: 1002, portClient: 40666, portServer: 55610},
+		securityAgreement: securityAgreement{verifyValue: "existing-agreement"},
+	}
+	agreement, use, err := session.registrationSecurity(&sipResponse{StatusCode: 401})
+	if err != nil {
+		t.Fatalf("re-challenge without Security-Server must reuse the current association, got %v", err)
+	}
+	if use || agreement.selected.spiClient != 0 {
+		t.Fatalf("re-challenge without Security-Server must not install a new agreement: use=%v spi=%d", use, agreement.selected.spiClient)
+	}
+	if !session.securityActive || session.securityDeclined || session.securityAgreement.verifyValue != "existing-agreement" {
+		t.Fatal("re-challenge mutated the live security association")
 	}
 }
