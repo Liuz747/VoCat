@@ -1182,7 +1182,11 @@ func newVoWiFiOrchestrator(
 		// succeed answers in well under a second on this network; the default
 		// 12 s only ever delayed the recovery.
 		TransactionTimeout: 4 * time.Second,
-		OnIncomingCall:     onIncomingCall,
+		// TS 24.229 5.1.1.3. The NOTIFYs tell us a binding is gone the moment
+		// the network drops it, instead of at the next refresh up to 48 minutes
+		// later, and cost no card time and no SMS.
+		SubscribeRegistrationEvents: true,
+		OnIncomingCall:              onIncomingCall,
 		OnSMS: func(ctx context.Context, message ims.ReceivedSMS) error {
 			message = physicalIMSSMS(message, storageDeviceID)
 			localPhone, _ := database.PhoneNumberForICCID(ctx, message.ICCID)

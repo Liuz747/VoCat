@@ -23,6 +23,10 @@ type AuthBroker struct {
 	// in. Read outside the transaction by ReadSMSCenter, hence the mutex.
 	smscMu sync.Mutex
 	smscs  map[string]string
+	// card records when the physical card last answered. Receiving SMS needs
+	// no card, so without this a dead reader stays invisible until the next
+	// authentication, hours away, and then takes every line on it down at once.
+	card cardHealthState
 }
 
 type ProfileAdapter struct {
@@ -242,6 +246,9 @@ func (a *ProfileAdapter) withProfile(ctx context.Context, expected *vowifi.SIMId
 		return ErrIdentityMismatch
 	}
 	a.broker.imsis[a.profile.ICCID] = live.IMSI
+	// The card just answered with the identity we expected: that is the
+	// strongest possible liveness evidence and it costs nothing to record.
+	a.broker.card.succeed(active)
 	if err := ctx.Err(); err != nil {
 		return err
 	}

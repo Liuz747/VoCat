@@ -69,7 +69,7 @@ func newProbeBroker(t *testing.T, backend *probeBackend) *AuthBroker {
 }
 
 func TestProbeCardRecordsLiveness(t *testing.T) {
-	backend := &probeBackend{iccid: "8901240527185779025"}
+	backend := &probeBackend{iccid: "8988211000000000042"}
 	broker := newProbeBroker(t, backend)
 
 	if health := broker.CardHealth(); !health.VerifiedAt.IsZero() {
@@ -93,7 +93,7 @@ func TestProbeCardRecordsLiveness(t *testing.T) {
 // alive inside the staleness window. At 60 modems this is the difference
 // between a background trickle and a steady stream of reader contention.
 func TestProbeCardSkipsWhenRecentlyVerified(t *testing.T) {
-	backend := &probeBackend{iccid: "8901240527185779025"}
+	backend := &probeBackend{iccid: "8988211000000000042"}
 	broker := newProbeBroker(t, backend)
 
 	if _, err := broker.ProbeCard(context.Background(), time.Minute); err != nil {
@@ -115,7 +115,7 @@ func TestProbeCardSkipsWhenRecentlyVerified(t *testing.T) {
 }
 
 func TestProbeCardRecordsFailureWithoutLosingTheLastGoodTime(t *testing.T) {
-	backend := &probeBackend{iccid: "8901240527185779025"}
+	backend := &probeBackend{iccid: "8988211000000000042"}
 	broker := newProbeBroker(t, backend)
 	if _, err := broker.ProbeCard(context.Background(), time.Nanosecond); err != nil {
 		t.Fatal(err)
@@ -147,7 +147,7 @@ func TestProbeCardRecordsFailureWithoutLosingTheLastGoodTime(t *testing.T) {
 // The probe shares the broker's transaction token, so it can never run while a
 // profile switch or an authentication holds the reader.
 func TestProbeCardWaitsForTheTransactionToken(t *testing.T) {
-	backend := &probeBackend{iccid: "8901240527185779025"}
+	backend := &probeBackend{iccid: "8988211000000000042"}
 	broker := newProbeBroker(t, backend)
 
 	<-broker.transaction // hold the reader as an authentication would

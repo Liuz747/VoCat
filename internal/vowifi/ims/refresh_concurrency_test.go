@@ -262,6 +262,13 @@ func serveRefreshConcurrency(listener *net.UDPConn, held chan<- refreshTestReque
 				return err
 			}
 			acknowledged <- sipTransactionKey{callID: request.value("Call-ID"), cseq: cseq, method: method}
+		case "SUBSCRIBE":
+			// TS 24.229 5.1.1.3 has the UE subscribe to the reg event package
+			// after registering. A real registrar answers 200; these fixtures
+			// only care that it never disturbs the registration or RP-ACK work.
+			if _, err := listener.WriteToUDP(testResponse(200, "OK", request.value("Call-ID"), request.value("CSeq"), []string{"Expires: 600000"}), remote); err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("unexpected SIP method %s", method)
 		}

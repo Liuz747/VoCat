@@ -56,6 +56,9 @@ type multiSIMReader struct {
 	radioSaved       bool
 	resumeUSSD       func()
 	singleMaintained bool
+	// watchCancel stops the background card-liveness probe when the group
+	// releases the reader.
+	watchCancel context.CancelFunc
 }
 
 func (bridge *multiSIMIntegration) rejectReaderAliases(ctx context.Context, configuredID, physicalID string) error {
@@ -226,7 +229,8 @@ func newMultiSIMIntegration(database *store.Store, devices *device.Manager, sing
 		// 20-profile group needs several minutes of reader time in total.
 		OperationTimeout: 6 * time.Minute, CleanupTimeout: 60 * time.Second,
 		RetryInitial: 5 * time.Second, RetryMaximum: 2 * time.Minute,
-		Prepare: bridge.prepare, Restore: bridge.restore, Factory: bridge.factory})
+		CardHealth: bridge.cardHealth,
+		Prepare:    bridge.prepare, Restore: bridge.restore, Factory: bridge.factory})
 	return bridge, manager
 }
 
@@ -334,6 +338,14 @@ func (bridge *multiSIMIntegration) prepare(ctx context.Context, config multisim.
 	}
 	reader.broker, err = multisim.NewAuthBroker(multisim.BrokerOptions{DeviceID: config.DeviceID, Backend: reader.backend, RequestTimeout: 30 * time.Second, Logger: bridge.logger.With("category", "multisim", "device_id", config.DeviceID)})
 	reader.gate = multisim.NewStartupGate(multiSIMStartupConcurrency)
+	if err == nil {
+		// A group-owned modem is skipped by the snapshot poller, so nothing
+		// else would notice the card dying until a line needed an
+		// authentication hours later.
+		watchCtx, cancel := context.WithCancel(context.Background())
+		reader.watchCancel = cancel
+		go reader.broker.WatchCard(watchCtx, multisim.CardProbeInterval)
+	}
 	return err
 }
 
@@ -398,6 +410,9 @@ func (bridge *multiSIMIntegration) restore(ctx context.Context, config multisim.
 		reader.resumeUSSD = nil
 	}
 	bridge.mu.Lock()
+	if reader != nil && reader.watchCancel != nil {
+		reader.watchCancel()
+	}
 	delete(bridge.readers, config.DeviceID)
 	bridge.mu.Unlock()
 	return nil
@@ -583,4 +598,16 @@ func (bridge *multiSIMIntegration) lineDeviceConfig(ctx context.Context, deviceI
 		config.APN = policy.APN
 	}
 	return config, nil
+}
+
+// cardHealth reports the shared reader's liveness for a device, or the zero
+// value when no group owns it.
+func (bridge *multiSIMIntegration) cardHealth(deviceID string) multisim.CardHealth {
+	bridge.mu.Lock()
+	reader := bridge.readers[deviceID]
+	bridge.mu.Unlock()
+	if reader == nil || reader.broker == nil {
+		return multisim.CardHealth{}
+	}
+	return reader.broker.CardHealth()
 }

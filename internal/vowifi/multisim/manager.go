@@ -156,6 +156,12 @@ func (m *Manager) State(deviceID string) GroupState {
 			state.UpdatedAt = snapshot.UpdatedAt
 		}
 	}
+	if m.options.CardHealth != nil {
+		health := m.options.CardHealth(deviceID)
+		state.CardVerifiedAt = health.VerifiedAt
+		state.CardError = health.LastError
+		state.CardActiveICCID = health.ActiveICCID
+	}
 	return state
 }
 

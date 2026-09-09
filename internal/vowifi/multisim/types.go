@@ -113,6 +113,13 @@ type GroupState struct {
 	LastError string      `json:"last_error,omitempty"`
 	Lines     []LineState `json:"lines"`
 	UpdatedAt time.Time   `json:"updated_at"`
+	// Card liveness for the shared reader. Receiving SMS needs no card, so a
+	// dead reader is invisible in the line states above until something needs
+	// an authentication; these fields are the only warning before every line
+	// on this card fails at once.
+	CardVerifiedAt  time.Time `json:"card_verified_at,omitempty"`
+	CardError       string    `json:"card_error,omitempty"`
+	CardActiveICCID string    `json:"card_active_iccid,omitempty"`
 }
 
 type Options struct {
@@ -121,9 +128,12 @@ type Options struct {
 	CleanupTimeout   time.Duration
 	RetryInitial     time.Duration
 	RetryMaximum     time.Duration
-	Prepare          func(context.Context, Config) error
-	Restore          func(context.Context, Config) error
-	Factory          func(context.Context, Config, Profile, string) (*vowifi.Orchestrator, error)
+	// CardHealth reports the physical reader's liveness for a device. Optional:
+	// without it the group state simply carries no card fields.
+	CardHealth func(string) CardHealth
+	Prepare    func(context.Context, Config) error
+	Restore    func(context.Context, Config) error
+	Factory    func(context.Context, Config, Profile, string) (*vowifi.Orchestrator, error)
 }
 
 // AuthBackend addresses exactly one physical reader. Its own APDU lock must be

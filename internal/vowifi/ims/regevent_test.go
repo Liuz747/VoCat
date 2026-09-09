@@ -10,9 +10,9 @@ import "testing"
 func TestParseRegInfo(t *testing.T) {
 	active := []byte(`<?xml version="1.0" encoding="UTF-8"?>
 <reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="1" state="full">
-  <registration aor="sip:+18602628552@ims.mnc240.mcc310.3gppnetwork.org" id="a7" state="active">
+  <registration aor="sip:+15550100042@ims.mnc240.mcc310.3gppnetwork.org" id="a7" state="active">
     <contact id="76" state="active" event="registered">
-      <uri>sip:+18602628552@10.20.30.40:5060</uri>
+      <uri>sip:+15550100042@10.20.30.40:5060</uri>
     </contact>
   </registration>
 </reginfo>`)
@@ -33,7 +33,7 @@ func TestParseRegInfo(t *testing.T) {
 	if doc[0].Contacts[0].Event != "registered" || doc[0].Contacts[0].State != "active" {
 		t.Fatalf("contact = %+v", doc[0].Contacts[0])
 	}
-	if doc[0].Contacts[0].URI != "sip:+18602628552@10.20.30.40:5060" {
+	if doc[0].Contacts[0].URI != "sip:+15550100042@10.20.30.40:5060" {
 		t.Fatalf("contact uri = %q", doc[0].Contacts[0].URI)
 	}
 }

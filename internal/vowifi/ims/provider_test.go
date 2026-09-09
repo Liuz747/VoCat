@@ -373,6 +373,19 @@ func serveRegistration(listener *net.UDPConn, nonce string, confirmSMS bool) err
 		if err != nil {
 			return err
 		}
+		if strings.HasPrefix(startLine, "SUBSCRIBE ") {
+			// TS 24.229 5.1.1.3: the UE subscribes to the reg event package
+			// once it is registered. Answer it and keep counting registrations,
+			// the same way a real registrar would.
+			if _, err := listener.WriteToUDP(
+				testResponse(200, "OK", headers["call-id"], headers["cseq"], []string{"Expires: 600000"}),
+				remote,
+			); err != nil {
+				return err
+			}
+			step--
+			continue
+		}
 		if !strings.HasPrefix(startLine, "REGISTER sip:ims.mnc001.mcc001.3gppnetwork.org SIP/2.0") {
 			return fmt.Errorf("unexpected start line %q", startLine)
 		}
