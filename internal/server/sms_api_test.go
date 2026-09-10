@@ -669,3 +669,246 @@ func TestHandleSMSSendMultiSIMCountsAgainstGlobalHourlyLimit(t *testing.T) {
 		t.Fatal("a rate-limited request reached the multisim line")
 	}
 }
+
+func saveTestInboundSMS(t *testing.T, database *store.Store, direction string, body string, extra string) store.SMSMessage {
+	t.Helper()
+	value := store.SMSMessage{
+		MessageID: "test-" + direction + "-" + body + "-" + strconv.FormatInt(time.Now().UnixNano(), 10),
+		DeviceID:  "ec20-1",
+		ModemIMEI: "000000000000001",
+		ICCID:     "8900000000000000001",
+		IMSI:      "001010000000001",
+		Peer:      "+15550000001",
+		Direction: direction,
+		Body:      body,
+		Timestamp: time.Unix(1_700_000_000, 0).UTC(),
+		Source:    "ims",
+	}
+	if extra != "" {
+		value.Extra = json.RawMessage(extra)
+	}
+	saved, err := database.SaveSMSMessage(context.Background(), value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return saved
+}
+
+func openSMSTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	database, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	return database
+}
+
+type smsInboundEnvelope struct {
+	Data struct {
+		Messages    []map[string]any `json:"messages"`
+		NextAfterID int64            `json:"next_after_id"`
+		Count       int              `json:"count"`
+	} `json:"data"`
+}
+
+func getSMSInbound(t *testing.T, server *Server, query string) (int, smsInboundEnvelope, string) {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodGet, "/api/sms/inbound"+query, nil)
+	response := httptest.NewRecorder()
+	server.handleSMSInbound(response, request)
+	var envelope smsInboundEnvelope
+	if response.Code == http.StatusOK {
+		if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+			t.Fatalf("decode inbound response %s: %v", response.Body.String(), err)
+		}
+	}
+	return response.Code, envelope, response.Body.String()
+}
+
+func TestHandleSMSInboundEmptyStoreKeepsCursor(t *testing.T) {
+	server := &Server{store: openSMSTestStore(t), logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	code, envelope, body := getSMSInbound(t, server, "?after_id=7")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", code, body)
+	}
+	if envelope.Data.Count != 0 || len(envelope.Data.Messages) != 0 || envelope.Data.NextAfterID != 7 {
+		t.Fatalf("empty store response = %s", body)
+	}
+}
+
+func TestHandleSMSInboundCursorSkipsUnreadyRowsAndOmitsOutbound(t *testing.T) {
+	database := openSMSTestStore(t)
+	server := &Server{store: database, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	first := saveTestInboundSMS(t, database, "inbound", "first", `{"k":"v"}`)
+	empty := saveTestInboundSMS(t, database, "inbound", "", "")
+	saveTestInboundSMS(t, database, "outbound", "reply", "")
+	third := saveTestInboundSMS(t, database, "received", "third", "")
+	if !(first.ID < empty.ID && empty.ID < third.ID) {
+		t.Fatalf("unexpected id order: %d %d %d", first.ID, empty.ID, third.ID)
+	}
+
+	code, envelope, body := getSMSInbound(t, server, "")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", code, body)
+	}
+	if envelope.Data.Count != 2 || len(envelope.Data.Messages) != 2 {
+		t.Fatalf("expected two ready messages, got %s", body)
+	}
+	if envelope.Data.NextAfterID != third.ID {
+		t.Fatalf("next_after_id = %d, want %d (body %s)", envelope.Data.NextAfterID, third.ID, body)
+	}
+	got := envelope.Data.Messages[0]
+	if int64(got["id"].(float64)) != first.ID || got["body"] != "first" || got["direction"] != "inbound" {
+		t.Fatalf("first message = %#v", got)
+	}
+	if got["read"] != false {
+		t.Fatalf("read flag = %#v, want false", got["read"])
+	}
+	createdAt, ok := got["created_at"].(string)
+	if !ok || createdAt == "" {
+		t.Fatalf("created_at = %#v", got["created_at"])
+	}
+	if parsed, err := time.Parse(time.RFC3339, createdAt); err != nil || parsed.Location() != time.UTC {
+		t.Fatalf("created_at %q is not RFC3339 UTC: %v", createdAt, err)
+	}
+	if extra, ok := got["extra"].(map[string]any); !ok || extra["k"] != "v" {
+		t.Fatalf("extra = %#v", got["extra"])
+	}
+	second := envelope.Data.Messages[1]
+	if int64(second["id"].(float64)) != third.ID || second["body"] != "third" {
+		t.Fatalf("second message = %#v", second)
+	}
+	// The store normalises an absent Extra to {} before persisting, so a row
+	// saved without data surfaces as an empty object rather than null.
+	if extra, ok := second["extra"].(map[string]any); !ok || len(extra) != 0 {
+		t.Fatalf("extra for row without data = %#v, want {}", second["extra"])
+	}
+	for _, message := range envelope.Data.Messages {
+		if message["direction"] == "outbound" || message["direction"] == "sent" {
+			t.Fatalf("outbound row leaked: %#v", message)
+		}
+	}
+
+	code, envelope, body = getSMSInbound(t, server, "?after_id="+strconv.FormatInt(first.ID, 10))
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", code, body)
+	}
+	if envelope.Data.Count != 1 || int64(envelope.Data.Messages[0]["id"].(float64)) != third.ID || envelope.Data.NextAfterID != third.ID {
+		t.Fatalf("after_id=%d response = %s", first.ID, body)
+	}
+
+	code, envelope, body = getSMSInbound(t, server, "?after_id="+strconv.FormatInt(third.ID, 10))
+	if code != http.StatusOK || envelope.Data.Count != 0 || envelope.Data.NextAfterID != third.ID {
+		t.Fatalf("tail response = %d %s", code, body)
+	}
+
+	// The cursor endpoint must not mark anything read.
+	for _, id := range []int64{first.ID, empty.ID, third.ID} {
+		stored, err := database.SMSMessage(context.Background(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.Read {
+			t.Fatalf("message %d was marked read by a GET", id)
+		}
+	}
+}
+
+func TestHandleSMSInboundLimitAndValidation(t *testing.T) {
+	database := openSMSTestStore(t)
+	server := &Server{store: database, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	ids := make([]int64, 0, 3)
+	for _, body := range []string{"a", "b", "c"} {
+		ids = append(ids, saveTestInboundSMS(t, database, "inbound", body, "").ID)
+	}
+
+	code, envelope, body := getSMSInbound(t, server, "?limit=2")
+	if code != http.StatusOK || envelope.Data.Count != 2 || envelope.Data.NextAfterID != ids[1] {
+		t.Fatalf("limit=2 response = %d %s", code, body)
+	}
+	// Values above 1000 and below 1 clamp instead of failing.
+	code, envelope, body = getSMSInbound(t, server, "?limit=5000")
+	if code != http.StatusOK || envelope.Data.Count != 3 {
+		t.Fatalf("limit=5000 response = %d %s", code, body)
+	}
+	code, envelope, body = getSMSInbound(t, server, "?limit=0")
+	if code != http.StatusOK || envelope.Data.Count != 1 || envelope.Data.NextAfterID != ids[0] {
+		t.Fatalf("limit=0 response = %d %s", code, body)
+	}
+	code, _, body = getSMSInbound(t, server, "?limit=abc")
+	if code != http.StatusBadRequest || !strings.Contains(body, "invalid_limit") {
+		t.Fatalf("limit=abc response = %d %s", code, body)
+	}
+	code, _, body = getSMSInbound(t, server, "?after_id=-1")
+	if code != http.StatusBadRequest || !strings.Contains(body, "invalid_after_id") {
+		t.Fatalf("after_id=-1 response = %d %s", code, body)
+	}
+	code, _, body = getSMSInbound(t, server, "?after_id=x")
+	if code != http.StatusBadRequest || !strings.Contains(body, "invalid_after_id") {
+		t.Fatalf("after_id=x response = %d %s", code, body)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/api/sms/inbound", nil)
+	response := httptest.NewRecorder()
+	server.handleSMSInbound(response, request)
+	if response.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestHandleSMSMessageGetReturnsRowAndDeleteStillWorks(t *testing.T) {
+	database := openSMSTestStore(t)
+	server := &Server{store: database, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	saved := saveTestInboundSMS(t, database, "outbound", "hello", `{"delivery":"x"}`)
+	idText := strconv.FormatInt(saved.ID, 10)
+
+	request := httptest.NewRequest(http.MethodGet, "/api/sms/messages/"+idText, nil)
+	response := httptest.NewRecorder()
+	server.handleSMSMessage(response, request, idText)
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var envelope struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if int64(envelope.Data["id"].(float64)) != saved.ID || envelope.Data["body"] != "hello" || envelope.Data["direction"] != "outbound" {
+		t.Fatalf("GET data = %#v", envelope.Data)
+	}
+	if _, ok := envelope.Data["delivery_state"]; !ok {
+		t.Fatalf("delivery_state missing: %#v", envelope.Data)
+	}
+	if _, ok := envelope.Data["created_at"].(string); !ok {
+		t.Fatalf("created_at = %#v", envelope.Data["created_at"])
+	}
+	if extra, ok := envelope.Data["extra"].(map[string]any); !ok || extra["delivery"] != "x" {
+		t.Fatalf("extra = %#v", envelope.Data["extra"])
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/api/sms/messages/999999", nil)
+	response = httptest.NewRecorder()
+	server.handleSMSMessage(response, request, "999999")
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("GET missing status = %d, body = %s", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodPut, "/api/sms/messages/"+idText, nil)
+	response = httptest.NewRecorder()
+	server.handleSMSMessage(response, request, idText)
+	if response.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("PUT status = %d, body = %s", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodDelete, "/api/sms/messages/"+idText, nil)
+	response = httptest.NewRecorder()
+	server.handleSMSMessage(response, request, idText)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"deleted":true`) {
+		t.Fatalf("DELETE status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if _, err := database.SMSMessage(context.Background(), saved.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("message after delete err = %v, want not found", err)
+	}
+}

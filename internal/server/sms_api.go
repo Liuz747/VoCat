@@ -32,6 +32,8 @@ func (s *Server) routeSMSAPI(w http.ResponseWriter, r *http.Request, cleanPath s
 		s.handleSMSThread(w, r)
 	case "sms/send":
 		s.handleSMSSend(w, r)
+	case "sms/inbound":
+		s.handleSMSInbound(w, r)
 	default:
 		segments := splitAPIPath(cleanPath)
 		if len(segments) == 3 && segments[0] == "sms" && segments[1] == "messages" {
@@ -645,8 +647,66 @@ func imsSMSDeliveryState(result vowifi.SMSSubmitResult) string {
 	}
 }
 
+// handleSMSInbound serves inbound SMS by durable row id so an external
+// consumer can poll with its own cursor. It has no side effects: rows are not
+// marked read and no modem or IMS state is touched. Rows that are not ready to
+// surface (empty bodies, incomplete long-SMS concatenations) are skipped but
+// still advance next_after_id, mirroring the Telegram notification cursor.
+func (s *Server) handleSMSInbound(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	afterID := int64(0)
+	if text := strings.TrimSpace(r.URL.Query().Get("after_id")); text != "" {
+		parsed, err := strconv.ParseInt(text, 10, 64)
+		if err != nil || parsed < 0 {
+			writeError(w, http.StatusBadRequest, "invalid_after_id", "after_id must be a non-negative integer")
+			return
+		}
+		afterID = parsed
+	}
+	limit := 100
+	if text := strings.TrimSpace(r.URL.Query().Get("limit")); text != "" {
+		parsed, err := strconv.Atoi(text)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_limit", "limit must be an integer")
+			return
+		}
+		limit = parsed
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	rows, err := s.store.ListInboundSMSAfterID(r.Context(), afterID, limit)
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	nextAfterID := afterID
+	messages := make([]map[string]any, 0, len(rows))
+	for _, message := range rows {
+		nextAfterID = message.ID
+		if !smsMessageReadyToNotify(message) {
+			continue
+		}
+		messages = append(messages, storedSMSDetailResponse(message))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{
+		"messages":      messages,
+		"next_after_id": nextAfterID,
+		"count":         len(messages),
+	}})
+}
+
 func (s *Server) handleSMSMessage(w http.ResponseWriter, r *http.Request, idText string) {
-	if !requireMethod(w, r, http.MethodDelete) {
+	switch r.Method {
+	case http.MethodGet, http.MethodDelete:
+	default:
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodDelete)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
 	id, err := strconv.ParseInt(idText, 10, 64)
@@ -657,6 +717,10 @@ func (s *Server) handleSMSMessage(w http.ResponseWriter, r *http.Request, idText
 	message, err := s.store.SMSMessage(r.Context(), id)
 	if err != nil {
 		s.writeStoreError(w, err)
+		return
+	}
+	if r.Method == http.MethodGet {
+		writeJSON(w, http.StatusOK, map[string]any{"data": storedSMSDetailResponse(message)})
 		return
 	}
 	if err := s.deleteSMSMessages(r.Context(), []store.SMSMessage{message}); err != nil {
@@ -1133,6 +1197,21 @@ func storedSMSResponse(message store.SMSMessage) map[string]any {
 		"parts_total":    message.PartsTotal,
 		"delivery_state": message.DeliveryState,
 	}
+}
+
+// storedSMSDetailResponse extends storedSMSResponse with the durable fields an
+// external consumer needs: the insertion time, the read flag, and the raw
+// Extra payload (delivery reports, concat metadata) as JSON or null.
+func storedSMSDetailResponse(message store.SMSMessage) map[string]any {
+	result := storedSMSResponse(message)
+	result["created_at"] = message.CreatedAt.UTC().Format(time.RFC3339)
+	result["read"] = message.Read
+	var extra any
+	if len(message.Extra) > 0 {
+		extra = json.RawMessage(message.Extra)
+	}
+	result["extra"] = extra
+	return result
 }
 
 func reverseSMS(messages []store.SMSMessage) {
