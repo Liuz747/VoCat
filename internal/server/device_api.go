@@ -561,6 +561,12 @@ func (s *Server) handleDevicePath(
 	if len(tail) > 0 && tail[0] == "multisim" {
 		return s.handleMultiSIM(w, r, config, tail[1:])
 	}
+	// Calls on a multi-tunnel device go through one line's IMS session. They
+	// never touch the reader, so they bypass the group's device lock and the
+	// physical-presence check below (the modem is airplane-mode by design).
+	if len(tail) > 0 && tail[0] == "calls" && s.multiSIMOwned(r.Context(), id) {
+		return s.handleMultiSIMCallRoute(w, r, config, tail)
+	}
 	if (r.Method != http.MethodGet && r.Method != http.MethodHead) || (len(tail) > 0 && tail[0] == "esim") {
 		unlock, lockErr := s.lockMultiSIMDevice(r.Context(), id)
 		if lockErr != nil {
