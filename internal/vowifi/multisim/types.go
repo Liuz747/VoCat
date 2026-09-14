@@ -128,6 +128,15 @@ type Options struct {
 	CleanupTimeout   time.Duration
 	RetryInitial     time.Duration
 	RetryMaximum     time.Duration
+	// PrepareRetryable reports whether a Prepare failure is temporary, such as
+	// a reader that hardware discovery has not found yet after a restart. Such
+	// a group keeps its desired state and prepares again with a capped backoff
+	// (PrepareRetryInitial doubling up to PrepareRetryMaximum) until it starts,
+	// is disabled, is re-saved, or the manager closes. Without it every Prepare
+	// failure is final.
+	PrepareRetryable    func(error) bool
+	PrepareRetryInitial time.Duration
+	PrepareRetryMaximum time.Duration
 	// CardHealth reports the physical reader's liveness for a device. Optional:
 	// without it the group state simply carries no card fields.
 	CardHealth func(string) CardHealth

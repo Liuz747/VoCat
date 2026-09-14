@@ -70,6 +70,15 @@ func New(options Options) *Manager {
 	if options.CleanupTimeout <= 0 {
 		options.CleanupTimeout = 30 * time.Second
 	}
+	if options.PrepareRetryInitial <= 0 {
+		options.PrepareRetryInitial = 5 * time.Second
+	}
+	if options.PrepareRetryMaximum <= 0 {
+		options.PrepareRetryMaximum = 60 * time.Second
+	}
+	if options.PrepareRetryMaximum < options.PrepareRetryInitial {
+		options.PrepareRetryMaximum = options.PrepareRetryInitial
+	}
 	return &Manager{options: options, groups: make(map[string]*group)}
 }
 
@@ -230,11 +239,15 @@ func (m *Manager) Reconnect(deviceID, iccid string) error {
 
 func (m *Manager) run(g *group, cycleCtx context.Context) {
 	defer m.wg.Done()
+	var prepareRetry time.Duration
 	for {
 		m.mu.Lock()
 		config := cloneConfig(g.config)
 		m.mu.Unlock()
 		startErr := m.start(g, cycleCtx, config)
+		if startErr == nil {
+			prepareRetry = 0
+		}
 		if startErr == nil && cycleCtx.Err() == nil {
 			m.setPhase(g, "running", false, "")
 			<-cycleCtx.Done()
@@ -307,6 +320,32 @@ func (m *Manager) run(g *group, cycleCtx context.Context) {
 			}
 		}
 		m.mu.Lock()
+		if startErr != nil && g.next == nil && !g.stopRequested && !m.closed &&
+			m.options.PrepareRetryable != nil && m.options.PrepareRetryable(startErr) {
+			// After a restart the reader may simply not be discovered yet. The
+			// preparation has already been restored above, so waiting keeps only
+			// the desired state; disabling, re-saving, or closing ends the wait.
+			prepareRetry = m.nextPrepareRetry(prepareRetry)
+			g.state.Phase = "waiting_device"
+			g.state.Busy = false
+			g.state.LastError = "reader not available yet; preparation will retry"
+			g.state.UpdatedAt = time.Now().UTC()
+			m.mu.Unlock()
+			m.options.Logger.Info("multisim group reader not available; retrying preparation",
+				"device_id", config.DeviceID, "retry_in", prepareRetry, "error", startErr)
+			m.waitPrepareRetry(g, prepareRetry)
+			m.mu.Lock()
+			if g.next == nil && !g.stopRequested && !m.closed {
+				g.cancel()
+				g.runtime = nil
+				g.lines = nil
+				cycleCtx, g.cancel = context.WithCancel(context.Background())
+				g.ctx = cycleCtx
+				g.state = GroupState{DeviceID: config.DeviceID, Enabled: true, Busy: true, Phase: "preparing", Lines: []LineState{}, UpdatedAt: time.Now().UTC()}
+				m.mu.Unlock()
+				continue
+			}
+		}
 		if g.next != nil && !m.closed {
 			next := cloneConfig(*g.next)
 			g.next = nil
@@ -576,6 +615,36 @@ func (m *Manager) setPhase(g *group, phase string, busy bool, lastError string) 
 	g.state.Busy = busy
 	g.state.LastError = lastError
 	g.state.UpdatedAt = time.Now().UTC()
+}
+
+func (m *Manager) nextPrepareRetry(previous time.Duration) time.Duration {
+	if previous <= 0 {
+		return m.options.PrepareRetryInitial
+	}
+	if previous > m.options.PrepareRetryMaximum/2 {
+		return m.options.PrepareRetryMaximum
+	}
+	return previous * 2
+}
+
+// waitPrepareRetry returns when the backoff elapses or the group's desired
+// state changes. A stale wake left by an earlier request does not end it.
+func (m *Manager) waitPrepareRetry(g *group, delay time.Duration) {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	for {
+		select {
+		case <-timer.C:
+			return
+		case <-g.wake:
+			m.mu.Lock()
+			changed := g.next != nil || g.stopRequested || m.closed
+			m.mu.Unlock()
+			if changed {
+				return
+			}
+		}
+	}
 }
 
 func (m *Manager) waitRetry(g *group) bool {
