@@ -119,13 +119,24 @@ func TestDefaultCardPolicySupportsEverySIMRegion(t *testing.T) {
 				}}
 				manager := newRegionTestManager(t, client)
 				snapshot := &device.Snapshot{DeviceID: regionTestDeviceID, SIMReady: true, IMSI: imsi, ICCID: iccid}
+				if legacy {
+					// An existing policy is never rewritten by the automatic
+					// path, whatever its source: it must not flip
+					// vowifi_enabled from 0 back to 1 (2026-09-14 rebound).
+					client = &fakeModemClient{}
+					manager = newRegionTestManager(t, client)
+				}
 				enforceDefaultSafeCardPolicy(ctx, regionTestLogger(), database, manager, regionTestDeviceID, snapshot)
 				policy, err := database.CardPolicy(ctx, iccid)
-				if err != nil || !policy.VoWiFiEnabled || policy.NetworkEnabled || !policy.AirplaneEnabled || policy.Source != "default" {
-					t.Fatalf("default policy = %+v, %v", policy, err)
+				if err != nil {
+					t.Fatal(err)
 				}
-				if legacy && policy.APN != "ims" {
-					t.Fatalf("existing APN lost: %+v", policy)
+				if legacy {
+					if policy.VoWiFiEnabled || policy.Source != "auto_region_block" || policy.APN != "ims" {
+						t.Fatalf("legacy policy rewritten: %+v", policy)
+					}
+				} else if !policy.VoWiFiEnabled || policy.NetworkEnabled || !policy.AirplaneEnabled || policy.Source != "default" {
+					t.Fatalf("default policy = %+v, %v", policy, err)
 				}
 				client.assertExhausted(t)
 			})
@@ -170,5 +181,59 @@ func TestProvisionedDeviceTypeRecognizesNativeWWAN(t *testing.T) {
 	}
 	if got := provisionedDeviceType(usb); got != store.DeviceTypePCIeEC20EC25 {
 		t.Fatalf("USB modem type = %q, want %q", got, store.DeviceTypePCIeEC20EC25)
+	}
+}
+
+func TestDesiredDeviceVoWiFi(t *testing.T) {
+	realICCID := "89860012345678901234"
+	placeholder := "89111111111111111111"
+	cases := []struct {
+		name   string
+		config store.Device
+		policy store.CardPolicy
+		iccid  string
+		want   bool
+		reason string
+	}{
+		{name: "policy on, untouched device", config: store.Device{ID: "a"}, policy: store.CardPolicy{VoWiFiEnabled: true}, iccid: realICCID, want: true},
+		{name: "policy off", config: store.Device{ID: "a"}, policy: store.CardPolicy{VoWiFiEnabled: false}, iccid: realICCID, want: false, reason: "policy_disabled"},
+		{name: "user switched this device off", config: store.Device{ID: "a", VoWiFiUserDisabled: true}, policy: store.CardPolicy{VoWiFiEnabled: true}, iccid: realICCID, want: false, reason: "user_disabled"},
+		{name: "blank eUICC placeholder identity", config: store.Device{ID: "a"}, policy: store.CardPolicy{VoWiFiEnabled: true}, iccid: placeholder, want: false, reason: "placeholder_iccid"},
+		{name: "placeholder wins over policy off", config: store.Device{ID: "a"}, policy: store.CardPolicy{VoWiFiEnabled: false}, iccid: placeholder, want: false, reason: "placeholder_iccid"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			got, reason := desiredDeviceVoWiFi(test.config, test.policy, test.iccid)
+			if got != test.want || reason != test.reason {
+				t.Fatalf("desiredDeviceVoWiFi() = %v, %q; want %v, %q", got, reason, test.want, test.reason)
+			}
+		})
+	}
+}
+
+// The reconciler mirrors the card policy into the device row. It may switch a
+// device off, but it must not switch a user-disabled device back on, and it
+// must never ask the runtime to start a line on the blank-eUICC placeholder.
+func TestApplyDesiredDeviceVoWiFiNeverReopensUserDisabledDevice(t *testing.T) {
+	policy := store.CardPolicy{ICCID: "89860012345678901234", VoWiFiEnabled: true, AirplaneEnabled: true}
+	config := store.Device{ID: "a", VoWiFiEnabled: false, VoWiFiUserDisabled: true}
+	next, changed := applyDesiredDeviceVoWiFi(config, policy, false)
+	if changed || next.VoWiFiEnabled {
+		t.Fatalf("user-disabled device changed: %+v (changed=%v)", next, changed)
+	}
+	config = store.Device{ID: "a", VoWiFiEnabled: true, VoWiFiUserDisabled: true}
+	next, changed = applyDesiredDeviceVoWiFi(config, policy, false)
+	if !changed || next.VoWiFiEnabled {
+		t.Fatalf("stale enabled row not pulled down: %+v (changed=%v)", next, changed)
+	}
+	config = store.Device{ID: "a", VoWiFiEnabled: false, NetworkEnabled: true}
+	next, changed = applyDesiredDeviceVoWiFi(config, policy, true)
+	if !changed || !next.VoWiFiEnabled || next.NetworkEnabled {
+		t.Fatalf("policy-enabled device not applied: %+v (changed=%v)", next, changed)
+	}
+	config = store.Device{ID: "a", VoWiFiEnabled: true}
+	next, changed = applyDesiredDeviceVoWiFi(config, policy, true)
+	if changed || !next.VoWiFiEnabled {
+		t.Fatalf("already-enabled device rewritten: %+v (changed=%v)", next, changed)
 	}
 }

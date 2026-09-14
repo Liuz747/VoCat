@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"vocat/internal/device"
 	"vocat/internal/store"
 	"vocat/internal/vowifi"
 	vowifiruntime "vocat/internal/vowifi/runtime"
@@ -311,5 +313,167 @@ func TestDeleteDeviceWithoutRunningVoWiFiSkipsTeardown(t *testing.T) {
 	}
 	if _, err := database.Device(context.Background(), "ec20"); err == nil {
 		t.Fatal("device record still exists after DELETE")
+	}
+}
+
+func newVoWiFiPolicyTestServer(t *testing.T, iccid string, controller VoWiFiController) *Server {
+	t.Helper()
+	database, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	return &Server{
+		store:               database,
+		vowifi:              controller,
+		logger:              slog.New(slog.NewTextHandler(io.Discard, nil)),
+		maxRequestBodyBytes: 4096,
+		devices: fakeDeviceController{entry: device.Device{
+			ID:         "ec20",
+			Discovered: true,
+			Snapshot:   &device.Snapshot{DeviceID: "ec20", ICCID: iccid, IMSI: "310260123456789"},
+		}},
+	}
+}
+
+func patchVoWiFi(t *testing.T, server *Server, config store.Device, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPatch, "/api/devices/ec20/vowifi", bytes.NewBufferString(body))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	server.handleVoWiFiEnabled(response, request, config, true)
+	return response
+}
+
+// Regression for the 2026-09-14 rebound: an explicit "off" must be remembered
+// on the device row so reconciliation cannot re-open it from the card policy,
+// and an explicit "on" must clear that mark again.
+func TestVoWiFiDisableMarksDeviceUserDisabledAndEnableClears(t *testing.T) {
+	ctx := context.Background()
+	iccid := "89860012345678901234"
+	controller := &fakeVoWiFiController{state: vowifi.State{DeviceID: "ec20", Phase: vowifi.PhaseIdle}}
+	server := newVoWiFiPolicyTestServer(t, iccid, controller)
+	config := store.Device{ID: "ec20", Name: "EC20", VoWiFiEnabled: true}
+	if err := server.store.UpsertDevice(ctx, config); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.store.UpsertCardPolicy(ctx, store.CardPolicy{ICCID: iccid, VoWiFiEnabled: true, AirplaneEnabled: true, IPVersion: "IPV4V6", Source: "default"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if response := patchVoWiFi(t, server, config, `{"enabled":false}`); response.Code != http.StatusAccepted {
+		t.Fatalf("disable status = %d, body = %s", response.Code, response.Body.String())
+	}
+	stored, err := server.store.Device(ctx, "ec20")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.VoWiFiEnabled || !stored.VoWiFiUserDisabled {
+		t.Fatalf("after disable: %+v", stored)
+	}
+	policy, err := server.store.CardPolicy(ctx, iccid)
+	if err != nil || policy.VoWiFiEnabled || policy.Source != "manual" {
+		t.Fatalf("card policy after disable = %+v, %v", policy, err)
+	}
+
+	if response := patchVoWiFi(t, server, stored, `{"enabled":true}`); response.Code != http.StatusAccepted {
+		t.Fatalf("enable status = %d, body = %s", response.Code, response.Body.String())
+	}
+	stored, err = server.store.Device(ctx, "ec20")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.VoWiFiEnabled || stored.VoWiFiUserDisabled {
+		t.Fatalf("after enable: %+v", stored)
+	}
+}
+
+// A blank eUICC with no enabled profile reports the placeholder ICCID
+// 8911…11. No carrier lives behind it (ePDG lookup of mcc111 can never succeed),
+// so an explicit enable is refused instead of queued.
+func TestVoWiFiEnableRejectsPlaceholderICCID(t *testing.T) {
+	ctx := context.Background()
+	controller := &fakeVoWiFiController{state: vowifi.State{DeviceID: "ec20", Phase: vowifi.PhaseIdle}}
+	server := newVoWiFiPolicyTestServer(t, "89111111111111111111", controller)
+	config := store.Device{ID: "ec20", Name: "EC20"}
+	if err := server.store.UpsertDevice(ctx, config); err != nil {
+		t.Fatal(err)
+	}
+	response := patchVoWiFi(t, server, config, `{"enabled":true}`)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if len(controller.enabled) != 0 {
+		t.Fatalf("runtime was asked to start: %#v", controller.enabled)
+	}
+	stored, err := server.store.Device(ctx, "ec20")
+	if err != nil || stored.VoWiFiEnabled {
+		t.Fatalf("device row changed: %+v, %v", stored, err)
+	}
+	// Disabling is still allowed: it is the safe direction.
+	if response := patchVoWiFi(t, server, config, `{"enabled":false}`); response.Code != http.StatusAccepted {
+		t.Fatalf("disable status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+// When the runtime rejects a disable request, the persisted desired state
+// stays "off" (reconciliation retries the stop); rolling the shared card policy
+// back to "on" used to re-open every device that hosts the same ICCID.
+func TestVoWiFiDisableRuntimeFailureKeepsDisabledPolicy(t *testing.T) {
+	ctx := context.Background()
+	iccid := "89860012345678901234"
+	controller := &fakeVoWiFiController{
+		state: vowifi.State{DeviceID: "ec20", Phase: vowifi.PhaseFailed, Enabled: true},
+		err:   errors.New("runtime closed"),
+	}
+	server := newVoWiFiPolicyTestServer(t, iccid, controller)
+	config := store.Device{ID: "ec20", Name: "EC20", VoWiFiEnabled: true}
+	if err := server.store.UpsertDevice(ctx, config); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.store.UpsertCardPolicy(ctx, store.CardPolicy{ICCID: iccid, VoWiFiEnabled: true, AirplaneEnabled: true, IPVersion: "IPV4V6", Source: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	response := patchVoWiFi(t, server, config, `{"enabled":false}`)
+	if response.Code == http.StatusAccepted {
+		t.Fatalf("runtime error was swallowed: %s", response.Body.String())
+	}
+	policy, err := server.store.CardPolicy(ctx, iccid)
+	if err != nil || policy.VoWiFiEnabled {
+		t.Fatalf("card policy rolled back to enabled: %+v, %v", policy, err)
+	}
+	stored, err := server.store.Device(ctx, "ec20")
+	if err != nil || stored.VoWiFiEnabled || !stored.VoWiFiUserDisabled {
+		t.Fatalf("device row rolled back: %+v, %v", stored, err)
+	}
+}
+
+// A failed enable still rolls back to "off": that is the fail-closed direction.
+func TestVoWiFiEnableRuntimeFailureRollsBackToDisabled(t *testing.T) {
+	ctx := context.Background()
+	iccid := "89860012345678901234"
+	controller := &fakeVoWiFiController{
+		state: vowifi.State{DeviceID: "ec20", Phase: vowifi.PhaseIdle},
+		err:   errors.New("runtime closed"),
+	}
+	server := newVoWiFiPolicyTestServer(t, iccid, controller)
+	config := store.Device{ID: "ec20", Name: "EC20", VoWiFiUserDisabled: true}
+	if err := server.store.UpsertDevice(ctx, config); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.store.UpsertCardPolicy(ctx, store.CardPolicy{ICCID: iccid, VoWiFiEnabled: false, AirplaneEnabled: true, IPVersion: "IPV4V6", Source: "manual"}); err != nil {
+		t.Fatal(err)
+	}
+	response := patchVoWiFi(t, server, config, `{"enabled":true}`)
+	if response.Code == http.StatusAccepted {
+		t.Fatalf("runtime error was swallowed: %s", response.Body.String())
+	}
+	policy, err := server.store.CardPolicy(ctx, iccid)
+	if err != nil || policy.VoWiFiEnabled {
+		t.Fatalf("card policy left enabled: %+v, %v", policy, err)
+	}
+	stored, err := server.store.Device(ctx, "ec20")
+	if err != nil || stored.VoWiFiEnabled || !stored.VoWiFiUserDisabled {
+		t.Fatalf("device row left enabled: %+v, %v", stored, err)
 	}
 }

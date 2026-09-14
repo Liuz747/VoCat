@@ -339,7 +339,10 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) bool {
 				}
 			}
 		}
-		if s.vowifi != nil && config.VoWiFiEnabled {
+		if s.vowifi != nil && config.VoWiFiEnabled && selected.Snapshot != nil && device.IsPlaceholderICCID(selected.Snapshot.ICCID) {
+			s.logger.Info("new device carries a blank eUICC (placeholder ICCID); single-line VoWiFi stays off until a profile is enabled",
+				"device_id", config.ID, "iccid", strings.TrimSpace(selected.Snapshot.ICCID))
+		} else if s.vowifi != nil && config.VoWiFiEnabled {
 			if _, err := s.vowifi.RequestEnabled(config.ID, true); err != nil {
 				s.logger.Warn("new device saved in safe airplane mode but VoWiFi start was not queued", "device_id", config.ID, "error", err)
 			}
@@ -1021,6 +1024,15 @@ func (s *Server) handleVoWiFiEnabled(
 		writeError(w, http.StatusConflict, "cellular_data_active", "disable roaming data before enabling VoWiFi")
 		return true
 	}
+	if request.Enabled {
+		if entry, _, present := s.physicalForConfig(config); present && entry.Snapshot != nil && device.IsPlaceholderICCID(entry.Snapshot.ICCID) {
+			// A blank eUICC without an enabled profile has no carrier behind
+			// its placeholder identity; starting VoWiFi only loops on ePDG
+			// resolution for mcc111.
+			writeError(w, http.StatusConflict, "no_profile_enabled", "the eUICC reports the blank placeholder ICCID; enable a profile before starting VoWiFi")
+			return true
+		}
+	}
 
 	// Establish RF-off synchronously before changing the asynchronous VoWiFi
 	// lifecycle. This removes the attach window both when entering VoWiFi and
@@ -1067,8 +1079,12 @@ func (s *Server) handleVoWiFiEnabled(
 		}
 	}
 
+	// Only a failed enable rolls the shared card policy back: that restores
+	// the fail-closed "off". A failed disable keeps "off" persisted and lets
+	// reconciliation retry the stop; rolling it back to "on" re-opened every
+	// device hosting the same ICCID (2026-09-14, 49 blank eUICCs).
 	rollbackCardPolicy := func() {
-		if liveICCID == "" {
+		if liveICCID == "" || !request.Enabled {
 			return
 		}
 		policy, policyErr := s.store.CardPolicy(context.Background(), liveICCID)
@@ -1080,8 +1096,12 @@ func (s *Server) handleVoWiFiEnabled(
 		policy.NetworkEnabled = false
 		_ = s.store.UpsertCardPolicy(context.Background(), policy)
 	}
+	previousConfig := config
 	config.VoWiFiEnabled = request.Enabled
 	config.NetworkEnabled = false
+	// Remember an explicit "off" on the device row so card policy
+	// reconciliation cannot re-open it; an explicit "on" clears the mark.
+	config.VoWiFiUserDisabled = !request.Enabled
 	if err := s.store.UpsertDevice(r.Context(), config); err != nil {
 		rollbackCardPolicy()
 		s.writeStoreError(w, err)
@@ -1105,14 +1125,15 @@ func (s *Server) handleVoWiFiEnabled(
 			})
 			return true
 		}
-		config.VoWiFiEnabled = previous
-		rollbackCardPolicy()
-		if restoreErr := s.store.UpsertDevice(r.Context(), config); restoreErr != nil {
-			s.logger.Error(
-				"restore VoWiFi policy after rejected runtime operation",
-				"device_id", config.ID,
-				"error", restoreErr,
-			)
+		if request.Enabled {
+			rollbackCardPolicy()
+			if restoreErr := s.store.UpsertDevice(r.Context(), previousConfig); restoreErr != nil {
+				s.logger.Error(
+					"restore VoWiFi policy after rejected runtime operation",
+					"device_id", config.ID,
+					"error", restoreErr,
+				)
+			}
 		}
 		s.writeVoWiFiError(w, err)
 		return true
@@ -2126,6 +2147,7 @@ func (s *Server) configuredDeviceSummary(
 	result["maintenance_phase"] = dataRuntime.MaintenancePhase
 	result["network_error"] = dataRuntime.LastError
 	result["vowifi_enabled"] = config.VoWiFiEnabled
+	result["vowifi_user_disabled"] = config.VoWiFiUserDisabled
 	var runtimeResponse map[string]any
 	runtimeMatchesCard := true
 	if s.vowifi != nil {
@@ -2494,6 +2516,7 @@ func storedDeviceConfig(config store.Device) map[string]any {
 		"network_enabled":      config.NetworkEnabled,
 		"sms_enabled":          config.SMSEnabled,
 		"vowifi_enabled":       config.VoWiFiEnabled,
+		"vowifi_user_disabled": config.VoWiFiUserDisabled,
 	}
 }
 

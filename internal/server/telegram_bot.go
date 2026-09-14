@@ -2238,15 +2238,23 @@ func (bot *telegramBot) handleVoWiFi(ctx context.Context, config telegramRuntime
 				return
 			}
 		}
+		previousStored := stored
 		stored.VoWiFiEnabled = enabled
 		stored.NetworkEnabled = false
+		// Same contract as the web API: an explicit "off" is remembered on the
+		// device row; an explicit "on" clears it.
+		stored.VoWiFiUserDisabled = !enabled
 		if err = bot.server.store.UpsertDevice(ctx, stored); err == nil {
 			dataRuntime.invalidate(stored.ID, false, "disabled", "")
 			state, err = bot.server.vowifi.RequestEnabled(deviceID, enabled)
 		}
-		if err != nil {
-			stored.VoWiFiEnabled = previous
-			_ = bot.server.store.UpsertDevice(ctx, stored)
+		if errors.Is(err, vowifiruntime.ErrOperationInProgress) && state.Enabled == enabled {
+			err = nil
+		}
+		if err != nil && enabled {
+			// Only a failed enable rolls back (to the fail-closed "off"); a
+			// failed disable keeps "off" persisted for reconciliation to retry.
+			_ = bot.server.store.UpsertDevice(ctx, previousStored)
 			if iccid != "" {
 				if policy, policyErr := bot.server.store.CardPolicy(ctx, iccid); policyErr == nil {
 					policy.VoWiFiEnabled = previous
@@ -2254,9 +2262,6 @@ func (bot *telegramBot) handleVoWiFi(ctx context.Context, config telegramRuntime
 					policy.NetworkEnabled = false
 					_ = bot.server.store.UpsertCardPolicy(ctx, policy)
 				}
-			}
-			if errors.Is(err, vowifiruntime.ErrOperationInProgress) && state.Enabled == enabled {
-				err = nil
 			}
 		}
 	case "reconnect":

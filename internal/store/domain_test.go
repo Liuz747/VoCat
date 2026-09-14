@@ -1192,3 +1192,82 @@ func mustSaveDevice(t *testing.T, database *Store, id, name string) {
 		t.Fatalf("UpsertDevice() error = %v", err)
 	}
 }
+
+// Regression for the 2026-09-14 VoWiFi rebound: an explicit user "off" on a
+// device must survive a round trip so reconciliation can tell it apart from a
+// row that merely mirrors the card policy.
+func TestDeviceVoWiFiUserDisabledRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.UpsertDevice(ctx, Device{ID: "ec20", Name: "EC20", VoWiFiEnabled: false, VoWiFiUserDisabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := database.Device(ctx, "ec20")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.VoWiFiUserDisabled || stored.VoWiFiEnabled {
+		t.Fatalf("stored device = %+v, want user-disabled VoWiFi", stored)
+	}
+	listed, err := database.ListDevices(ctx)
+	if err != nil || len(listed) != 1 || !listed[0].VoWiFiUserDisabled {
+		t.Fatalf("listed devices = %+v, %v", listed, err)
+	}
+	stored.VoWiFiUserDisabled = false
+	stored.VoWiFiEnabled = true
+	if err := database.UpsertDevice(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = database.Device(ctx, "ec20")
+	if err != nil || stored.VoWiFiUserDisabled || !stored.VoWiFiEnabled {
+		t.Fatalf("cleared device = %+v, %v", stored, err)
+	}
+}
+
+// Every caller of UpsertCardPolicy reads the row, edits it and writes it back,
+// carrying the old UpdatedAt along. The store must stamp the write time itself;
+// otherwise "updated_at did not change" is not evidence that nobody wrote.
+func TestUpsertCardPolicyReadModifyWriteRefreshesUpdatedAt(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	iccid := "89111111111111111111"
+	if err := database.UpsertCardPolicy(ctx, CardPolicy{ICCID: iccid, VoWiFiEnabled: true, AirplaneEnabled: true, IPVersion: "IPV4V6", Source: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.db.ExecContext(ctx, `UPDATE card_policies SET created_at = 100, updated_at = 100 WHERE iccid = ?`, iccid); err != nil {
+		t.Fatal(err)
+	}
+	policy, err := database.CardPolicy(ctx, iccid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.UpdatedAt.Unix() != 100 {
+		t.Fatalf("seeded updated_at = %v", policy.UpdatedAt)
+	}
+	policy.VoWiFiEnabled = false
+	policy.Source = "manual"
+	if err := database.UpsertCardPolicy(ctx, policy); err != nil {
+		t.Fatal(err)
+	}
+	policy, err = database.CardPolicy(ctx, iccid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.VoWiFiEnabled || policy.Source != "manual" {
+		t.Fatalf("policy after write = %+v", policy)
+	}
+	if policy.CreatedAt.Unix() != 100 {
+		t.Fatalf("created_at changed on update: %v", policy.CreatedAt)
+	}
+	if !policy.UpdatedAt.After(time.Unix(100, 0)) {
+		t.Fatalf("updated_at was not refreshed: %v", policy.UpdatedAt)
+	}
+}
