@@ -4,19 +4,21 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"vocat/internal/modem"
 	"vocat/internal/vowifi"
 )
 
 func TestBrokerLogsLifecycleWithoutAuthenticationMaterial(t *testing.T) {
 	backend := newBackend()
 	var output bytes.Buffer
-	broker, err := NewAuthBroker(BrokerOptions{DeviceID: "physical-reader", Backend: backend, Logger: slog.New(slog.NewJSONHandler(&output, nil))})
+	broker, err := NewAuthBroker(BrokerOptions{DeviceID: "physical-reader", Backend: backend, Logger: slog.New(slog.NewJSONHandler(&output, nil)), AKARetryDelays: quickAKARetries})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,6 +58,7 @@ type testBackend struct {
 	release         chan struct{}
 	wrongSwitch     bool
 	authError       error
+	authErrors      []error // consumed one per authentication before authError
 	ignoreCancel    bool
 	smscReads       int
 	smscError       error
@@ -105,6 +108,9 @@ func (b *testBackend) AuthenticateWithPreference(ctx context.Context, id vowifi.
 	b.mu.Lock()
 	b.authentications++
 	entered, release, authErr, ignoreCancel := b.entered, b.release, b.authError, b.ignoreCancel
+	if len(b.authErrors) > 0 {
+		authErr, b.authErrors = b.authErrors[0], b.authErrors[1:]
+	}
 	b.mu.Unlock()
 	if entered != nil {
 		select {
@@ -136,7 +142,7 @@ func (b *testBackend) AuthenticateWithPreference(ctx context.Context, id vowifi.
 
 func testBroker(t *testing.T, b *testBackend) (*AuthBroker, *ProfileAdapter, *ProfileAdapter) {
 	t.Helper()
-	broker, err := NewAuthBroker(BrokerOptions{DeviceID: "physical-reader", Backend: b, RequestTimeout: time.Second})
+	broker, err := NewAuthBroker(BrokerOptions{DeviceID: "physical-reader", Backend: b, RequestTimeout: time.Second, AKARetryDelays: quickAKARetries})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,6 +274,157 @@ func TestCanceledAuthenticationHoldsReaderUntilBackendReturns(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+var quickAKARetries = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond, time.Millisecond}
+
+func statusWord6985() error {
+	return fmt.Errorf("%w: %w", vowifi.ErrEC20AKAResponse, &vowifi.APDUStatusError{SW: 0x6985})
+}
+
+func loggedBroker(t *testing.T, backend *testBackend) (*ProfileAdapter, *ProfileAdapter, *bytes.Buffer) {
+	t.Helper()
+	output := &bytes.Buffer{}
+	broker, err := NewAuthBroker(BrokerOptions{DeviceID: "physical-reader", Backend: backend, RequestTimeout: time.Second,
+		Logger: slog.New(slog.NewJSONHandler(output, nil)), AKARetryDelays: quickAKARetries})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig()
+	a, err := broker.ForProfile(cfg.Profiles[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := broker.ForProfile(cfg.Profiles[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a, b, output
+}
+
+// switchedAway returns a's identity with the card left on b, so a's next
+// authentication has to switch profiles first.
+func switchedAway(t *testing.T, a, b *ProfileAdapter) vowifi.SIMIdentity {
+	t.Helper()
+	identity, err := a.ReadIdentity(context.Background(), "line-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.ReadIdentity(context.Background(), "line-b"); err != nil {
+		t.Fatal(err)
+	}
+	return identity
+}
+
+func logLine(log, message string) string {
+	for _, line := range strings.Split(log, "\n") {
+		if strings.Contains(line, `"msg":"`+message+`"`) {
+			return line
+		}
+	}
+	return ""
+}
+
+func TestAKARepeatsTransientCardFailureInsideTheSameTransaction(t *testing.T) {
+	backend := newBackend()
+	a, b, output := loggedBroker(t, backend)
+	identity := switchedAway(t, a, b)
+	backend.authErrors = []error{statusWord6985()}
+	challenge := vowifi.AKAChallenge{}
+	challenge.RAND[0] = 7
+	result, err := a.Authenticate(context.Background(), identity, challenge)
+	if err != nil || len(result.RES) != 1 || result.RES[0] != 7 {
+		t.Fatalf("authentication after one transient failure = %+v, %v", result, err)
+	}
+	if backend.authentications != 2 || backend.switches != 2 {
+		t.Fatalf("authentications=%d switches=%d, want 2 and 2 (no extra switch between attempts)", backend.authentications, backend.switches)
+	}
+	log := output.String()
+	retry := logLine(log, "multisim AKA authenticate retry")
+	for _, field := range []string{`"attempt":1`, `"delay_ms":`, `"detail":"apdu_sw_6985"`, `"after_profile_switch":true`} {
+		if !strings.Contains(retry, field) {
+			t.Fatalf("retry log lacks %s: %s", field, log)
+		}
+	}
+	if logLine(log, "multisim AKA completed") == "" || logLine(log, "multisim AKA failed") != "" {
+		t.Fatalf("final outcome not logged as completed: %s", log)
+	}
+}
+
+func TestAKAGivesUpAfterFourRetriesAndLogsSafeDetail(t *testing.T) {
+	backend := newBackend()
+	a, _, output := loggedBroker(t, backend)
+	identity, err := a.ReadIdentity(context.Background(), "line-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const secret = "0088008122101112131415161718"
+	backend.authError = fmt.Errorf("%w: %w", vowifi.ErrEC20AKACommand, &modem.CommandError{Command: `AT+CSIM=76,"` + secret + `"`, Final: "+CME ERROR: 14"})
+	if _, err := a.Authenticate(context.Background(), identity, vowifi.AKAChallenge{}); err == nil {
+		t.Fatal("persistent failure reported success")
+	} else if strings.Contains(err.Error(), secret) {
+		t.Fatalf("returned error leaked command text: %v", err)
+	}
+	if backend.authentications != 5 {
+		t.Fatalf("authentications = %d, want 1 + 4 retries", backend.authentications)
+	}
+	log := output.String()
+	if got := strings.Count(log, "multisim AKA authenticate retry"); got != 4 {
+		t.Fatalf("retry log lines = %d, want 4: %s", got, log)
+	}
+	failed := logLine(log, "multisim AKA failed")
+	if !strings.Contains(failed, `"detail":"cme_error_14"`) || !strings.Contains(failed, `"after_profile_switch":false`) {
+		t.Fatalf("failure log lacks safe detail: %s", log)
+	}
+	if strings.Contains(log, secret) {
+		t.Fatal("log leaked APDU command text")
+	}
+}
+
+func TestAKADoesNotRepeatCancellationRejectionOrIdentityFailures(t *testing.T) {
+	for _, cause := range []error{context.DeadlineExceeded, context.Canceled, vowifi.ErrEAPAuthenticationRejected,
+		ErrIdentityMismatch, vowifi.ErrInvalidIdentity, vowifi.ErrEC20IdentityChanged} {
+		backend := newBackend()
+		a, _, output := loggedBroker(t, backend)
+		identity, err := a.ReadIdentity(context.Background(), "line-a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		backend.authError = cause
+		if _, err := a.Authenticate(context.Background(), identity, vowifi.AKAChallenge{}); err == nil {
+			t.Fatalf("%v: reported success", cause)
+		}
+		if backend.authentications != 1 || strings.Contains(output.String(), "authenticate retry") {
+			t.Fatalf("%v: repeated %d times", cause, backend.authentications)
+		}
+	}
+}
+
+func TestProfileSwitchFailureLogsSafeDetail(t *testing.T) {
+	backend := &failingSwitchBackend{testBackend: newBackend(), err: &modem.CommandError{Command: `AT+CSIM=42,"secret-apdu"`, Final: "+CME ERROR: 13"}}
+	output := &bytes.Buffer{}
+	broker, err := NewAuthBroker(BrokerOptions{DeviceID: "physical-reader", Backend: backend, Logger: slog.New(slog.NewJSONHandler(output, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := broker.ForProfile(testConfig().Profiles[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.ReadIdentity(context.Background(), "line-b"); err == nil {
+		t.Fatal("failed switch reported success")
+	}
+	failed := logLine(output.String(), "multisim profile switch failed")
+	if !strings.Contains(failed, `"detail":"cme_error_13"`) || strings.Contains(output.String(), "secret-apdu") {
+		t.Fatalf("switch failure log = %s", output.String())
+	}
+}
+
+type failingSwitchBackend struct {
+	*testBackend
+	err error
+}
+
+func (b *failingSwitchBackend) SwitchProfile(context.Context, Profile) error { return b.err }
 
 // The backend exposes the service-centre address of the profile that is
 // switched in, the same way the single-line EC20 adapter answers AT+CSCA?.

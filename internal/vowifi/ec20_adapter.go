@@ -583,7 +583,7 @@ func (adapter *EC20Adapter) authenticateWithApplication(
 			true,
 		)
 		if err != nil {
-			return AKAResult{}, ErrEC20AKACommand
+			return AKAResult{}, withSafeAPDUCause(ErrEC20AKACommand, err)
 		}
 	} else {
 		channel, err := adapter.openLogicalChannel(
@@ -648,9 +648,9 @@ func parseUSIMAuthenticateResponse(raw []byte) (AKAResult, error) {
 			return AKAResult{}, ErrEC20AKAMACFailure
 		default:
 			return AKAResult{}, fmt.Errorf(
-				"%w: status word %04X",
+				"%w: %w",
 				ErrEC20AKAResponse,
-				status,
+				&APDUStatusError{SW: status},
 			)
 		}
 	}
@@ -1112,7 +1112,7 @@ func (adapter *EC20Adapter) discoverBasicApplicationAID(
 			return err
 		}
 		if status != 0x9000 {
-			return fmt.Errorf("vocat: EC20 basic-channel SELECT returned %04X", status)
+			return fmt.Errorf("vocat: EC20 basic-channel SELECT returned %w", &APDUStatusError{SW: status})
 		}
 		return nil
 	}
@@ -1231,8 +1231,8 @@ func (adapter *EC20Adapter) selectBasicApplication(
 	}
 	if status != 0x9000 {
 		return fmt.Errorf(
-			"vocat: EC20 basic-channel SELECT returned %04X",
-			status,
+			"vocat: EC20 basic-channel SELECT returned %w",
+			&APDUStatusError{SW: status},
 		)
 	}
 	return nil
@@ -1263,7 +1263,8 @@ func (adapter *EC20Adapter) transmitBasicAPDU(
 			response, err = adapter.execute(ctx, deviceID, command)
 		}
 		if err != nil {
-			return nil, errors.New("vocat: EC20 CSIM exchange failed")
+			// Keep only the result code: the command text carries the APDU.
+			return nil, withSafeAPDUCause(errEC20CSIMExchange, err)
 		}
 		raw, err := parseCSIMData(response)
 		if err != nil {
@@ -1321,7 +1322,7 @@ func (adapter *EC20Adapter) transmitLogicalAPDU(
 			response, err = adapter.execute(ctx, deviceID, command)
 		}
 		if err != nil {
-			return nil, errors.Join(ErrEC20AKACommand, err)
+			return nil, withSafeAPDUCause(ErrEC20AKACommand, err)
 		}
 		raw, err := parseCGLAData(response)
 		if err != nil {

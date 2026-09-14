@@ -164,4 +164,8 @@ type BrokerOptions struct {
 	Backend        AuthBackend
 	RequestTimeout time.Duration
 	Logger         *slog.Logger
+	// AKARetryDelays are the pauses before each repeated AKA attempt inside one
+	// reader transaction. nil selects the default 250 ms, 500 ms, 1 s, 2 s; an
+	// empty slice disables repetition.
+	AKARetryDelays []time.Duration
 }

@@ -19,6 +19,9 @@ type AuthBroker struct {
 	// Accessed only while holding transaction. Once learned, IMSI cannot change
 	// during this broker's lifetime, including through another profile adapter.
 	imsis map[string]string
+	// switched records whether the current transaction had to switch profiles.
+	// Accessed only while holding transaction.
+	switched bool
 	// Service-centre addresses by ICCID, learned while the profile is switched
 	// in. Read outside the transaction by ReadSMSCenter, hence the mutex.
 	smscMu sync.Mutex
@@ -39,6 +42,14 @@ var _ vowifi.PreferredAKAProvider = (*ProfileAdapter)(nil)
 var _ vowifi.SMSCenterReader = (*ProfileAdapter)(nil)
 
 var errSMSCenterUnsupported = errors.New("multisim: reader does not expose the SMS service-centre address")
+
+var errAKANotReady = errors.New("multisim: AKA application is not ready")
+
+// defaultAKARetryDelays space repeated AKA attempts inside one transaction.
+// Right after a real profile switch the card has rejected AUTHENTICATE within
+// milliseconds and accepted the same kind of request seconds later without a
+// switch (8-hour re-challenge storm logs, 2026-09-12).
+var defaultAKARetryDelays = []time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second}
 
 func NewAuthBroker(options BrokerOptions) (*AuthBroker, error) {
 	if options.DeviceID == "" || options.Backend == nil {
@@ -149,7 +160,7 @@ func (a *ProfileAdapter) Authenticate(ctx context.Context, identity vowifi.SIMId
 func (a *ProfileAdapter) AuthenticateWithPreference(ctx context.Context, expected vowifi.SIMIdentity, challenge vowifi.AKAChallenge, preference string) (result vowifi.AKAResult, err error) {
 	started := time.Now()
 	var waited time.Duration
-	acquired := false
+	acquired, afterSwitch := false, false
 	logger := a.broker.options.Logger.With("profile_suffix", profileSuffix(a.profile.ICCID))
 	logger.Info("multisim AKA queued")
 	defer func() {
@@ -158,7 +169,8 @@ func (a *ProfileAdapter) AuthenticateWithPreference(ctx context.Context, expecte
 			waited = elapsed
 		}
 		if err != nil {
-			logger.Warn("multisim AKA failed", "wait_ms", waited.Milliseconds(), "total_ms", elapsed.Milliseconds(), "error_class", safeErrorClass(err))
+			logger.Warn("multisim AKA failed", "wait_ms", waited.Milliseconds(), "total_ms", elapsed.Milliseconds(), "error_class", safeErrorClass(err),
+				"detail", safeErrorDetail(err), "after_profile_switch", afterSwitch)
 		} else {
 			logger.Info("multisim AKA completed", "wait_ms", waited.Milliseconds(), "total_ms", elapsed.Milliseconds())
 		}
@@ -168,18 +180,22 @@ func (a *ProfileAdapter) AuthenticateWithPreference(ctx context.Context, expecte
 		waited = time.Since(started)
 		logger.Info("multisim AKA reader acquired", "wait_ms", waited.Milliseconds())
 	}, func(ctx context.Context, live vowifi.SIMIdentity) error {
-		evidence, err := a.broker.options.Backend.CheckReady(ctx, live)
-		if err != nil {
-			return safeBackendError("AKA readiness check", err)
-		}
-		if !evidence.Ready {
-			return errors.New("multisim: AKA application is not ready")
-		}
-		result, err = a.broker.options.Backend.AuthenticateWithPreference(ctx, live, challenge, preference)
-		if err != nil {
-			return safeBackendError("AKA authentication", err)
-		}
-		return nil
+		afterSwitch = a.broker.switched
+		backend := a.broker.options.Backend
+		return a.repeatAKA(ctx, logger, afterSwitch, func() error {
+			evidence, err := backend.CheckReady(ctx, live)
+			if err != nil {
+				return safeBackendError("AKA readiness check", err)
+			}
+			if !evidence.Ready {
+				return errAKANotReady
+			}
+			result, err = backend.AuthenticateWithPreference(ctx, live, challenge, preference)
+			if err != nil {
+				return safeBackendError("AKA authentication", err)
+			}
+			return nil
+		})
 	})
 	if err != nil {
 		return vowifi.AKAResult{}, err
@@ -218,11 +234,12 @@ func (a *ProfileAdapter) withProfile(ctx context.Context, expected *vowifi.SIMId
 	if err != nil {
 		return safeBackendError("read active profile", err)
 	}
+	a.broker.switched = active != a.profile.ICCID
 	if active != a.profile.ICCID {
 		logger := a.broker.options.Logger.With("profile_suffix", profileSuffix(a.profile.ICCID))
 		logger.Info("multisim profile switch requested")
 		if err := backend.SwitchProfile(ctx, a.profile); err != nil {
-			logger.Warn("multisim profile switch failed", "error_class", safeErrorClass(err))
+			logger.Warn("multisim profile switch failed", "error_class", safeErrorClass(err), "detail", safeErrorDetail(err))
 			return safeBackendError("profile switch", err)
 		}
 		active, err = backend.ActiveICCID(ctx)
@@ -287,7 +304,47 @@ func safeErrorClass(err error) string {
 	}
 }
 
+// repeatAKA runs attempt and repeats failures that are not final, keeping the
+// reader transaction and the switched-in profile; every attempt re-selects the
+// application and re-verifies the live ICCID inside the backend.
+func (a *ProfileAdapter) repeatAKA(ctx context.Context, logger *slog.Logger, afterSwitch bool, attempt func() error) error {
+	delays := a.broker.options.AKARetryDelays
+	if delays == nil {
+		delays = defaultAKARetryDelays
+	}
+	for retry := 0; ; retry++ {
+		err := attempt()
+		if err == nil || retry == len(delays) || !repeatableAKAFailure(err) {
+			return err
+		}
+		logger.Info("multisim AKA authenticate retry", "attempt", retry+1, "delay_ms", delays[retry].Milliseconds(),
+			"detail", safeErrorDetail(err), "after_profile_switch", afterSwitch)
+		timer := time.NewTimer(delays[retry])
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func repeatableAKAFailure(err error) bool {
+	for _, final := range []error{context.Canceled, context.DeadlineExceeded, ErrIdentityMismatch, vowifi.ErrInvalidIdentity, vowifi.ErrEAPAuthenticationRejected} {
+		if errors.Is(err, final) {
+			return false
+		}
+	}
+	return safeErrorDetail(err) != "identity_changed"
+}
+
 func validIMSI(imsi string) bool { return len(imsi) >= 10 && len(imsi) <= 18 && digits(imsi) }
+
+// redactedError replaces a backend error whose text may carry authentication
+// material. It keeps only a log-safe detail such as a status word.
+type redactedError struct{ message, detail string }
+
+func (e *redactedError) Error() string { return e.message }
 
 // Do not wrap arbitrary backend errors: APDU and AT implementations can embed
 // command text, including authentication material. Preserve only safe classes.
@@ -297,5 +354,21 @@ func safeBackendError(operation string, err error) error {
 			return safe
 		}
 	}
-	return errors.New("multisim: " + operation + " failed")
+	return &redactedError{message: "multisim: " + operation + " failed", detail: vowifi.SafeAPDUDetail(err)}
+}
+
+// safeErrorDetail refines safeErrorClass with evidence that is safe to log: an
+// APDU status word or an AT error code, never command or response text.
+func safeErrorDetail(err error) string {
+	var redacted *redactedError
+	switch {
+	case errors.As(err, &redacted) && redacted.detail != "":
+		return redacted.detail
+	case errors.Is(err, errAKANotReady):
+		return "aka_not_ready"
+	}
+	if detail := vowifi.SafeAPDUDetail(err); detail != "" {
+		return detail
+	}
+	return safeErrorClass(err)
 }
