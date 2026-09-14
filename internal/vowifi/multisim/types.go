@@ -134,6 +134,10 @@ type Options struct {
 	Prepare    func(context.Context, Config) error
 	Restore    func(context.Context, Config) error
 	Factory    func(context.Context, Config, Profile, string) (*vowifi.Orchestrator, error)
+	// Verify checks profiles being added to a group that is already running,
+	// before any line is created for them. Prepare performs this check for a
+	// full start; Verify covers the incremental path only. Optional.
+	Verify func(context.Context, Config, []Profile) error
 }
 
 // AuthBackend addresses exactly one physical reader. Its own APDU lock must be

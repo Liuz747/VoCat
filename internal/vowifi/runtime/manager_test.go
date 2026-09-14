@@ -456,3 +456,53 @@ func TestManagerCoalescesReconnectWhileLifecycleOperationIsBusy(t *testing.T) {
 	}
 	t.Fatal("queued reconnect did not run after the active operation")
 }
+
+func TestRemoveClosesOneSessionAndFreesItsName(t *testing.T) {
+	manager := New(Options{OperationTimeout: time.Second, RetryInitial: time.Millisecond, RetryMaximum: 2 * time.Millisecond})
+	t.Cleanup(func() { _ = manager.Close(context.Background()) })
+	if err := manager.Register(testOrchestrator(t, "ec20")); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Register(testOrchestrator(t, "sibling")); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"ec20", "sibling"} {
+		if _, err := manager.RequestEnabled(id, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitReady := func(id string) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if state, err := manager.State(id); err == nil && state.Phase == vowifi.PhaseSMSReady {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatalf("%s never became ready", id)
+	}
+	waitReady("ec20")
+	waitReady("sibling")
+
+	if err := manager.Remove(context.Background(), "ec20"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.State("ec20"); !errors.Is(err, ErrNotRegistered) {
+		t.Fatalf("removed session still registered: %v", err)
+	}
+	if err := manager.Remove(context.Background(), "ec20"); !errors.Is(err, ErrNotRegistered) {
+		t.Fatalf("second Remove = %v, want ErrNotRegistered", err)
+	}
+	if state, err := manager.State("sibling"); err != nil || state.Phase != vowifi.PhaseSMSReady {
+		t.Fatalf("sibling disturbed by Remove: %+v %v", state, err)
+	}
+	// The name is free again: a replacement session can take it immediately.
+	if err := manager.Register(testOrchestrator(t, "ec20")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.RequestEnabled("ec20", true); err != nil {
+		t.Fatal(err)
+	}
+	waitReady("ec20")
+}

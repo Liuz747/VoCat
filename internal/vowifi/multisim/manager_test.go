@@ -3,6 +3,7 @@ package multisim
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -294,62 +295,6 @@ func TestBlockedFactoryCannotPreventSiblingOrReleaseReaderOnStop(t *testing.T) {
 	waitFor(t, func() bool { return restored.Load() && !m.Owns(cfg.DeviceID) })
 }
 
-func TestReconfigureRestoresOldGroupBeforePreparingReplacement(t *testing.T) {
-	cfg := testConfig()
-	var prepares, restores atomic.Int32
-	restoreEntered, release := make(chan struct{}, 1), make(chan struct{})
-	m := New(Options{
-		Prepare: func(context.Context, Config) error { prepares.Add(1); return nil },
-		Restore: func(ctx context.Context, _ Config) error {
-			if restores.Add(1) == 1 {
-				restoreEntered <- struct{}{}
-				select {
-				case <-release:
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			}
-			return nil
-		},
-		Factory: func(_ context.Context, _ Config, p Profile, id string) (*vowifi.Orchestrator, error) {
-			return lifecycleOrchestrator(p, id, lifecycleTunnel{}, lifecycleIMS{})
-		},
-	})
-	t.Cleanup(func() { _ = m.Close(context.Background()) })
-	if err := m.Apply(context.Background(), cfg); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, func() bool {
-		s := m.State(cfg.DeviceID)
-		return len(s.Lines) == 2 && s.Lines[0].State.SMSReady && s.Lines[1].State.SMSReady
-	})
-	replacement := testConfig()
-	replacement.Profiles[1].ICCID = "8910000000000000003"
-	if err := m.Apply(context.Background(), replacement); err != nil {
-		t.Fatal(err)
-	}
-	<-restoreEntered
-	if !m.Owns(cfg.DeviceID) || prepares.Load() != 1 {
-		t.Fatal("replacement started before restoration finished")
-	}
-	for _, line := range m.State(cfg.DeviceID).Lines {
-		if line.State.Active || line.State.Enabled {
-			t.Fatal("old line still active during physical restoration")
-		}
-	}
-	close(release)
-	waitFor(t, func() bool {
-		s := m.State(cfg.DeviceID)
-		return prepares.Load() == 2 && len(s.Lines) == 2 && s.Lines[1].ICCID == "8910000000000000003" && s.Lines[1].State.SMSReady
-	})
-	if err := m.Reconnect(cfg.DeviceID, "8910000000000000002"); !errors.Is(err, ErrNotRegistered) {
-		t.Fatalf("removed line can reconnect: %v", err)
-	}
-	if err := m.Reconnect(cfg.DeviceID, "8910000000000000003"); err != nil {
-		t.Fatal(err)
-	}
-}
-
 type refreshIMS struct{ entered, release chan struct{} }
 
 func (p refreshIMS) Start(context.Context, vowifi.IMSRequest) (vowifi.IMSSession, error) {
@@ -507,5 +452,199 @@ func TestSendSMSSelectsLineByICCIDOrSessionAndRequiresSelectorForGroups(t *testi
 	}
 	if err := m.Close(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// countingIMS records how many IMS sessions were closed, per profile ICCID, so
+// a test can prove that reconfiguring a running group touched only the lines
+// that actually changed.
+type countingIMS struct {
+	mu     *sync.Mutex
+	closes map[string]int
+	iccid  string
+}
+
+func (p countingIMS) Start(context.Context, vowifi.IMSRequest) (vowifi.IMSSession, error) {
+	return &countingIMSSession{p: p}, nil
+}
+
+type countingIMSSession struct{ p countingIMS }
+
+func (*countingIMSSession) Evidence() vowifi.IMSEvidence {
+	return vowifi.IMSEvidence{Registered: true, RegistrationState: "registered"}
+}
+func (*countingIMSSession) EnableSMS(context.Context) (vowifi.SMSEvidence, error) {
+	return vowifi.SMSEvidence{Ready: true}, nil
+}
+func (s *countingIMSSession) Close(context.Context) error {
+	s.p.mu.Lock()
+	s.p.closes[s.p.iccid]++
+	s.p.mu.Unlock()
+	return nil
+}
+
+type incrementalFixture struct {
+	m         *Manager
+	prepares  *atomic.Int32
+	restores  *atomic.Int32
+	factories *atomic.Int32
+	closes    map[string]int
+	closesMu  *sync.Mutex
+}
+
+func newIncrementalFixture(t *testing.T, verify func(context.Context, Config, []Profile) error) incrementalFixture {
+	t.Helper()
+	f := incrementalFixture{prepares: &atomic.Int32{}, restores: &atomic.Int32{}, factories: &atomic.Int32{}, closes: map[string]int{}, closesMu: &sync.Mutex{}}
+	f.m = New(Options{
+		RetryInitial: 5 * time.Millisecond, RetryMaximum: 10 * time.Millisecond,
+		Prepare: func(context.Context, Config) error { f.prepares.Add(1); return nil },
+		Restore: func(context.Context, Config) error { f.restores.Add(1); return nil },
+		Verify:  verify,
+		Factory: func(_ context.Context, _ Config, p Profile, id string) (*vowifi.Orchestrator, error) {
+			f.factories.Add(1)
+			return lifecycleOrchestrator(p, id, lifecycleTunnel{}, countingIMS{mu: f.closesMu, closes: f.closes, iccid: p.ICCID})
+		},
+	})
+	t.Cleanup(func() { _ = f.m.Close(context.Background()) })
+	return f
+}
+
+func (f incrementalFixture) closed(iccid string) int {
+	f.closesMu.Lock()
+	defer f.closesMu.Unlock()
+	return f.closes[iccid]
+}
+
+func allReady(s GroupState, n int) bool {
+	if len(s.Lines) != n {
+		return false
+	}
+	for _, line := range s.Lines {
+		if !line.State.SMSReady {
+			return false
+		}
+	}
+	return true
+}
+
+func TestApplyAddsLineToRunningGroupWithoutRestartingSiblings(t *testing.T) {
+	f := newIncrementalFixture(t, nil)
+	cfg := testConfig()
+	if err := f.m.Apply(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return allReady(f.m.State(cfg.DeviceID), 2) })
+
+	grown := testConfig()
+	grown.Profiles[0].Name = "renamed"
+	grown.Profiles = append(grown.Profiles, Profile{ICCID: "8910000000000000003", AID: "A000000003", Name: "third"})
+	if err := f.m.Apply(context.Background(), grown); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return allReady(f.m.State(cfg.DeviceID), 3) })
+
+	s := f.m.State(cfg.DeviceID)
+	if s.Phase != "running" || s.Busy {
+		t.Fatalf("group phase %q busy=%v after incremental add", s.Phase, s.Busy)
+	}
+	if s.Lines[0].Name != "renamed" || s.Lines[2].ICCID != "8910000000000000003" {
+		t.Fatalf("lines after add: %+v", s.Lines)
+	}
+	if f.prepares.Load() != 1 || f.restores.Load() != 0 {
+		t.Fatalf("incremental add restarted the group: prepares=%d restores=%d", f.prepares.Load(), f.restores.Load())
+	}
+	if f.factories.Load() != 3 {
+		t.Fatalf("factories = %d, want 3 (siblings must not be rebuilt)", f.factories.Load())
+	}
+	if f.closed(cfg.Profiles[0].ICCID) != 0 || f.closed(cfg.Profiles[1].ICCID) != 0 {
+		t.Fatal("a sibling IMS session was closed by an incremental add")
+	}
+}
+
+func TestApplyRemovesOnlyTheDroppedLineAndAllowsReAdd(t *testing.T) {
+	f := newIncrementalFixture(t, nil)
+	cfg := testConfig()
+	if err := f.m.Apply(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return allReady(f.m.State(cfg.DeviceID), 2) })
+
+	dropped := cfg.Profiles[1].ICCID
+	shrunk := testConfig()
+	shrunk.Profiles = shrunk.Profiles[:1]
+	if err := f.m.Apply(context.Background(), shrunk); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return f.closed(dropped) == 1 })
+	waitFor(t, func() bool { return allReady(f.m.State(cfg.DeviceID), 1) })
+	if f.closed(cfg.Profiles[0].ICCID) != 0 {
+		t.Fatal("the surviving line was closed")
+	}
+	if err := f.m.Reconnect(cfg.DeviceID, dropped); !errors.Is(err, ErrNotRegistered) {
+		t.Fatalf("removed line still addressable: %v", err)
+	}
+	if _, _, err := f.m.SendSMS(context.Background(), cfg.DeviceID, dropped, vowifi.SMSSubmitRequest{}); !errors.Is(err, ErrNotRegistered) {
+		t.Fatalf("removed line still routable for SMS: %v", err)
+	}
+	if f.prepares.Load() != 1 || f.restores.Load() != 0 || !f.m.Owns(cfg.DeviceID) {
+		t.Fatalf("incremental remove restarted or released the group: prepares=%d restores=%d owned=%v", f.prepares.Load(), f.restores.Load(), f.m.Owns(cfg.DeviceID))
+	}
+
+	// Re-adding the same ICCID must work once its old session is gone.
+	if err := f.m.Apply(context.Background(), testConfig()); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return allReady(f.m.State(cfg.DeviceID), 2) })
+	if f.factories.Load() != 3 {
+		t.Fatalf("factories = %d, want 3", f.factories.Load())
+	}
+
+	// A full stop after incremental edits still releases the reader cleanly.
+	stop := testConfig()
+	stop.Enabled = false
+	if err := f.m.Apply(context.Background(), stop); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return !f.m.Owns(cfg.DeviceID) })
+	if f.restores.Load() != 1 {
+		t.Fatalf("restores = %d after stop", f.restores.Load())
+	}
+}
+
+func TestApplyRejectsAddedProfileThatVerifyRefuses(t *testing.T) {
+	refused := errors.New("multisim: selected profile is not present on this reader")
+	var verified [][]Profile
+	f := newIncrementalFixture(t, func(_ context.Context, _ Config, added []Profile) error {
+		verified = append(verified, added)
+		for _, p := range added {
+			if p.ICCID == "8910000000000000009" {
+				return refused
+			}
+		}
+		return nil
+	})
+	cfg := testConfig()
+	if err := f.m.Apply(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return allReady(f.m.State(cfg.DeviceID), 2) })
+	if len(verified) != 0 {
+		t.Fatal("Verify ran for the initial start; Prepare owns that check")
+	}
+
+	bad := testConfig()
+	bad.Profiles = append(bad.Profiles, Profile{ICCID: "8910000000000000009", AID: "A000000009"})
+	if err := f.m.Apply(context.Background(), bad); !errors.Is(err, refused) {
+		t.Fatalf("Apply error = %v, want the Verify refusal", err)
+	}
+	if len(verified) != 1 || len(verified[0]) != 1 || verified[0][0].ICCID != "8910000000000000009" {
+		t.Fatalf("Verify saw %+v, want only the added profile", verified)
+	}
+	s := f.m.State(cfg.DeviceID)
+	if !allReady(s, 2) || s.Phase != "running" || s.Busy {
+		t.Fatalf("refused add disturbed the group: %+v", s)
+	}
+	if f.factories.Load() != 2 || f.prepares.Load() != 1 {
+		t.Fatalf("refused add touched hardware: factories=%d prepares=%d", f.factories.Load(), f.prepares.Load())
 	}
 }

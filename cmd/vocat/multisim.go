@@ -230,8 +230,38 @@ func newMultiSIMIntegration(database *store.Store, devices *device.Manager, sing
 		OperationTimeout: 6 * time.Minute, CleanupTimeout: 60 * time.Second,
 		RetryInitial: 5 * time.Second, RetryMaximum: 2 * time.Minute,
 		CardHealth: bridge.cardHealth,
-		Prepare:    bridge.prepare, Restore: bridge.restore, Factory: bridge.factory})
+		Prepare:    bridge.prepare, Restore: bridge.restore, Factory: bridge.factory, Verify: bridge.verify})
 	return bridge, manager
+}
+
+// verify admits profiles added to a running group: they must exist on the
+// eUICC the group already owns. The inventory read takes the shared reader
+// lock, so it queues behind any authentication in flight instead of
+// interleaving APDUs with it.
+func (bridge *multiSIMIntegration) verify(ctx context.Context, config multisim.Config, added []multisim.Profile) error {
+	bridge.mu.Lock()
+	reader := bridge.readers[config.DeviceID]
+	bridge.mu.Unlock()
+	if reader == nil || reader.backend == nil {
+		return errors.New("multisim: reader is not prepared")
+	}
+	inventory, err := bridge.devices.ESIMListProfiles(ctx, reader.backend.physicalID)
+	if err != nil {
+		return err
+	}
+	available := make(map[string]bool, len(inventory.Profiles))
+	for _, profile := range inventory.Profiles {
+		available[profile.ICCID] = true
+	}
+	for _, profile := range added {
+		if !available[profile.ICCID] {
+			return errors.New("multisim: selected profile is not present on this reader")
+		}
+		if profile.AID != "" && inventory.AID != "" && !strings.EqualFold(profile.AID, inventory.AID) {
+			return errors.New("multisim: selected profiles must belong to the same eUICC")
+		}
+	}
+	return nil
 }
 
 func (bridge *multiSIMIntegration) prepare(ctx context.Context, config multisim.Config) error {

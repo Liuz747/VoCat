@@ -743,6 +743,45 @@ func (manager *Manager) Close(ctx context.Context) error {
 	return errors.Join(closeErrors...)
 }
 
+// Remove closes one registered session and forgets it, leaving every other
+// session untouched. The device ID is free for a new Register as soon as
+// Remove returns. Pending lifecycle operations and automatic retries for the
+// session are cancelled; the orchestrator's own Close performs the network
+// de-registration and tunnel teardown.
+func (manager *Manager) Remove(ctx context.Context, deviceID string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	manager.mu.Lock()
+	if manager.closed {
+		manager.mu.Unlock()
+		return ErrClosed
+	}
+	item := manager.entries[deviceID]
+	if item == nil {
+		manager.mu.Unlock()
+		return ErrNotRegistered
+	}
+	delete(manager.entries, deviceID)
+	item.desiredEnabled = false
+	item.reconnectPending = false
+	cancelOperation := item.operationCancel
+	manager.mu.Unlock()
+
+	if item.stopWatch != nil {
+		item.stopWatch()
+	}
+	if cancelOperation != nil {
+		cancelOperation()
+	}
+	manager.logger.Info("VoWiFi session removed", "device_id", deviceID)
+	closeErr := item.orchestrator.Close(ctx)
+	if errors.Is(closeErr, vowifi.ErrCleanupIncomplete) {
+		closeErr = nil
+	}
+	return errors.Join(closeErr, item.orchestrator.WaitCleanup(ctx))
+}
+
 // WaitCleanup observes an existing orchestrator without creating a runtime or
 // touching hardware. Quiesce lifecycle requests before an ownership handoff.
 func (manager *Manager) WaitCleanup(ctx context.Context, deviceID string) error {

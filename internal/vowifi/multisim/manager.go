@@ -31,11 +31,14 @@ type group struct {
 	cancel        context.CancelFunc
 	next          *Config
 	stopRequested bool
-	wake          chan struct{}
-	runtime       *vowifiruntime.Manager
-	lines         []*line
-	initializers  sync.WaitGroup
-	actions       sync.WaitGroup
+	// reconciling serialises incremental edits of a running group without
+	// marking the group busy, so SMS and line operations keep working.
+	reconciling  bool
+	wake         chan struct{}
+	runtime      *vowifiruntime.Manager
+	lines        []*line
+	initializers sync.WaitGroup
+	actions      sync.WaitGroup
 }
 
 type line struct {
@@ -45,6 +48,16 @@ type line struct {
 	lastError      string
 	retryWake      chan struct{}
 	refreshPending bool
+	// cancel stops this line's initialization without touching the group;
+	// initialized is closed once initializeLine has returned.
+	ctx         context.Context
+	cancel      context.CancelFunc
+	initialized chan struct{}
+}
+
+func newLine(cycleCtx context.Context, deviceID string, profile Profile) *line {
+	ctx, cancel := context.WithCancel(cycleCtx)
+	return &line{profile: profile, sessionID: LineID(deviceID, profile.ICCID), retryWake: make(chan struct{}, 1), ctx: ctx, cancel: cancel, initialized: make(chan struct{})}
 }
 
 func New(options Options) *Manager {
@@ -98,11 +111,23 @@ func (m *Manager) Apply(ctx context.Context, config Config) error {
 		return errors.New("multisim: orchestrator factory is required")
 	}
 	if g != nil && g.owned {
-		if g.state.Busy {
+		if g.state.Busy || g.reconciling {
 			return ErrOperationInProgress
 		}
-		if !g.stopRequested && g.state.Phase == "running" && reflect.DeepEqual(g.config, config) {
-			return nil
+		if !g.stopRequested && g.state.Phase == "running" {
+			if reflect.DeepEqual(g.config, config) {
+				return nil
+			}
+			if g.config.Enabled && g.config.DeviceID == config.DeviceID {
+				// Same reader, same enabled group: edit the line set in place
+				// instead of tearing every line down and rebuilding the group.
+				g.reconciling = true
+				m.mu.Unlock()
+				err := m.reconcile(ctx, g, config)
+				m.mu.Lock()
+				g.reconciling = false
+				return err
+			}
 		}
 		g.next = &config
 		g.stopRequested = true
@@ -329,22 +354,130 @@ func (m *Manager) start(g *group, cycleCtx context.Context, config Config) error
 	m.mu.Lock()
 	g.runtime = runtime
 	for _, profile := range config.Profiles {
-		g.lines = append(g.lines, &line{profile: profile, sessionID: LineID(config.DeviceID, profile.ICCID), retryWake: make(chan struct{}, 1)})
+		g.lines = append(g.lines, newLine(cycleCtx, config.DeviceID, profile))
 	}
 	items := append([]*line(nil), g.lines...)
 	g.initializers.Add(len(items))
 	m.mu.Unlock()
 	for _, item := range items {
-		go m.initializeLine(g, cycleCtx, config, runtime, item)
+		go m.initializeLine(g, config, runtime, item)
 	}
 	return ctx.Err()
+}
+
+// profileDiff splits a desired profile list against the running one. A changed
+// AID is a removal plus an addition; a changed name is applied in place.
+func profileDiff(current, desired []Profile) (added, removed, renamed []Profile) {
+	running := make(map[string]Profile, len(current))
+	for _, profile := range current {
+		running[profile.ICCID] = profile
+	}
+	wanted := make(map[string]bool, len(desired))
+	for _, profile := range desired {
+		wanted[profile.ICCID] = true
+		previous, ok := running[profile.ICCID]
+		switch {
+		case !ok:
+			added = append(added, profile)
+		case !strings.EqualFold(previous.AID, profile.AID):
+			removed = append(removed, previous)
+			added = append(added, profile)
+		case previous.Name != profile.Name:
+			renamed = append(renamed, profile)
+		}
+	}
+	for _, profile := range current {
+		if !wanted[profile.ICCID] {
+			removed = append(removed, profile)
+		}
+	}
+	return added, removed, renamed
+}
+
+// reconcile applies a changed profile list to a running group. The caller
+// holds g.reconciling and has released m.mu; Verify may need the reader.
+func (m *Manager) reconcile(ctx context.Context, g *group, config Config) error {
+	m.mu.Lock()
+	added, removed, renamed := profileDiff(g.config.Profiles, config.Profiles)
+	m.mu.Unlock()
+	if len(added) > 0 && m.options.Verify != nil {
+		if err := m.options.Verify(ctx, config, added); err != nil {
+			return err
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrClosed
+	}
+	if g.stopRequested || g.state.Phase != "running" || g.runtime == nil {
+		return ErrOperationInProgress
+	}
+	g.config = config
+	g.state.UpdatedAt = time.Now().UTC()
+	for _, profile := range renamed {
+		for _, item := range g.lines {
+			if item.profile.ICCID == profile.ICCID {
+				item.profile.Name = profile.Name
+			}
+		}
+	}
+	for _, profile := range removed {
+		for index, item := range g.lines {
+			if item.profile.ICCID != profile.ICCID {
+				continue
+			}
+			g.lines = append(g.lines[:index], g.lines[index+1:]...)
+			g.actions.Add(1)
+			go m.removeLine(g, item)
+			break
+		}
+	}
+	runtime := g.runtime
+	for _, profile := range added {
+		item := newLine(g.ctx, config.DeviceID, profile)
+		g.lines = append(g.lines, item)
+		g.initializers.Add(1)
+		go m.initializeLine(g, config, runtime, item)
+	}
+	m.options.Logger.Info("multisim group reconciled in place",
+		"device_id", config.DeviceID, "added", len(added), "removed", len(removed), "renamed", len(renamed), "lines", len(g.lines))
+	return nil
+}
+
+// removeLine stops one line's initialization, then closes and forgets its
+// session. Siblings are never touched; the group stays running.
+func (m *Manager) removeLine(g *group, item *line) {
+	defer g.actions.Done()
+	item.cancel()
+	<-item.initialized
+	m.mu.Lock()
+	orchestrator := item.orchestrator
+	runtime := g.runtime
+	deviceID := g.config.DeviceID
+	m.mu.Unlock()
+	attrs := []any{"device_id", deviceID, "session_id", item.sessionID,
+		"profile_suffix", profileSuffix(item.profile.ICCID), "profile_name", item.profile.Name}
+	if orchestrator == nil || runtime == nil {
+		m.options.Logger.Info("multisim line removed before it was created", attrs...)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), m.options.CleanupTimeout)
+	defer cancel()
+	if err := runtime.Remove(ctx, item.sessionID); err != nil && !errors.Is(err, vowifiruntime.ErrNotRegistered) && !errors.Is(err, vowifiruntime.ErrClosed) {
+		m.options.Logger.Warn("multisim line removal left cleanup incomplete", append(attrs, "error", err)...)
+		return
+	}
+	m.options.Logger.Info("multisim line removed", attrs...)
 }
 
 // Construction can fail independently (for example a temporary database read).
 // Retry only construction here; once registered, runtime.Manager owns all
 // session retries and failure notifications for this line.
-func (m *Manager) initializeLine(g *group, cycleCtx context.Context, config Config, runtime *vowifiruntime.Manager, item *line) {
+func (m *Manager) initializeLine(g *group, config Config, runtime *vowifiruntime.Manager, item *line) {
 	defer g.initializers.Done()
+	defer close(item.initialized)
+	cycleCtx := item.ctx
 	retry := m.options.RetryInitial
 	if retry <= 0 {
 		retry = 2 * time.Second
