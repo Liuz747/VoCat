@@ -229,13 +229,19 @@ func newMultiSIMIntegration(database *store.Store, devices *device.Manager, sing
 		// 20-profile group needs several minutes of reader time in total.
 		OperationTimeout: 6 * time.Minute, CleanupTimeout: 60 * time.Second,
 		RetryInitial: 5 * time.Second, RetryMaximum: 2 * time.Minute,
-		// Right after a restart prepare can run before hardware discovery has
-		// found the reader; keep retrying (5 s doubling to 60 s) instead of
-		// requiring the configuration to be saved again.
-		PrepareRetryable: func(err error) bool { return errors.Is(err, device.ErrNotFound) },
+		PrepareRetryable: multiSIMPrepareRetryable,
 		CardHealth:       bridge.cardHealth,
 		Prepare:          bridge.prepare, Restore: bridge.restore, Factory: bridge.factory, Verify: bridge.verify})
 	return bridge, manager
+}
+
+// multiSIMPrepareRetryable reports whether prepare failed only because the
+// reader is not usable yet. Right after a restart prepare can run before
+// hardware discovery has found the reader, and a module that re-enumerates
+// during prepare stops matching the reader it reserved; keep retrying (5 s
+// doubling to 60 s) instead of requiring the configuration to be saved again.
+func multiSIMPrepareRetryable(err error) bool {
+	return errors.Is(err, device.ErrNotFound) || errors.Is(err, errReaderRemapped)
 }
 
 // verify admits profiles added to a running group: they must exist on the
@@ -554,6 +560,10 @@ type multiSIMPinnedAT struct {
 	deviceID, physicalID string
 }
 
+// errReaderRemapped means the configured device now resolves to a different
+// physical reader than the one reserved, as after a modem re-enumeration.
+var errReaderRemapped = errors.New("multisim: configured device no longer maps to the reserved physical reader")
+
 func (p multiSIMPinnedAT) physical(ctx context.Context, id string) (device.Device, error) {
 	if err := ctx.Err(); err != nil {
 		return device.Device{}, err
@@ -566,7 +576,7 @@ func (p multiSIMPinnedAT) physical(ctx context.Context, id string) (device.Devic
 		return device.Device{}, err
 	}
 	if current.ID != p.physicalID {
-		return device.Device{}, errors.New("multisim: configured device no longer maps to the reserved physical reader")
+		return device.Device{}, errReaderRemapped
 	}
 	if err := ctx.Err(); err != nil {
 		return device.Device{}, err

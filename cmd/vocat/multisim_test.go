@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -190,6 +191,50 @@ func TestMultiSIMPinnedExecutorRejectsRemappedReader(t *testing.T) {
 	}
 	if len(devices.calls) != 1 || devices.calls[0] != "physical-a:AT" {
 		t.Fatalf("unexpected hardware operations: %v", devices.calls)
+	}
+}
+
+func TestMultiSIMPrepareRetriesMissingOrRemappedReader(t *testing.T) {
+	ctx := context.Background()
+	database := newRegionTestStore(t)
+	cfg := store.Device{ID: "configured", Name: "modem", ATPort: "/dev/a"}
+	if err := database.UpsertDevice(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	devices := &multiSIMTestAT{entries: []device.Device{
+		{ID: "physical-a", Discovered: true, Candidate: modem.Candidate{ATPort: modem.Port{Path: "/dev/a"}}},
+		{ID: "physical-b", Discovered: true, Candidate: modem.Candidate{ATPort: modem.Port{Path: "/dev/b"}}},
+	}}
+	pinned := multiSIMPinnedAT{mapper: integration.ATMapper{Store: database, Devices: devices}, deviceID: cfg.ID, physicalID: "physical-a"}
+	// The module re-enumerated in the middle of prepare: the configuration now
+	// resolves to another physical reader than the one reserved.
+	cfg.ATPort = "/dev/b"
+	if err := database.UpsertDevice(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	_, remapped := pinned.physical(ctx, cfg.ID)
+	if remapped == nil {
+		t.Fatal("remapped reader accepted")
+	}
+	_, remappedAT := pinned.ExecuteAT(ctx, cfg.ID, "AT+CFUN?")
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"reader_not_discovered", device.ErrNotFound, true},
+		{"reader_remapped", remapped, true},
+		{"reader_remapped_through_adapter", fmt.Errorf("enter EC20 RF-off mode: %w", remappedAT), true},
+		{"configuration_deleted", store.ErrNotFound, false},
+		{"profile_missing", errors.New("multisim: selected profile is not present on this reader"), false},
+		{"invalid_binding", errors.New("multisim: physical reader binding is invalid"), false},
+	} {
+		if got := multiSIMPrepareRetryable(tc.err); got != tc.want {
+			t.Errorf("%s: retryable = %v, want %v (%v)", tc.name, got, tc.want, tc.err)
+		}
+	}
+	if len(devices.calls) != 0 {
+		t.Fatalf("remapped reader received commands: %v", devices.calls)
 	}
 }
 
