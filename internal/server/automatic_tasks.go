@@ -522,7 +522,9 @@ func (s *Server) prepareAutomaticTaskEnvironment(ctx context.Context, config *st
 		if _, err := s.devices.SetFlight(ctx, physicalID, true); err != nil {
 			return fmt.Errorf("enable airplane mode for VoWiFi: %w", err)
 		}
-		config.VoWiFiEnabled, config.NetworkEnabled = true, false
+		// A user-configured VoWiFi task is explicit intent for this device;
+		// clear the user "off" mark so reconciliation does not fight the run.
+		config.VoWiFiEnabled, config.NetworkEnabled, config.VoWiFiUserDisabled = true, false, false
 		if err := s.store.UpsertDevice(ctx, *config); err != nil {
 			return err
 		}

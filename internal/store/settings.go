@@ -379,10 +379,10 @@ func (s *Store) UpsertCardPolicy(ctx context.Context, value CardPolicy) error {
 	if createdAt.IsZero() {
 		createdAt = now
 	}
-	updatedAt := value.UpdatedAt
-	if updatedAt.IsZero() {
-		updatedAt = now
-	}
+	// Every caller reads the row, edits it and writes it back, so the value
+	// carries the previous UpdatedAt. Stamp the write time here; otherwise an
+	// unchanged updated_at looks like proof that nobody wrote the policy.
+	updatedAt := now
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO card_policies (
 			iccid, network_enabled, vowifi_enabled, airplane_enabled,

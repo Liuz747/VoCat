@@ -39,6 +39,11 @@ type Device struct {
 	NetworkEnabled     bool
 	SMSEnabled         bool
 	VoWiFiEnabled      bool
+	// VoWiFiUserDisabled records an explicit user "off" for this device. Card
+	// policy reconciliation may switch a device off, but it must not switch a
+	// user-disabled device back on; only a new registration or an explicit
+	// user "on" clears it.
+	VoWiFiUserDisabled bool
 	Extra              json.RawMessage
 	CreatedAt          time.Time
 	UpdatedAt          time.Time

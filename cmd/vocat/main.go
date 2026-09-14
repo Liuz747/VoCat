@@ -1529,11 +1529,11 @@ func enforceDefaultSafeCardPolicy(
 	iccid := strings.TrimSpace(snapshot.ICCID)
 	policy, err := database.CardPolicy(ctx, iccid)
 	if err == nil {
-		// Replace only automatic blocks left by older releases. Explicit user
-		// policies keep their settings, regardless of the SIM's home country.
-		if policy.Source != "auto_region_block" {
-			return
-		}
+		// An existing policy is never rewritten here, whatever its source.
+		// This automatic path must not flip vowifi_enabled from 0 back to 1:
+		// with 49 blank eUICCs sharing one placeholder ICCID, a single flip
+		// re-opened single-line VoWiFi on every module (2026-09-14).
+		return
 	} else if errors.Is(err, store.ErrNotFound) {
 		policy = store.CardPolicy{ICCID: iccid, IPVersion: "IPV4V6"}
 	} else {
@@ -1575,6 +1575,41 @@ func enforceDefaultSafeCardPolicy(
 	logger.Info("new SIM protected by default VoWiFi/airplane policy", "device_id", physicalID, "iccid", iccid)
 }
 
+// desiredDeviceVoWiFi decides whether single-line VoWiFi should run on a
+// configured device that currently hosts the given ICCID. The card policy is
+// the baseline; an explicit user "off" on the device and the blank-eUICC
+// placeholder identity both hold it off. The reason is empty when VoWiFi is
+// wanted, otherwise one of policy_disabled, user_disabled, placeholder_iccid.
+func desiredDeviceVoWiFi(config store.Device, policy store.CardPolicy, iccid string) (bool, string) {
+	switch {
+	case device.IsPlaceholderICCID(iccid):
+		return false, "placeholder_iccid"
+	case config.VoWiFiUserDisabled:
+		return false, "user_disabled"
+	case !policy.VoWiFiEnabled:
+		return false, "policy_disabled"
+	}
+	return true, ""
+}
+
+// applyDesiredDeviceVoWiFi mirrors the effective VoWiFi decision and the
+// policy APN into the device row. It reports whether the row changed.
+func applyDesiredDeviceVoWiFi(config store.Device, policy store.CardPolicy, wantVoWiFi bool) (store.Device, bool) {
+	changed := false
+	if config.VoWiFiEnabled != wantVoWiFi || (wantVoWiFi && config.NetworkEnabled) {
+		config.VoWiFiEnabled = wantVoWiFi
+		if wantVoWiFi {
+			config.NetworkEnabled = false
+		}
+		changed = true
+	}
+	if config.APN != strings.TrimSpace(policy.APN) {
+		config.APN = strings.TrimSpace(policy.APN)
+		changed = true
+	}
+	return config, changed
+}
+
 func reconcileCardPolicies(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -1584,6 +1619,9 @@ func reconcileCardPolicies(
 	owners ...multiSIMOwner,
 ) {
 	observedCards := make(map[string]string)
+	// Devices whose blank-eUICC placeholder identity has already been logged;
+	// cleared when the device reports a different ICCID.
+	placeholderLogged := make(map[string]bool)
 	wifi410StartupNotBefore := time.Now().Add(wifi410VoWiFiStartupDelay)
 	reconcile := func() {
 		policies, policyListErr := database.ListCardPolicies(ctx)
@@ -1642,18 +1680,17 @@ func reconcileCardPolicies(
 					continue
 				}
 			}
-			deviceChanged := false
-			if config.VoWiFiEnabled != policy.VoWiFiEnabled || (policy.VoWiFiEnabled && config.NetworkEnabled) {
-				config.VoWiFiEnabled = policy.VoWiFiEnabled
-				if policy.VoWiFiEnabled {
-					config.NetworkEnabled = false
+			wantVoWiFi, holdReason := desiredDeviceVoWiFi(config, policy, iccid)
+			if holdReason == "placeholder_iccid" {
+				if !placeholderLogged[config.ID] {
+					placeholderLogged[config.ID] = true
+					logger.Info("blank eUICC reports the placeholder ICCID; single-line VoWiFi stays off until a profile is enabled",
+						"device_id", config.ID, "iccid", iccid)
 				}
-				deviceChanged = true
+			} else {
+				delete(placeholderLogged, config.ID)
 			}
-			if config.APN != strings.TrimSpace(policy.APN) {
-				config.APN = strings.TrimSpace(policy.APN)
-				deviceChanged = true
-			}
+			config, deviceChanged := applyDesiredDeviceVoWiFi(config, policy, wantVoWiFi)
 			if deviceChanged {
 				if err := database.UpsertDevice(ctx, config); err != nil {
 					logger.Warn("reconcile card policy: update device", "device_id", config.ID, "error", err)
@@ -1661,7 +1698,7 @@ func reconcileCardPolicies(
 				}
 			}
 			state, stateErr := vowifiManager.State(config.ID)
-			if policy.VoWiFiEnabled {
+			if wantVoWiFi {
 				if !entry.Snapshot.FlightMode {
 					flightContext, cancel := context.WithTimeout(ctx, flightModeTransitionTimeout)
 					_, _ = manager.SetFlight(flightContext, entry.ID, true)

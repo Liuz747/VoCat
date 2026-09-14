@@ -492,7 +492,11 @@ func (s *Server) handleEsimSwitch(w http.ResponseWriter, r *http.Request, config
 		s.writeStoreError(w, err)
 		return
 	}
-	config.VoWiFiEnabled = policy.VoWiFiEnabled
+	// The target profile's policy is the baseline, but an explicit user "off"
+	// on this device and the blank-eUICC placeholder identity both keep
+	// single-line VoWiFi off.
+	wantVoWiFi := policy.VoWiFiEnabled && !config.VoWiFiUserDisabled && !device.IsPlaceholderICCID(iccid)
+	config.VoWiFiEnabled = wantVoWiFi
 	config.NetworkEnabled = false
 	config.APN = policy.APN
 	if err := s.store.UpsertDevice(r.Context(), config); err != nil {
@@ -508,7 +512,7 @@ func (s *Server) handleEsimSwitch(w http.ResponseWriter, r *http.Request, config
 	canRestoreFlightImmediately := s.vowifi == nil
 	if s.vowifi != nil {
 		state, stateErr := s.vowifi.State(configuredID)
-		if policy.VoWiFiEnabled {
+		if wantVoWiFi {
 			switch {
 			case stateErr == nil && state.Enabled:
 				_, err = s.vowifi.RequestReconnect(configuredID)
@@ -521,10 +525,10 @@ func (s *Server) handleEsimSwitch(w http.ResponseWriter, r *http.Request, config
 			canRestoreFlightImmediately = true
 		}
 		if err != nil {
-			s.logger.Warn("profile switched but saved VoWiFi state was not queued", "device_id", configuredID, "iccid", iccid, "enabled", policy.VoWiFiEnabled, "error", err)
+			s.logger.Warn("profile switched but saved VoWiFi state was not queued", "device_id", configuredID, "iccid", iccid, "enabled", wantVoWiFi, "error", err)
 		}
 	}
-	if !policy.VoWiFiEnabled && canRestoreFlightImmediately && !policy.AirplaneEnabled {
+	if !wantVoWiFi && canRestoreFlightImmediately && !policy.AirplaneEnabled {
 		if _, err := s.devices.SetFlight(r.Context(), physicalID, false); err != nil {
 			s.logger.Warn("profile switched but saved airplane state will require reconciliation", "device_id", configuredID, "iccid", iccid, "error", err)
 		}

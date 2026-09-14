@@ -525,6 +525,14 @@ func migrationStatements(version int) []string {
 			 WHEN NEW.status IN ('queued','running') AND EXISTS(SELECT 1 FROM device_multisim WHERE device_id=NEW.device_id AND enabled=1)
 			 BEGIN SELECT RAISE(ABORT,'multisim_enabled'); END`,
 		}
+	case 27:
+		return []string{
+			// Explicit user "off" for single-line VoWiFi. Card policy
+			// reconciliation used to mirror the per-ICCID policy into every
+			// device row, re-opening VoWiFi that the user had switched off
+			// (2026-09-14, 49 blank-eUICC modules after a hub reset).
+			`ALTER TABLE devices ADD COLUMN vowifi_user_disabled INTEGER NOT NULL DEFAULT 0 CHECK (vowifi_user_disabled IN (0, 1))`,
+		}
 	default:
 		return nil
 	}

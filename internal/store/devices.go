@@ -178,9 +178,9 @@ func upsertDevice(ctx context.Context, executor contextExecer, value Device) err
 			audio_device, modem_imei, sim_pin, apn, proxy_port, baud_rate,
 			data_bits, stop_bits, parity, device_backend, esim_transport,
 			qmi_use_proxy, qmi_proxy_path, qmi_proxy_executable,
-			network_enabled, sms_enabled, vowifi_enabled, extra_json,
+			network_enabled, sms_enabled, vowifi_enabled, vowifi_user_disabled, extra_json,
 			created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
 			device_type = excluded.device_type,
@@ -205,6 +205,7 @@ func upsertDevice(ctx context.Context, executor contextExecer, value Device) err
 			network_enabled = excluded.network_enabled,
 			sms_enabled = excluded.sms_enabled,
 			vowifi_enabled = excluded.vowifi_enabled,
+			vowifi_user_disabled = excluded.vowifi_user_disabled,
 			extra_json = excluded.extra_json,
 			updated_at = excluded.updated_at
 	`,
@@ -214,7 +215,7 @@ func upsertDevice(ctx context.Context, executor contextExecer, value Device) err
 		value.Parity, value.DeviceBackend, value.ESIMTransport,
 		boolInt(value.QMIUseProxy), value.QMIProxyPath, value.QMIProxyExecutable,
 		boolInt(value.NetworkEnabled), boolInt(value.SMSEnabled),
-		boolInt(value.VoWiFiEnabled), string(extra), createdAt.Unix(),
+		boolInt(value.VoWiFiEnabled), boolInt(value.VoWiFiUserDisabled), string(extra), createdAt.Unix(),
 		updatedAt.Unix(),
 	)
 	if err != nil {
@@ -302,12 +303,12 @@ const deviceSelect = `
 		audio_device, modem_imei, sim_pin, apn, proxy_port, baud_rate, data_bits,
 		stop_bits, parity, device_backend, esim_transport, qmi_use_proxy,
 		qmi_proxy_path, qmi_proxy_executable, network_enabled, sms_enabled,
-		vowifi_enabled, extra_json, created_at, updated_at
+		vowifi_enabled, vowifi_user_disabled, extra_json, created_at, updated_at
 	FROM devices`
 
 func scanDevice(row rowScanner) (Device, error) {
 	var value Device
-	var qmiUseProxy, networkEnabled, smsEnabled, vowifiEnabled int
+	var qmiUseProxy, networkEnabled, smsEnabled, vowifiEnabled, vowifiUserDisabled int
 	var extra string
 	var createdAt, updatedAt int64
 	err := row.Scan(
@@ -317,7 +318,7 @@ func scanDevice(row rowScanner) (Device, error) {
 		&value.StopBits, &value.Parity, &value.DeviceBackend,
 		&value.ESIMTransport, &qmiUseProxy, &value.QMIProxyPath,
 		&value.QMIProxyExecutable, &networkEnabled, &smsEnabled,
-		&vowifiEnabled, &extra, &createdAt, &updatedAt,
+		&vowifiEnabled, &vowifiUserDisabled, &extra, &createdAt, &updatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Device{}, ErrNotFound
@@ -329,6 +330,7 @@ func scanDevice(row rowScanner) (Device, error) {
 	value.NetworkEnabled = networkEnabled != 0
 	value.SMSEnabled = smsEnabled != 0
 	value.VoWiFiEnabled = vowifiEnabled != 0
+	value.VoWiFiUserDisabled = vowifiUserDisabled != 0
 	value.DeviceType = NormalizeDeviceType(value.DeviceType)
 	value.Extra = []byte(extra)
 	value.CreatedAt = time.Unix(createdAt, 0).UTC()
