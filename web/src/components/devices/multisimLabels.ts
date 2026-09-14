@@ -6,7 +6,7 @@ type Translate = (text: string) => string;
 export function multiSIMGroupPhaseLabel(phase: string, t: Translate): string {
   const phases: Record<string, string> = {
     disabled: t("已停止"), idle: t("未启动"), pending: t("等待启动"), starting: t("正在建立线路"),
-    preparing: t("正在接管设备"), stopping: t("正在停止并恢复设备"), ready: t("运行中"),
+    preparing: t("正在接管设备"), waiting_device: t("等待设备就绪，自动重试"), stopping: t("正在停止并恢复设备"), ready: t("运行中"),
     active: t("运行中"), running: t("运行中"), restoring: t("正在恢复设备"), partial: t("部分线路可用"), failed: t("运行失败"),
     cleanup_failed: t("线路清理失败"), restore_failed: t("设备恢复失败"),
   };

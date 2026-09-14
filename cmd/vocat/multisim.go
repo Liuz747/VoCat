@@ -229,8 +229,12 @@ func newMultiSIMIntegration(database *store.Store, devices *device.Manager, sing
 		// 20-profile group needs several minutes of reader time in total.
 		OperationTimeout: 6 * time.Minute, CleanupTimeout: 60 * time.Second,
 		RetryInitial: 5 * time.Second, RetryMaximum: 2 * time.Minute,
-		CardHealth: bridge.cardHealth,
-		Prepare:    bridge.prepare, Restore: bridge.restore, Factory: bridge.factory})
+		// Right after a restart prepare can run before hardware discovery has
+		// found the reader; keep retrying (5 s doubling to 60 s) instead of
+		// requiring the configuration to be saved again.
+		PrepareRetryable: func(err error) bool { return errors.Is(err, device.ErrNotFound) },
+		CardHealth:       bridge.cardHealth,
+		Prepare:          bridge.prepare, Restore: bridge.restore, Factory: bridge.factory})
 	return bridge, manager
 }
 

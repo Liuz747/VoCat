@@ -3,6 +3,7 @@ package multisim
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -100,6 +101,155 @@ func TestPrepareFailureRestoresAndRestoreFailureRetainsOwnershipForRetry(t *test
 		t.Fatalf("restoration retry count %d", restores.Load())
 	}
 	_ = m.Close(context.Background())
+}
+
+var errReaderMissing = errors.New("reader not discovered yet")
+
+func readerMissing(err error) bool { return errors.Is(err, errReaderMissing) }
+
+func TestPrepareRetriesUntilReaderAppears(t *testing.T) {
+	cfg := testConfig()
+	var prepares, restores atomic.Int32
+	var present atomic.Bool
+	m := New(Options{
+		PrepareRetryable: readerMissing, PrepareRetryInitial: 5 * time.Millisecond, PrepareRetryMaximum: 10 * time.Millisecond,
+		Prepare: func(context.Context, Config) error {
+			prepares.Add(1)
+			if !present.Load() {
+				return fmt.Errorf("resolve reader: %w", errReaderMissing)
+			}
+			return nil
+		},
+		Restore: func(context.Context, Config) error { restores.Add(1); return nil },
+		Factory: func(_ context.Context, _ Config, p Profile, id string) (*vowifi.Orchestrator, error) {
+			return lifecycleOrchestrator(p, id, lifecycleTunnel{}, lifecycleIMS{})
+		},
+	})
+	t.Cleanup(func() { _ = m.Close(context.Background()) })
+	if err := m.Apply(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return prepares.Load() >= 2 })
+	if state := m.State(cfg.DeviceID); !state.Enabled || !m.Owns(cfg.DeviceID) {
+		t.Fatalf("group gave up while its reader was missing: %+v", state)
+	}
+	present.Store(true)
+	waitFor(t, func() bool {
+		s := m.State(cfg.DeviceID)
+		return s.Phase == "running" && len(s.Lines) == 2 && s.Lines[0].State.SMSReady && s.Lines[1].State.SMSReady
+	})
+	if restores.Load() < 1 {
+		t.Fatal("failed preparation was not restored before retrying")
+	}
+}
+
+func TestPrepareRetryWaitsInVisiblePhaseAndStopsWhenDisabled(t *testing.T) {
+	cfg := testConfig()
+	var prepares atomic.Int32
+	m := New(Options{
+		PrepareRetryable: readerMissing, PrepareRetryInitial: time.Hour, PrepareRetryMaximum: time.Hour,
+		Prepare: func(context.Context, Config) error { prepares.Add(1); return errReaderMissing },
+		Factory: func(context.Context, Config, Profile, string) (*vowifi.Orchestrator, error) {
+			t.Error("factory ran without a prepared reader")
+			return nil, errors.New("unexpected")
+		},
+	})
+	t.Cleanup(func() { _ = m.Close(context.Background()) })
+	if err := m.Apply(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return m.State(cfg.DeviceID).Phase == "waiting_device" })
+	if state := m.State(cfg.DeviceID); !state.Enabled || state.Busy || state.LastError == "" {
+		t.Fatalf("waiting state = %+v", state)
+	}
+	cfg.Enabled = false
+	if err := m.Apply(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return !m.Owns(cfg.DeviceID) })
+	if state := m.State(cfg.DeviceID); state.Enabled || state.Phase != "idle" {
+		t.Fatalf("disabled group state = %+v", state)
+	}
+	if prepares.Load() != 1 {
+		t.Fatalf("prepare ran %d times after the group was disabled", prepares.Load())
+	}
+}
+
+func TestResaveDuringPrepareRetryStartsReplacementImmediately(t *testing.T) {
+	cfg := testConfig()
+	var present atomic.Bool
+	m := New(Options{
+		PrepareRetryable: readerMissing, PrepareRetryInitial: time.Hour, PrepareRetryMaximum: time.Hour,
+		Prepare: func(context.Context, Config) error {
+			if !present.Load() {
+				return errReaderMissing
+			}
+			return nil
+		},
+		Factory: func(_ context.Context, _ Config, p Profile, id string) (*vowifi.Orchestrator, error) {
+			return lifecycleOrchestrator(p, id, lifecycleTunnel{}, lifecycleIMS{})
+		},
+	})
+	t.Cleanup(func() { _ = m.Close(context.Background()) })
+	if err := m.Apply(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return m.State(cfg.DeviceID).Phase == "waiting_device" })
+	present.Store(true)
+	if err := m.Apply(context.Background(), cfg); err != nil {
+		t.Fatalf("re-save while waiting was rejected: %v", err)
+	}
+	waitFor(t, func() bool {
+		s := m.State(cfg.DeviceID)
+		return s.Phase == "running" && len(s.Lines) == 2 && s.Lines[0].State.SMSReady && s.Lines[1].State.SMSReady
+	})
+}
+
+func TestCloseEndsPrepareRetryAndReleasesReader(t *testing.T) {
+	cfg := testConfig()
+	m := New(Options{
+		PrepareRetryable: readerMissing, PrepareRetryInitial: time.Hour, PrepareRetryMaximum: time.Hour,
+		Prepare: func(context.Context, Config) error { return errReaderMissing },
+		Factory: func(context.Context, Config, Profile, string) (*vowifi.Orchestrator, error) {
+			return nil, errors.New("unexpected")
+		},
+	})
+	if err := m.Apply(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return m.State(cfg.DeviceID).Phase == "waiting_device" })
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := m.Close(ctx); err != nil {
+		t.Fatalf("close during prepare retry: %v", err)
+	}
+	if m.Owns(cfg.DeviceID) {
+		t.Fatal("reader still owned after close")
+	}
+}
+
+func TestNonRetryablePrepareFailureStillFails(t *testing.T) {
+	cfg := testConfig()
+	var prepares atomic.Int32
+	m := New(Options{
+		PrepareRetryable: readerMissing, PrepareRetryInitial: 5 * time.Millisecond, PrepareRetryMaximum: 5 * time.Millisecond,
+		Prepare: func(context.Context, Config) error {
+			prepares.Add(1)
+			return errors.New("selected profile is not present")
+		},
+		Factory: func(context.Context, Config, Profile, string) (*vowifi.Orchestrator, error) {
+			return nil, errors.New("unexpected")
+		},
+	})
+	t.Cleanup(func() { _ = m.Close(context.Background()) })
+	if err := m.Apply(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return m.State(cfg.DeviceID).Phase == "failed" })
+	time.Sleep(30 * time.Millisecond)
+	if prepares.Load() != 1 || m.Owns(cfg.DeviceID) {
+		t.Fatalf("permanent preparation error retried: prepares=%d owned=%v", prepares.Load(), m.Owns(cfg.DeviceID))
+	}
 }
 
 type lifecycleSIM struct{ profile Profile }
