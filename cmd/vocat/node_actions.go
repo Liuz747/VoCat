@@ -808,6 +808,26 @@ func (service *nodeActionService) enableProfile(ctx context.Context, command nod
 		return service.devices.ESIMSwitchProfile(ctx, physicalID, record.Target.ICCID, record.AID)
 	})
 	if err != nil {
+		// The card refuses to enable a profile that is already enabled
+		// ("profile is not currently disabled"). The requested end state then
+		// already holds, and the protocol has no error for it — enabling the
+		// current profile must be idempotent — so confirm against the card and
+		// report success. Only a genuine failure is reported as one.
+		if profiles, listErr := service.deviceProfiles(ctx, config, true); listErr == nil {
+			for _, candidate := range profiles {
+				if normalizeICCID(candidate.ICCID) != record.Target.ICCID {
+					continue
+				}
+				state := strings.ToLower(strings.TrimSpace(candidate.StateText))
+				if state == "enabled" || candidate.State == 1 {
+					service.clearPhoneCache()
+					return map[string]any{
+						"binding_version": 1, "current_iccid": record.Target.ICCID, "profile_state": "enabled",
+					}, nil
+				}
+				break
+			}
+		}
 		return nil, classifySideEffect(err, "切换结果无法确认")
 	}
 	service.clearPhoneCache()
