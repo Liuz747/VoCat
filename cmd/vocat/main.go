@@ -561,6 +561,14 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 	if err := startConfiguredMultiSIM(deviceStartupContext, database, multiSIMManager, logger); err != nil {
 		return fmt.Errorf("configure multi-tunnel runtime: %w", err)
 	}
+	// A modem knocked off a hub re-enumerates, often at another USB position.
+	// Keep each running group bound to its card instead of to the vanished
+	// physical ID.
+	if events, err := deviceManager.SubscribeDeviceLifecycleEvents(pollContext); err != nil {
+		logger.Warn("multi-tunnel reader watch disabled", "error", err)
+	} else {
+		go multiSIMBridge.watchReaders(pollContext, events, time.Minute)
+	}
 	// Start background consumers only after the synchronous radio/VoWiFi
 	// startup sequence. A snapshot refresh also takes the device operation
 	// mutex; starting it earlier can strand cold boot forever behind a serial

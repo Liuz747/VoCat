@@ -90,7 +90,7 @@ func TestMultiSIMReservesOneOwnerPerPhysicalReader(t *testing.T) {
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
-			reader := &multiSIMReader{backend: &multiSIMBackend{deviceID: id, physicalID: "usb-1-2"}}
+			reader := &multiSIMReader{backend: &multiSIMBackend{deviceID: id, binding: newMultiSIMBinding("usb-1-2")}}
 			if bridge.reserveReader(id, reader) == nil {
 				accepted.Add(1)
 			}
@@ -100,7 +100,7 @@ func TestMultiSIMReservesOneOwnerPerPhysicalReader(t *testing.T) {
 	if accepted.Load() != 1 {
 		t.Fatalf("physical reader acquired by %d groups", accepted.Load())
 	}
-	if err := bridge.reserveReader("different", &multiSIMReader{backend: &multiSIMBackend{deviceID: "different", physicalID: "usb-1-3"}}); err != nil {
+	if err := bridge.reserveReader("different", &multiSIMReader{backend: &multiSIMBackend{deviceID: "different", binding: newMultiSIMBinding("usb-1-3")}}); err != nil {
 		t.Fatalf("independent reader rejected: %v", err)
 	}
 }
@@ -160,7 +160,7 @@ func TestMultiSIMPinnedExecutorRejectsRemappedReader(t *testing.T) {
 		{ID: "physical-b", Discovered: true, Candidate: modem.Candidate{ATPort: modem.Port{Path: "/dev/b"}}},
 	}}
 	mapper := integration.ATMapper{Store: database, Devices: devices}
-	executor := multiSIMPinnedAT{mapper: mapper, deviceID: cfg.ID, physicalID: "physical-a"}
+	executor := multiSIMPinnedAT{mapper: mapper, deviceID: cfg.ID, binding: newMultiSIMBinding("physical-a")}
 	transaction, release, err := executor.BeginUICCTransaction(ctx, cfg.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -182,7 +182,7 @@ func TestMultiSIMPinnedExecutorRejectsRemappedReader(t *testing.T) {
 	if _, _, err := executor.BeginUICCTransaction(ctx, cfg.ID); err == nil {
 		t.Fatal("transaction accepted a different physical reader")
 	}
-	backend := &multiSIMBackend{deviceID: cfg.ID, physicalID: "physical-a", mapper: mapper}
+	backend := &multiSIMBackend{deviceID: cfg.ID, binding: newMultiSIMBinding("physical-a"), mapper: mapper}
 	if _, err := backend.ActiveICCID(ctx); err == nil {
 		t.Fatal("active identity accepted remapped hardware")
 	}
@@ -205,7 +205,7 @@ func TestMultiSIMPrepareRetriesMissingOrRemappedReader(t *testing.T) {
 		{ID: "physical-a", Discovered: true, Candidate: modem.Candidate{ATPort: modem.Port{Path: "/dev/a"}}},
 		{ID: "physical-b", Discovered: true, Candidate: modem.Candidate{ATPort: modem.Port{Path: "/dev/b"}}},
 	}}
-	pinned := multiSIMPinnedAT{mapper: integration.ATMapper{Store: database, Devices: devices}, deviceID: cfg.ID, physicalID: "physical-a"}
+	pinned := multiSIMPinnedAT{mapper: integration.ATMapper{Store: database, Devices: devices}, deviceID: cfg.ID, binding: newMultiSIMBinding("physical-a")}
 	// The module re-enumerated in the middle of prepare: the configuration now
 	// resolves to another physical reader than the one reserved.
 	cfg.ATPort = "/dev/b"
@@ -254,7 +254,7 @@ func TestMultiSIMRestoreRetriesHandoffWithoutReusingRadioCheckpoint(t *testing.T
 		t.Fatal(err)
 	}
 	resumed := 0
-	reader := &multiSIMReader{backend: &multiSIMBackend{EC20Adapter: adapter, deviceID: "configured", physicalID: "physical"}, radio: radio, radioSaved: true, resumeUSSD: func() { resumed++ }}
+	reader := &multiSIMReader{backend: &multiSIMBackend{EC20Adapter: adapter, deviceID: "configured", binding: newMultiSIMBinding("physical")}, radio: radio, radioSaved: true, resumeUSSD: func() { resumed++ }}
 	bridge := &multiSIMIntegration{singles: singles, readers: map[string]*multiSIMReader{"configured": reader}}
 	cfg := multisim.Config{DeviceID: "configured"}
 	if err := bridge.restore(ctx, cfg); !errors.Is(err, vowifiruntime.ErrClosed) {

@@ -21,14 +21,93 @@ import (
 )
 
 type multiSIMIntegration struct {
-	database *store.Store
-	devices  *device.Manager
-	singles  *vowifiruntime.Manager
-	logger   *slog.Logger
-	mapper   integration.ATMapper
-	mu       sync.Mutex
-	readers  map[string]*multiSIMReader
-	closing  atomic.Bool
+	database  *store.Store
+	devices   *device.Manager
+	inventory multiSIMInventory
+	singles   *vowifiruntime.Manager
+	logger    *slog.Logger
+	mapper    integration.ATMapper
+	mu        sync.Mutex
+	readers   map[string]*multiSIMReader
+	// refused maps a group to the physical reader whose card it refused.
+	refused map[string]string
+	closing atomic.Bool
+}
+
+// multiSIMInventory is the part of the device manager a group needs to prove
+// which eUICC sits in a reader and to fence USSD off that reader.
+type multiSIMInventory interface {
+	ESIMUsesAT(id string) (bool, error)
+	ESIMListProfiles(ctx context.Context, id string) (device.EsimInfo, error)
+	ESIMInventory(ctx context.Context, id string) ([]device.EsimInventoryEntry, error)
+	WaitESIMProfileRecovery(ctx context.Context, id string) error
+	SuspendUSSD(ctx context.Context, id string) (func(), error)
+}
+
+var errMultiSIMReaderReleased = errors.New("multisim: group released its reader")
+
+var errMultiSIMReaderAbsent = errors.New("multisim: the group's modem is not present")
+
+var errMultiSIMDifferentCard = errors.New("multisim: the modem now carries a different eUICC; refusing to re-attach its reader")
+
+// followCardDuringRestore lets a group that is being disabled or re-saved
+// reach its card when the modem came back at another USB position. Through the
+// stale binding restore could never touch the card, and the group would hold
+// the reader until the process restarts. It runs under the broker's token.
+func (bridge *multiSIMIntegration) followCardDuringRestore(ctx context.Context, deviceID string, reader *multiSIMReader) error {
+	current, err := bridge.mapper.Get(deviceID)
+	if err != nil || current.ID == reader.backend.binding.ID() {
+		// Absent or unchanged: restore's own card access decides.
+		return nil
+	}
+	moveCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := bridge.moveReader(moveCtx, deviceID, reader, current.ID, true); err != nil {
+		return err
+	}
+	bridge.logger.Info("multisim reader re-attached for restore", "device_id", deviceID, "physical_id", current.ID)
+	return nil
+}
+
+// multiSIMCardEID names the eUICC behind the storage a group uses.
+// GetProfilesInfo carries no EID, so it comes from the chip inventory. With
+// several storages and no known AID it refuses to guess.
+func multiSIMCardEID(entries []device.EsimInventoryEntry, aid string) string {
+	aid = strings.TrimSpace(aid)
+	for _, entry := range entries {
+		if aid != "" && strings.EqualFold(strings.TrimSpace(entry.Info.AID), aid) {
+			return strings.TrimSpace(entry.Info.EID)
+		}
+	}
+	if aid == "" && len(entries) == 1 {
+		return strings.TrimSpace(entries[0].Info.EID)
+	}
+	return ""
+}
+
+// multiSIMBinding is the physical reader a running group addresses. Prepare
+// sets it; reattachReader may move it, but only after proving that the modem at
+// the new USB position carries the eUICC the group owns.
+type multiSIMBinding struct {
+	mu sync.Mutex
+	id string
+}
+
+func newMultiSIMBinding(id string) *multiSIMBinding { return &multiSIMBinding{id: id} }
+
+func (b *multiSIMBinding) ID() string {
+	if b == nil {
+		return ""
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.id
+}
+
+func (b *multiSIMBinding) set(id string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.id = id
 }
 
 // multiSIMStartupConcurrency bounds how many lines of one group run their
@@ -47,9 +126,13 @@ type multiSIMLineOptions struct {
 }
 
 type multiSIMReader struct {
-	backend          *multiSIMBackend
-	broker           *multisim.AuthBroker
-	gate             *multisim.StartupGate
+	backend *multiSIMBackend
+	broker  *multisim.AuthBroker
+	gate    *multisim.StartupGate
+	// eid identifies the card the group owns. A reader is only re-attached to
+	// a modem presenting this same EID.
+	eid              string
+	released         bool
 	original         multisim.Profile
 	resumeSingle     bool
 	radio            vowifi.RadioSnapshot
@@ -82,7 +165,7 @@ func (bridge *multiSIMIntegration) rejectReaderAliases(ctx context.Context, conf
 }
 
 type multiSIMBackend struct {
-	physicalID string
+	binding *multiSIMBinding
 	*vowifi.EC20Adapter
 	deviceID string
 	mapper   integration.ATMapper
@@ -90,7 +173,7 @@ type multiSIMBackend struct {
 }
 
 func (backend *multiSIMBackend) ActiveICCID(ctx context.Context) (string, error) {
-	physical, err := (multiSIMPinnedAT{mapper: backend.mapper, deviceID: backend.deviceID, physicalID: backend.physicalID}).physical(ctx, backend.deviceID)
+	physical, err := (multiSIMPinnedAT{mapper: backend.mapper, deviceID: backend.deviceID, binding: backend.binding}).physical(ctx, backend.deviceID)
 	if err != nil {
 		return "", err
 	}
@@ -102,7 +185,7 @@ func (backend *multiSIMBackend) ActiveICCID(ctx context.Context) (string, error)
 }
 
 func (backend *multiSIMBackend) SwitchProfile(ctx context.Context, profile multisim.Profile) error {
-	physical, err := (multiSIMPinnedAT{mapper: backend.mapper, deviceID: backend.deviceID, physicalID: backend.physicalID}).physical(ctx, backend.deviceID)
+	physical, err := (multiSIMPinnedAT{mapper: backend.mapper, deviceID: backend.deviceID, binding: backend.binding}).physical(ctx, backend.deviceID)
 	if err != nil {
 		return err
 	}
@@ -222,7 +305,7 @@ func physicalIMSSMS(message ims.ReceivedSMS, deviceID string) ims.ReceivedSMS {
 }
 
 func newMultiSIMIntegration(database *store.Store, devices *device.Manager, singles *vowifiruntime.Manager, logger *slog.Logger) (*multiSIMIntegration, *multisim.Manager) {
-	bridge := &multiSIMIntegration{database: database, devices: devices, singles: singles, logger: logger,
+	bridge := &multiSIMIntegration{database: database, devices: devices, inventory: devices, singles: singles, logger: logger,
 		mapper: integration.ATMapper{Store: database, Devices: devices}, readers: make(map[string]*multiSIMReader)}
 	manager := multisim.New(multisim.Options{Logger: logger.With("category", "multisim"),
 		// One line's Enable now includes queueing behind the startup gate; a
@@ -255,7 +338,11 @@ func (bridge *multiSIMIntegration) verify(ctx context.Context, config multisim.C
 	if reader == nil || reader.backend == nil {
 		return errors.New("multisim: reader is not prepared")
 	}
-	inventory, err := bridge.devices.ESIMListProfiles(ctx, reader.backend.physicalID)
+	physical, err := (multiSIMPinnedAT{mapper: bridge.mapper, deviceID: config.DeviceID, binding: reader.backend.binding}).physical(ctx, config.DeviceID)
+	if err != nil {
+		return err
+	}
+	inventory, err := bridge.inventory.ESIMListProfiles(ctx, physical.ID)
 	if err != nil {
 		return err
 	}
@@ -299,7 +386,8 @@ func (bridge *multiSIMIntegration) prepare(ctx context.Context, config multisim.
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	pinned := multiSIMPinnedAT{mapper: bridge.mapper, deviceID: config.DeviceID, physicalID: physical.ID}
+	binding := newMultiSIMBinding(physical.ID)
+	pinned := multiSIMPinnedAT{mapper: bridge.mapper, deviceID: config.DeviceID, binding: binding}
 	adapter, err := vowifi.NewEC20Adapter(pinned, vowifi.EC20AdapterOptions{
 		PureAirplanePolicy:  func(string) bool { return stored.VoWiFiEnabled },
 		RestoreCellularData: stored.NetworkEnabled,
@@ -307,7 +395,7 @@ func (bridge *multiSIMIntegration) prepare(ctx context.Context, config multisim.
 	if err != nil {
 		return err
 	}
-	reader := &multiSIMReader{backend: &multiSIMBackend{EC20Adapter: adapter, deviceID: config.DeviceID, physicalID: physical.ID, mapper: bridge.mapper, devices: bridge.devices}, resumeSingle: stored.VoWiFiEnabled}
+	reader := &multiSIMReader{backend: &multiSIMBackend{EC20Adapter: adapter, deviceID: config.DeviceID, binding: binding, mapper: bridge.mapper, devices: bridge.devices}, resumeSingle: stored.VoWiFiEnabled}
 	// Reserve before any single-line, RF, or profile mutation. A failed Prepare
 	// leaves this reservation for Restore; an alias rejected here owns nothing.
 	if err := bridge.reserveReader(config.DeviceID, reader); err != nil {
@@ -359,6 +447,14 @@ func (bridge *multiSIMIntegration) prepare(ctx context.Context, config multisim.
 	if err != nil {
 		return err
 	}
+	// The EID lets reattachReader follow this card if the modem re-enumerates
+	// at another USB position. Without it the group still runs, pinned as before.
+	if chips, chipErr := bridge.inventory.ESIMInventory(ctx, physical.ID); chipErr == nil {
+		reader.eid = multiSIMCardEID(chips, inventory.AID)
+	}
+	if reader.eid == "" {
+		bridge.logger.Warn("multisim reader EID unavailable; the group cannot follow its card to another USB position", "device_id", config.DeviceID)
+	}
 	identity, err := adapter.ReadIdentity(ctx, config.DeviceID)
 	if err != nil {
 		return err
@@ -389,6 +485,260 @@ func (bridge *multiSIMIntegration) prepare(ctx context.Context, config multisim.
 	return err
 }
 
+// reattachReader keeps a running group attached to its card when the modem
+// re-enumerates. A modem knocked off a hub comes back as a new USB device,
+// often at another position and therefore under another physical ID. Bound to
+// the vanished ID, the group fails every authentication, and every line on the
+// card drops at the next network re-challenge, hours later (2026-09-14).
+//
+// The binding follows the configuration only when the modem the configuration
+// now resolves to presents the EID recorded by Prepare and no other group owns
+// it, and it moves under the broker's transaction token so no APDU exchange
+// spans two modems. Every attempt also keeps RF off: a power-cycled EC20 boots
+// with RF on, and the lifecycle event that would say so is best effort.
+func (bridge *multiSIMIntegration) reattachReader(ctx context.Context, deviceID string) error {
+	reader := bridge.activeReader(deviceID)
+	if reader == nil {
+		return nil
+	}
+	if _, err := bridge.mapper.Get(deviceID); err != nil {
+		// Still absent; the next event or sweep tries again.
+		return errMultiSIMReaderAbsent
+	}
+	return reader.broker.Exclusive(ctx, func(ctx context.Context) error {
+		// Restore may have begun while this attempt queued for the token.
+		if bridge.activeReader(deviceID) != reader {
+			return nil
+		}
+		current, err := bridge.mapper.Get(deviceID)
+		if err != nil {
+			return errMultiSIMReaderAbsent
+		}
+		previous := reader.backend.binding.ID()
+		if current.ID != previous {
+			moveCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			err := bridge.moveReader(moveCtx, deviceID, reader, current.ID, false)
+			cancel()
+			if errors.Is(err, errMultiSIMReaderReleased) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			bridge.logger.Info("multisim reader re-attached", "device_id", deviceID,
+				"previous_physical_id", previous, "physical_id", current.ID)
+		} else if reader.eid == "" {
+			// Prepare could not read the chip, for example during a profile
+			// recovery. Learn the EID while this binding is still the proven one.
+			chipCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			chips, chipErr := bridge.inventory.ESIMInventory(chipCtx, current.ID)
+			cancel()
+			if chipErr == nil {
+				reader.eid = multiSIMCardEID(chips, reader.original.AID)
+			}
+		}
+		// A profile recovery soft-resets the modem (CFUN=0, then back); turning
+		// RF off in the middle of it would fight the recovery.
+		waitCtx, cancelWait := context.WithTimeout(ctx, 5*time.Second)
+		err = bridge.inventory.WaitESIMProfileRecovery(waitCtx, current.ID)
+		cancelWait()
+		if err != nil {
+			return fmt.Errorf("multisim: eSIM profile recovery still running: %w", err)
+		}
+		// A modem whose AT port is not ready yet must not hold the token for
+		// long; the next sweep tries again.
+		rfCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		return reader.backend.EnterVoWiFiRFOff(rfCtx, deviceID)
+	})
+}
+
+// activeReader returns the group's reader, or nil when no group owns the
+// device, the group is still preparing, or its restore has begun.
+func (bridge *multiSIMIntegration) activeReader(deviceID string) *multiSIMReader {
+	bridge.mu.Lock()
+	defer bridge.mu.Unlock()
+	reader := bridge.readers[deviceID]
+	if reader == nil || reader.released || reader.backend == nil || reader.broker == nil {
+		return nil
+	}
+	return reader
+}
+
+// moveReader proves the modem at physicalID carries the group's card, then
+// binds the group to it. It runs under the broker's transaction token.
+func (bridge *multiSIMIntegration) moveReader(ctx context.Context, deviceID string, reader *multiSIMReader, physicalID string, restoring bool) error {
+	if reader.eid == "" {
+		return errors.New("multisim: no EID was recorded for this group; refusing to re-attach its reader")
+	}
+	if err := bridge.rejectReaderAliases(ctx, deviceID, physicalID); err != nil {
+		return err
+	}
+	usesAT, err := bridge.inventory.ESIMUsesAT(physicalID)
+	if err != nil {
+		return err
+	}
+	if !usesAT {
+		return errors.New("multisim: eUICC authentication requires the AT reader transport")
+	}
+	if bridge.readerOwnedByOther(deviceID, physicalID) {
+		return errors.New("multisim: physical reader is already owned by another configuration")
+	}
+	if bridge.cardRefused(deviceID, physicalID) {
+		return errMultiSIMDifferentCard
+	}
+	chips, err := bridge.inventory.ESIMInventory(ctx, physicalID)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(multiSIMCardEID(chips, reader.original.AID), reader.eid) {
+		bridge.rememberRefusal(deviceID, physicalID)
+		return errMultiSIMDifferentCard
+	}
+	resume, err := bridge.inventory.SuspendUSSD(ctx, physicalID)
+	if err != nil {
+		return err
+	}
+	bridge.mu.Lock()
+	if bridge.readers[deviceID] != reader || (reader.released && !restoring) {
+		bridge.mu.Unlock()
+		resume()
+		return errMultiSIMReaderReleased
+	}
+	previousResume := reader.resumeUSSD
+	reader.resumeUSSD = resume
+	reader.backend.binding.set(physicalID)
+	delete(bridge.refused, deviceID)
+	bridge.mu.Unlock()
+	if previousResume != nil {
+		previousResume()
+	}
+	return nil
+}
+
+// A refused card stays refused until its modem re-enumerates. Reading the chip
+// occupies the reader, so a sweep must not repeat the read every minute.
+func (bridge *multiSIMIntegration) cardRefused(deviceID, physicalID string) bool {
+	bridge.mu.Lock()
+	defer bridge.mu.Unlock()
+	return bridge.refused[deviceID] == physicalID
+}
+
+func (bridge *multiSIMIntegration) rememberRefusal(deviceID, physicalID string) {
+	bridge.mu.Lock()
+	defer bridge.mu.Unlock()
+	if bridge.refused == nil {
+		bridge.refused = make(map[string]string)
+	}
+	bridge.refused[deviceID] = physicalID
+}
+
+// forgetRefusals clears refusals of a reader that just re-enumerated: its card
+// may have been swapped while it was away.
+func (bridge *multiSIMIntegration) forgetRefusals(physicalID string) {
+	bridge.mu.Lock()
+	defer bridge.mu.Unlock()
+	for deviceID, refused := range bridge.refused {
+		if refused == physicalID {
+			delete(bridge.refused, deviceID)
+		}
+	}
+}
+
+// readerOwnedByOther reports whether another running group is bound to
+// physicalID and is still configured for it. A binding whose configuration now
+// resolves elsewhere is stale: two modems that swapped positions would
+// otherwise refuse each other forever.
+func (bridge *multiSIMIntegration) readerOwnedByOther(deviceID, physicalID string) bool {
+	bridge.mu.Lock()
+	var holders []string
+	for id, other := range bridge.readers {
+		if id != deviceID && other.backend != nil && other.backend.binding.ID() == physicalID {
+			holders = append(holders, id)
+		}
+	}
+	bridge.mu.Unlock()
+	for _, id := range holders {
+		if current, err := bridge.mapper.Get(id); err == nil && current.ID == physicalID {
+			return true
+		}
+	}
+	return false
+}
+
+// watchReaders re-attaches running groups whose modem has come back and keeps
+// their RF off. Lifecycle events are best effort (a slow subscriber drops
+// them), so they only bring the next periodic sweep forward.
+func (bridge *multiSIMIntegration) watchReaders(ctx context.Context, events <-chan device.DeviceLifecycleEvent, interval time.Duration) {
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	failures := make(map[string]string)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-events:
+			if !ok {
+				events = nil
+				continue
+			}
+			if !event.Present {
+				continue
+			}
+			bridge.forgetRefusals(event.ID)
+		case <-ticker.C:
+		}
+		bridge.reattachAll(ctx, failures)
+	}
+}
+
+// reattachAll makes one attempt per running group. A failure is logged when it
+// first appears or changes, not on every sweep.
+func (bridge *multiSIMIntegration) reattachAll(ctx context.Context, failures map[string]string) {
+	bridge.mu.Lock()
+	deviceIDs := make([]string, 0, len(bridge.readers))
+	for deviceID := range bridge.readers {
+		deviceIDs = append(deviceIDs, deviceID)
+	}
+	bridge.mu.Unlock()
+	running := make(map[string]bool, len(deviceIDs))
+	for _, deviceID := range deviceIDs {
+		running[deviceID] = true
+		attemptCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		err := bridge.reattachReader(attemptCtx, deviceID)
+		cancel()
+		if ctx.Err() != nil {
+			return
+		}
+		if errors.Is(err, errMultiSIMReaderAbsent) {
+			// Neither a failure nor a recovery: wait for the modem.
+			continue
+		}
+		message := ""
+		if err != nil {
+			message = err.Error()
+		}
+		if message == failures[deviceID] {
+			continue
+		}
+		if message == "" {
+			delete(failures, deviceID)
+			bridge.logger.Info("multisim reader re-attach recovered", "device_id", deviceID)
+			continue
+		}
+		failures[deviceID] = message
+		bridge.logger.Warn("multisim reader re-attach failed", "device_id", deviceID, "error", err)
+	}
+	for deviceID := range failures {
+		if !running[deviceID] {
+			delete(failures, deviceID)
+		}
+	}
+}
+
 func (bridge *multiSIMIntegration) factory(ctx context.Context, config multisim.Config, profile multisim.Profile, sessionID string) (*vowifi.Orchestrator, error) {
 	bridge.mu.Lock()
 	reader := bridge.readers[config.DeviceID]
@@ -415,29 +765,54 @@ func (bridge *multiSIMIntegration) restore(ctx context.Context, config multisim.
 	if reader == nil {
 		return nil
 	}
+	// From here on the reader belongs to this restore; reattachReader leaves it
+	// alone, and the card and radio work below waits for any attempt in flight.
+	bridge.mu.Lock()
+	reader.released = true
+	watchCancel := reader.watchCancel
+	bridge.mu.Unlock()
+	if watchCancel != nil {
+		// The card probe would otherwise compete for the token restore needs.
+		watchCancel()
+	}
 	if reader.singleMaintained {
 		if err := bridge.singles.WaitCleanup(ctx, config.DeviceID); err != nil {
 			return err
 		}
 	}
-	if reader.original.ICCID != "" {
-		current, err := reader.backend.ActiveICCID(ctx)
-		if err != nil {
-			return err
-		}
-		if current != reader.original.ICCID {
-			if err := reader.backend.SwitchProfile(ctx, reader.original); err != nil {
+	restoreCard := func(ctx context.Context) error {
+		if reader.broker != nil {
+			if err := bridge.followCardDuringRestore(ctx, config.DeviceID, reader); err != nil {
 				return err
 			}
 		}
+		if reader.original.ICCID != "" {
+			current, err := reader.backend.ActiveICCID(ctx)
+			if err != nil {
+				return err
+			}
+			if current != reader.original.ICCID {
+				if err := reader.backend.SwitchProfile(ctx, reader.original); err != nil {
+					return err
+				}
+			}
+		}
+		if !reader.resumeSingle && reader.radioSaved {
+			if err := reader.backend.Restore(ctx, config.DeviceID, reader.radio); err != nil {
+				return err
+			}
+			// EC20Adapter consumes its checkpoint on success. Later retries only
+			// need to finish the single-line handoff, not restore that checkpoint.
+			reader.radioSaved = false
+		}
+		return nil
 	}
-	if !reader.resumeSingle && reader.radioSaved {
-		if err := reader.backend.Restore(ctx, config.DeviceID, reader.radio); err != nil {
+	if reader.broker != nil {
+		if err := reader.broker.Exclusive(ctx, restoreCard); err != nil {
 			return err
 		}
-		// EC20Adapter consumes its checkpoint on success. Later retries only
-		// need to finish the single-line handoff, not restore that checkpoint.
-		reader.radioSaved = false
+	} else if err := restoreCard(ctx); err != nil {
+		return err
 	}
 	bridge.singles.EndMaintenance(config.DeviceID)
 	if !bridge.closing.Load() {
@@ -445,15 +820,21 @@ func (bridge *multiSIMIntegration) restore(ctx context.Context, config multisim.
 			return err
 		}
 	}
-	if reader.resumeUSSD != nil {
-		reader.resumeUSSD()
-		reader.resumeUSSD = nil
+	// reattachReader swaps resumeUSSD under bridge.mu when the group follows its
+	// card to another modem.
+	bridge.mu.Lock()
+	resumeUSSD := reader.resumeUSSD
+	reader.resumeUSSD = nil
+	bridge.mu.Unlock()
+	if resumeUSSD != nil {
+		resumeUSSD()
 	}
 	bridge.mu.Lock()
 	if reader != nil && reader.watchCancel != nil {
 		reader.watchCancel()
 	}
 	delete(bridge.readers, config.DeviceID)
+	delete(bridge.refused, config.DeviceID)
 	bridge.mu.Unlock()
 	return nil
 }
@@ -530,7 +911,7 @@ func closeMultiSIM(bridge *multiSIMIntegration, manager *multisim.Manager) error
 
 // reserveReader makes ownership independent of user-configured aliases.
 func (bridge *multiSIMIntegration) reserveReader(deviceID string, reader *multiSIMReader) error {
-	if reader == nil || reader.backend == nil || reader.backend.physicalID == "" {
+	if reader == nil || reader.backend == nil || reader.backend.binding.ID() == "" {
 		return errors.New("multisim: physical reader identity is required")
 	}
 	bridge.mu.Lock()
@@ -542,7 +923,7 @@ func (bridge *multiSIMIntegration) reserveReader(deviceID string, reader *multiS
 		return errors.New("multisim: reader has not finished its previous restore")
 	}
 	for _, existing := range bridge.readers {
-		if existing.backend.physicalID == reader.backend.physicalID {
+		if existing.backend.binding.ID() == reader.backend.binding.ID() {
 			return errors.New("multisim: physical reader is already owned by another configuration")
 		}
 	}
@@ -550,14 +931,16 @@ func (bridge *multiSIMIntegration) reserveReader(deviceID string, reader *multiS
 	return nil
 }
 
-// multiSIMPinnedAT always sends to the reader reserved by Prepare. Checking a
+// multiSIMPinnedAT always sends to the reader the group is bound to. Checking a
 // mapping and then calling ATMapper.ExecuteAT would resolve a second time and
 // could redirect an APDU after a configuration edit or modem re-enumeration.
-// Here every command validates the mapping, then addresses the fixed physical
-// ID directly. A mid-transaction remapping can only fail the next command.
+// Here every command validates the mapping against the binding, then
+// addresses that validated physical ID directly. A mid-transaction remapping
+// can only fail the next command; only reattachReader moves the binding.
 type multiSIMPinnedAT struct {
-	mapper               integration.ATMapper
-	deviceID, physicalID string
+	mapper   integration.ATMapper
+	deviceID string
+	binding  *multiSIMBinding
 }
 
 // errReaderRemapped means the configured device now resolves to a different
@@ -568,14 +951,15 @@ func (p multiSIMPinnedAT) physical(ctx context.Context, id string) (device.Devic
 	if err := ctx.Err(); err != nil {
 		return device.Device{}, err
 	}
-	if id != p.deviceID || p.physicalID == "" {
+	physicalID := p.binding.ID()
+	if id != p.deviceID || physicalID == "" {
 		return device.Device{}, errors.New("multisim: physical reader binding is invalid")
 	}
 	current, err := p.mapper.Get(id)
 	if err != nil {
 		return device.Device{}, err
 	}
-	if current.ID != p.physicalID {
+	if current.ID != physicalID {
 		return device.Device{}, errReaderRemapped
 	}
 	if err := ctx.Err(); err != nil {
@@ -585,30 +969,37 @@ func (p multiSIMPinnedAT) physical(ctx context.Context, id string) (device.Devic
 }
 
 func (p multiSIMPinnedAT) ExecuteAT(ctx context.Context, id, command string) (modem.Response, error) {
-	if _, err := p.physical(ctx, id); err != nil {
+	current, err := p.physical(ctx, id)
+	if err != nil {
 		return modem.Response{}, err
 	}
-	return p.mapper.Devices.ExecuteAT(ctx, p.physicalID, command)
+	return p.mapper.Devices.ExecuteAT(ctx, current.ID, command)
 }
 func (p multiSIMPinnedAT) ExecuteSensitiveAT(ctx context.Context, id, command string) (modem.Response, error) {
-	if _, err := p.physical(ctx, id); err != nil {
+	current, err := p.physical(ctx, id)
+	if err != nil {
 		return modem.Response{}, err
 	}
-	return p.mapper.Devices.ExecuteSensitiveAT(ctx, p.physicalID, command)
+	return p.mapper.Devices.ExecuteSensitiveAT(ctx, current.ID, command)
 }
 func (p multiSIMPinnedAT) BeginUICCTransaction(ctx context.Context, id string) (context.Context, func(), error) {
-	if _, err := p.physical(ctx, id); err != nil {
+	current, err := p.physical(ctx, id)
+	if err != nil {
 		return ctx, nil, err
 	}
 	transactions, ok := p.mapper.Devices.(vowifi.EC20UICCTransactions)
 	if !ok {
 		return ctx, nil, errors.New("multisim: physical reader lacks transaction locking")
 	}
-	transaction, release, err := transactions.BeginUICCTransaction(ctx, p.physicalID)
+	transaction, release, err := transactions.BeginUICCTransaction(ctx, current.ID)
 	if err != nil {
 		return ctx, nil, err
 	}
-	if _, err := p.physical(transaction, id); err != nil {
+	again, err := p.physical(transaction, id)
+	if err == nil && again.ID != current.ID {
+		err = errors.New("multisim: reader binding moved while opening a transaction")
+	}
+	if err != nil {
 		release()
 		return ctx, nil, err
 	}

@@ -66,6 +66,29 @@ func NewAuthBroker(options BrokerOptions) (*AuthBroker, error) {
 	return b, nil
 }
 
+// Exclusive runs operation while holding the reader's transaction token, the
+// same one every authentication and profile switch takes. Moving a group to
+// another physical reader must happen here, so no APDU exchange can start on
+// one modem and finish on another.
+func (b *AuthBroker) Exclusive(ctx context.Context, operation func(context.Context) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-b.transaction:
+	}
+	defer func() { b.transaction <- struct{}{} }()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return operation(ctx)
+}
+
 func (b *AuthBroker) ForProfile(profile Profile) (*ProfileAdapter, error) {
 	if err := profile.validate(); err != nil {
 		return nil, err
