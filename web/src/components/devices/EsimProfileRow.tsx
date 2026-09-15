@@ -15,6 +15,8 @@ export interface EsimProfileRowProps {
   switching: boolean;
   deleting: boolean;
   policyOpen: boolean;
+  // A running multi-tunnel group decides which profile is enabled.
+  switchLocked?: boolean;
   onRenameValueChange: (v: string) => void;
   onSwitch: () => void;
   onStartRename: () => void;
@@ -72,17 +74,19 @@ export function EsimProfileRow(props: EsimProfileRowProps) {
         </div>
         {!renaming ? (
           <div className="flex flex-shrink-0 items-center gap-2">
-            <Button variant={active ? "warning" : "success"} size="small" plain loading={props.switching} onClick={props.onSwitch}>
-              {active ? t("禁用") : t("切换")}
-            </Button>
+            <span title={props.switchLocked ? t("多隧道运行中由多隧道决定启用哪个 Profile") : undefined}>
+              <Button variant={active ? "warning" : "success"} size="small" plain loading={props.switching} disabled={props.switchLocked} onClick={props.onSwitch}>
+                {active ? t("禁用") : t("切换")}
+              </Button>
+            </span>
             <Button variant="primary" size="small" plain onClick={props.onStartRename}>
               {t("改名")}
             </Button>
             <Button variant={props.policyOpen ? "primary" : "default"} size="small" plain onClick={props.onTogglePolicy}>
               {t("策略")}
             </Button>
-            <span title={active ? t("当前启用的 Profile 不能删除；请先切换到另一张卡") : undefined}>
-              <Button variant="danger" size="small" plain loading={props.deleting} disabled={active} onClick={props.onDelete}>
+            <span title={active && !props.switchLocked ? t("当前启用的 Profile 不能删除；请先切换到另一张卡") : undefined}>
+              <Button variant="danger" size="small" plain loading={props.deleting} disabled={active && !props.switchLocked} onClick={props.onDelete}>
                 {t("删除")}
               </Button>
             </span>

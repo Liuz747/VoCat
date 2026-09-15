@@ -23,6 +23,7 @@ type fakeMultiSIMController struct {
 	keepOwned   bool
 	applyErr    error
 	applies     int
+	lastConfig  multisim.Config
 	state       multisim.GroupState
 	reconnected string
 	refreshed   string
@@ -36,6 +37,7 @@ type fakeMultiSIMController struct {
 
 func (f *fakeMultiSIMController) Apply(_ context.Context, c multisim.Config) error {
 	f.applies++
+	f.lastConfig = c
 	if f.applyErr != nil {
 		return f.applyErr
 	}

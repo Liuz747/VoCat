@@ -22,6 +22,7 @@ export interface EsimEuiccGroupProps {
   switchingIccid: string | null;
   deletingIccid: string | null;
   policyIccid: string | null;
+  switchLocked?: boolean;
   onRenameValueChange: (v: string) => void;
   onSwitch: (iccid: string, state: number | undefined, aidHex?: string) => void;
   onStartRename: (iccid: string, name?: string) => void;
@@ -148,6 +149,7 @@ export function EsimEuiccGroup(props: EsimEuiccGroupProps) {
               switching={props.switchingIccid === p.iccid}
               deleting={props.deletingIccid === p.iccid}
               policyOpen={props.policyIccid === p.iccid}
+              switchLocked={props.switchLocked}
               onRenameValueChange={props.onRenameValueChange}
               onSwitch={() => props.onSwitch(p.iccid, p.state, group.aidHex)}
               onStartRename={() => props.onStartRename(p.iccid, p.name)}

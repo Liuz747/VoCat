@@ -580,8 +580,14 @@ func (s *Server) handleDevicePath(
 				return true
 			}
 		} else if s.multiSIMOwned(r.Context(), id) {
-			writeMultiSIMConflict(w)
-			return true
+			// A running EC20 group lends its reader to eUICC maintenance; the
+			// handlers take the group's transaction token themselves.
+			lent := store.NormalizeDeviceType(config.DeviceType) == store.DeviceTypePCIeEC20EC25 &&
+				s.ownedCardReader(id) && ownedESIMMaintenance(r.Method, tail)
+			if !lent {
+				writeMultiSIMConflict(w)
+				return true
+			}
 		}
 	}
 	if len(tail) == 0 {

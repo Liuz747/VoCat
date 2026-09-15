@@ -33,7 +33,7 @@ func (s *Server) handleESIM(w http.ResponseWriter, r *http.Request, rest []strin
 		if !requireMethod(w, r, http.MethodGet) {
 			return true
 		}
-		s.writeEsimOverview(w, r, physicalID, physicalPresent)
+		s.writeEsimOverview(w, r, configuredID, physicalID, physicalPresent)
 		return true
 	}
 
@@ -43,15 +43,15 @@ func (s *Server) handleESIM(w http.ResponseWriter, r *http.Request, rest []strin
 			if !requireMethod(w, r, http.MethodGet) {
 				return true
 			}
-			s.writeEsimGroups(w, r, physicalID, physicalPresent)
+			s.writeEsimGroups(w, r, configuredID, physicalID, physicalPresent)
 			return true
 		}
 		if len(rest) == 2 && r.Method == http.MethodDelete {
-			s.handleEsimDelete(w, r, physicalID, physicalPresent, rest[1])
+			s.handleEsimDelete(w, r, configuredID, physicalID, physicalPresent, rest[1])
 			return true
 		}
 		if len(rest) == 2 && r.Method == http.MethodPatch {
-			s.handleEsimRename(w, r, physicalID, physicalPresent, rest[1])
+			s.handleEsimRename(w, r, configuredID, physicalID, physicalPresent, rest[1])
 			return true
 		}
 		esimUnavailable(w)
@@ -61,7 +61,7 @@ func (s *Server) handleESIM(w http.ResponseWriter, r *http.Request, rest []strin
 			if !requireMethod(w, r, http.MethodGet) {
 				return true
 			}
-			s.writeEsimNotifications(w, r, physicalID, physicalPresent)
+			s.writeEsimNotifications(w, r, configuredID, physicalID, physicalPresent)
 			return true
 		}
 		if len(rest) == 4 && rest[2] == "actions" && rest[3] == "retry" {
@@ -92,7 +92,7 @@ func (s *Server) handleESIM(w http.ResponseWriter, r *http.Request, rest []strin
 			if !requireMethod(w, r, http.MethodGet) {
 				return true
 			}
-			s.handleEsimDownload(w, r, physicalID, physicalPresent)
+			s.handleEsimDownload(w, r, configuredID, physicalID, physicalPresent)
 			return true
 		}
 		// Any other provisioning action is not implemented.
@@ -103,15 +103,20 @@ func (s *Server) handleESIM(w http.ResponseWriter, r *http.Request, rest []strin
 	}
 }
 
-func (s *Server) writeEsimNotifications(w http.ResponseWriter, r *http.Request, physicalID string, physicalPresent bool) {
+func (s *Server) writeEsimNotifications(w http.ResponseWriter, r *http.Request, configuredID, physicalID string, physicalPresent bool) {
 	controller, ok := s.devices.(esimNotificationController)
 	if !ok || !physicalPresent {
 		writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{"items": []any{}}})
 		return
 	}
-	items, err := controller.ESIMNotifications(r.Context(), physicalID)
+	var items []device.EsimNotification
+	err := s.withESIMReader(r.Context(), configuredID, physicalID, func(ctx context.Context, physical string) error {
+		var readErr error
+		items, readErr = controller.ESIMNotifications(ctx, physical)
+		return readErr
+	})
 	if err != nil {
-		s.writeDeviceError(w, err)
+		s.writeESIMError(w, err)
 		return
 	}
 	if items == nil {
@@ -148,24 +153,29 @@ func (s *Server) handleEsimNotificationRetry(w http.ResponseWriter, r *http.Requ
 // esimInfo loads the eUICC profile list. The string result is "ok" (use info),
 // "empty" (no usable eUICC — render the empty state), or "error" (an error
 // response has already been written).
-func (s *Server) esimInfo(w http.ResponseWriter, r *http.Request, physicalID string, physicalPresent bool) (string, []device.EsimInventoryEntry) {
+func (s *Server) esimInfo(w http.ResponseWriter, r *http.Request, configuredID, physicalID string, physicalPresent bool) (string, []device.EsimInventoryEntry) {
 	if s.devices == nil || !physicalPresent {
 		return "empty", nil
 	}
-	info, err := s.devices.ESIMInventory(r.Context(), physicalID)
+	var info []device.EsimInventoryEntry
+	err := s.withESIMReader(r.Context(), configuredID, physicalID, func(ctx context.Context, physical string) error {
+		var readErr error
+		info, readErr = s.devices.ESIMInventory(ctx, physical)
+		return readErr
+	})
 	if err != nil {
 		if errors.Is(err, device.ErrNoEUICC) {
 			return "empty", nil
 		}
-		s.writeDeviceError(w, err)
+		s.writeESIMError(w, err)
 		return "error", nil
 	}
 	return "ok", info
 }
 
 // writeEsimOverview returns { chipInfo, profiles } for the eSIM tab.
-func (s *Server) writeEsimOverview(w http.ResponseWriter, r *http.Request, physicalID string, physicalPresent bool) {
-	status, info := s.esimInfo(w, r, physicalID, physicalPresent)
+func (s *Server) writeEsimOverview(w http.ResponseWriter, r *http.Request, configuredID, physicalID string, physicalPresent bool) {
+	status, info := s.esimInfo(w, r, configuredID, physicalID, physicalPresent)
 	switch status {
 	case "error":
 		return
@@ -276,8 +286,8 @@ func (s *Server) esimChipInfo(r *http.Request, physicalID string) map[string]any
 }
 
 // writeEsimGroups returns just the profile groups for the /esim/profiles call.
-func (s *Server) writeEsimGroups(w http.ResponseWriter, r *http.Request, physicalID string, physicalPresent bool) {
-	status, info := s.esimInfo(w, r, physicalID, physicalPresent)
+func (s *Server) writeEsimGroups(w http.ResponseWriter, r *http.Request, configuredID, physicalID string, physicalPresent bool) {
+	status, info := s.esimInfo(w, r, configuredID, physicalID, physicalPresent)
 	switch status {
 	case "error":
 		return
@@ -340,7 +350,7 @@ func esimGroups(info device.EsimInfo) []map[string]any {
 	}
 }
 
-func (s *Server) handleEsimRename(w http.ResponseWriter, r *http.Request, physicalID string, physicalPresent bool, iccid string) {
+func (s *Server) handleEsimRename(w http.ResponseWriter, r *http.Request, configuredID, physicalID string, physicalPresent bool, iccid string) {
 	if s.devices == nil {
 		writeError(w, http.StatusServiceUnavailable, "device_manager_unavailable", "device manager is unavailable")
 		return
@@ -369,8 +379,10 @@ func (s *Server) handleEsimRename(w http.ResponseWriter, r *http.Request, physic
 		return
 	}
 	aidHex := firstNonEmpty(request.AIDHex, request.AIDHexCamel)
-	if err := s.devices.ESIMRenameProfile(r.Context(), physicalID, iccid, nickname, aidHex); err != nil {
-		s.writeDeviceError(w, err)
+	if err := s.withESIMReader(r.Context(), configuredID, physicalID, func(ctx context.Context, physical string) error {
+		return s.devices.ESIMRenameProfile(ctx, physical, iccid, nickname, aidHex)
+	}); err != nil {
+		s.writeESIMError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{"status": "renamed", "iccid": iccid, "name": nickname}})
@@ -611,7 +623,7 @@ func (s *Server) handleEsimDisable(w http.ResponseWriter, r *http.Request, physi
 	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{"status": "disabled", "iccid": iccid, "recovering": true}})
 }
 
-func (s *Server) handleEsimDelete(w http.ResponseWriter, r *http.Request, physicalID string, physicalPresent bool, iccid string) {
+func (s *Server) handleEsimDelete(w http.ResponseWriter, r *http.Request, configuredID, physicalID string, physicalPresent bool, iccid string) {
 	if s.devices == nil {
 		writeError(w, http.StatusServiceUnavailable, "device_manager_unavailable", "device manager is unavailable")
 		return
@@ -623,6 +635,10 @@ func (s *Server) handleEsimDelete(w http.ResponseWriter, r *http.Request, physic
 	iccid = strings.TrimSpace(iccid)
 	if iccid == "" {
 		writeError(w, http.StatusBadRequest, "invalid_request", "iccid is required")
+		return
+	}
+	if s.ownedCardReader(configuredID) {
+		s.deleteOwnedESIMProfile(w, r, configuredID, iccid, r.URL.Query().Get("aid_hex"))
 		return
 	}
 	result, err := s.devices.ESIMDeleteProfile(r.Context(), physicalID, iccid, r.URL.Query().Get("aid_hex"))
@@ -646,7 +662,7 @@ func (s *Server) handleEsimDelete(w http.ResponseWriter, r *http.Request, physic
 // confirmation_code/aid_hex/imei) and reads `data: {step,msg,pct,...}` lines.
 // The event field names (step/msg/pct/code/space_delta/warning) match the
 // reference contract byte-for-byte, so the frontend needs no changes.
-func (s *Server) handleEsimDownload(w http.ResponseWriter, r *http.Request, physicalID string, physicalPresent bool) {
+func (s *Server) handleEsimDownload(w http.ResponseWriter, r *http.Request, configuredID, physicalID string, physicalPresent bool) {
 	if s.devices == nil {
 		writeError(w, http.StatusServiceUnavailable, "device_manager_unavailable", "device manager is unavailable")
 		return
@@ -675,8 +691,24 @@ func (s *Server) handleEsimDownload(w http.ResponseWriter, r *http.Request, phys
 		_ = writeSSEEvent(w, controller, "progress", payload)
 	}
 
-	result, err := s.devices.ESIMDownloadProfile(r.Context(), physicalID, params, func(p device.EsimProgress) {
-		emit(map[string]any{"step": p.Step, "msg": p.Msg, "pct": p.Pct})
+	owned := s.ownedCardReader(configuredID)
+	if owned {
+		emit(map[string]any{"step": "preflight", "msg": "等待多隧道让出读卡器…", "pct": 1})
+	}
+	var result *device.EsimDownloadResult
+	var after device.EsimInfo
+	var afterErr error
+	err := s.withESIMReader(r.Context(), configuredID, physicalID, func(ctx context.Context, physical string) error {
+		var downloadErr error
+		result, downloadErr = s.devices.ESIMDownloadProfile(ctx, physical, params, func(p device.EsimProgress) {
+			emit(map[string]any{"step": p.Step, "msg": p.Msg, "pct": p.Pct})
+		})
+		if downloadErr == nil && owned {
+			// Read the card again while the reader is still held, so the new
+			// profile's AID and name come from the same eUICC snapshot.
+			after, afterErr = s.devices.ESIMListProfiles(ctx, physical)
+		}
+		return downloadErr
 	})
 	if err != nil {
 		emit(map[string]any{
@@ -693,8 +725,19 @@ func (s *Server) handleEsimDownload(w http.ResponseWriter, r *http.Request, phys
 		"pct":         100,
 		"space_delta": map[string]any{"direction": "consumed", "bytes": result.SpaceDelta},
 	}
+	warnings := make([]string, 0, 2)
 	if result.Warning != "" {
-		done["warning"] = result.Warning
+		warnings = append(warnings, result.Warning)
+	}
+	if owned {
+		added, warning := s.joinDownloadedProfile(r.Context(), configuredID, result, after, afterErr)
+		done["multisim_added"] = added
+		if warning != "" {
+			warnings = append(warnings, warning)
+		}
+	}
+	if len(warnings) > 0 {
+		done["warning"] = strings.Join(warnings, "；")
 	}
 	emit(done)
 }

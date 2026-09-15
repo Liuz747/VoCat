@@ -464,7 +464,8 @@ export function DeviceEsimTab({ deviceId, deviceImei, isActive, deviceOnline, de
   return (
     <div className="space-y-5">
       {multiSIMPanel}
-      {multiSIMOwned ? <div className="rounded-xl border p-4 text-sm text-gray-500">{t("多隧道运行中暂停读卡和卡片操作。请先停止多隧道，再刷新或编辑 eSIM 列表。")}</div> : <>
+      {multiSIMOwned && loadFailure?.code === "multisim_active" ? <div className="rounded-xl border p-4 text-sm text-gray-500">{t("多隧道正在启动或变更，读卡器暂时不可用，稍后刷新即可。")}</div> : <>
+      {multiSIMOwned ? <div className="rounded-xl border p-4 text-sm text-gray-500">{t("多隧道运行中：可以读卡、写入、删除和改名，切换与禁用由多隧道决定。写入的新 Profile 会自动加入多隧道；删除的 Profile 会先从多隧道移除，其余线路不受影响。")}</div> : null}
       {!chipInfo ? <Button loading={refreshing} disabled={!deviceOnline} onClick={() => void loadOverview(true)} icon={<ArrowSyncRegular />}>{t("读取 eSIM 列表")}</Button> : null}
       {loadFailure?.channelStuck ? (
         <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-amber-900 dark:border-amber-500/25 dark:bg-amber-500/10 dark:text-amber-100">
@@ -516,6 +517,7 @@ export function DeviceEsimTab({ deviceId, deviceImei, isActive, deviceOnline, de
           switchingIccid={switchingIccid}
           deletingIccid={deletingIccid}
           policyIccid={policyIccid}
+          switchLocked={multiSIMOwned}
           onRenameValueChange={setRenameValue}
           onSwitch={switchProfile}
           onStartRename={startRename}

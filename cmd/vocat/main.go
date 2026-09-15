@@ -589,6 +589,7 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 		Devices:             deviceManager,
 		VoWiFi:              vowifiManager,
 		MultiSIM:            multiSIMManager,
+		MultiSIMCards:       multiSIMBridge,
 		Logs:                logs,
 		Assets:              web.Dist,
 		Logger:              logger,
