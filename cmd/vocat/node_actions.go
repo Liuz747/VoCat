@@ -17,7 +17,6 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/sync/singleflight"
-	"vocat/internal/buildinfo"
 	"vocat/internal/device"
 	"vocat/internal/nodemqtt"
 	"vocat/internal/store"
@@ -36,6 +35,7 @@ type nodeActionService struct {
 	mapper     integration.ATMapper
 	nodeMu     sync.RWMutex
 	node       string
+	maxPayload int
 	revisions  sync.Map
 	cacheMu    sync.Mutex
 	phoneCache phoneCollection
@@ -83,11 +83,13 @@ func newNodeActionService(database *store.Store, devices *device.Manager, vowifi
 	}
 }
 
-// setNode records the configured node id. Execute() never receives it, but
-// node.describe has to report this node's outbox depth, which is keyed by node.
-func (service *nodeActionService) setNode(node string) {
+// setIdentity records the configured node id and payload ceiling. Execute()
+// never receives the settings, but node.describe has to report this node's
+// outbox depth (keyed by node) and its payload limit.
+func (service *nodeActionService) setIdentity(node string, maxPayloadBytes int) {
 	service.nodeMu.Lock()
 	service.node = strings.TrimSpace(node)
+	service.maxPayload = maxPayloadBytes
 	service.nodeMu.Unlock()
 }
 
@@ -95,6 +97,20 @@ func (service *nodeActionService) nodeName() string {
 	service.nodeMu.RLock()
 	defer service.nodeMu.RUnlock()
 	return service.node
+}
+
+// NodeDescriptor is the single source of truth behind both node.hello (emitted
+// by the runtime on connect) and node.describe. sms_text_chars mirrors what
+// sendSMS actually enforces; advertising anything else would publish a limit
+// this node does not have.
+func (service *nodeActionService) NodeDescriptor() nodemqtt.Descriptor {
+	return nodemqtt.Descriptor{
+		NodeType:               "vocat_ec20",
+		Capabilities:           nodeCapabilities,
+		SMSTextChars:           nodeSMSTextChars,
+		InventoryPageSize:      100,
+		CardOperationsParallel: 1,
+	}
 }
 
 // revision hands out a monotonic version per resource, as the protocol's
@@ -430,7 +446,7 @@ func (service *nodeActionService) downloadProfile(ctx context.Context, command n
 	// the card back for the new profile's AID and state. The multi-tunnel config
 	// sync below needs the AID and cannot proceed without it.
 	profile := device.EsimProfile{ICCID: normalizeICCID(result.ICCID)}
-	if profiles, listErr := service.deviceProfiles(ctx, config); listErr == nil {
+	if profiles, listErr := service.deviceProfiles(ctx, config, true); listErr == nil {
 		for _, candidate := range profiles {
 			if normalizeICCID(candidate.ICCID) == profile.ICCID {
 				profile = candidate
@@ -496,6 +512,9 @@ func (service *nodeActionService) deleteProfile(ctx context.Context, command nod
 
 // nodeCapabilities is what node.describe advertises. Keep it in step with the
 // Execute switch above; the server uses it to decide what it may send.
+// nodeSMSTextChars is the ceiling sendSMS enforces on params.text.
+const nodeSMSTextChars = 4096
+
 var nodeCapabilities = []string{
 	"node.describe", "inventory.get", "phones.list", "phones.check", "slot.refresh",
 	"esim.profiles.list", "esim.profile.download", "esim.profile.enable", "esim.profile.delete",
@@ -515,19 +534,13 @@ func (service *nodeActionService) describeNode(ctx context.Context, command node
 			pending = value
 		}
 	}
-	return map[string]any{
-		"node_type":        "vocat_ec20",
-		"software_version": buildinfo.Version,
-		"protocol_version": "1.0",
-		"capabilities":     nodeCapabilities,
-		"limits": map[string]any{
-			"payload_bytes":            131072,
-			"sms_text_chars":           1000,
-			"inventory_page_size":      100,
-			"card_operations_parallel": 1,
-		},
-		"outbox_pending": pending,
-	}, nil
+	service.nodeMu.RLock()
+	maxPayload := service.maxPayload
+	service.nodeMu.RUnlock()
+	if maxPayload <= 0 {
+		maxPayload = 131072
+	}
+	return service.NodeDescriptor().Payload(maxPayload, pending), nil
 }
 
 func (service *nodeActionService) getTask(ctx context.Context, command nodemqtt.Command) (any, *nodemqtt.ActionError) {
@@ -577,7 +590,9 @@ func (service *nodeActionService) getTask(ctx context.Context, command nodemqtt.
 // slotRecord builds the protocol's SlotRecord, shared by inventory.get and
 // slot.refresh. A device we cannot resolve or read is reported with its stored
 // profiles and a non-ready state rather than failing the whole action.
-func (service *nodeActionService) slotRecord(ctx context.Context, config store.Device) map[string]any {
+// slotRecord builds the protocol's SlotRecord. live reads the card; bulk
+// callers pass false so a sweep cannot contend with every running line.
+func (service *nodeActionService) slotRecord(ctx context.Context, config store.Device, live bool) map[string]any {
 	observed := time.Now().UTC()
 	slot, slotErr := service.deviceSlot(config)
 	record := map[string]any{
@@ -596,7 +611,7 @@ func (service *nodeActionService) slotRecord(ctx context.Context, config store.D
 		record["tunnels"] = []any{}
 		return record
 	}
-	profiles, listErr := service.deviceProfiles(ctx, config)
+	profiles, listErr := service.deviceProfiles(ctx, config, live)
 	record["profiles_complete"] = listErr == nil
 	record["profiles_observed_at"] = nodemqtt.FormatTime(observed)
 	var current *string
@@ -693,7 +708,7 @@ func (service *nodeActionService) getInventory(ctx context.Context, command node
 	}
 	items := make([]any, 0, end-offset)
 	for _, config := range configs[offset:end] {
-		items = append(items, service.slotRecord(ctx, config))
+		items = append(items, service.slotRecord(ctx, config, false))
 	}
 	var cursor *string
 	if end < len(configs) {
@@ -718,7 +733,15 @@ func (service *nodeActionService) refreshSlot(ctx context.Context, command nodem
 		return nil, targetErr
 	}
 	service.clearPhoneCache()
-	return map[string]any{"source": "registry", "slot": service.slotRecord(ctx, config)}, nil
+	record := service.slotRecord(ctx, config, true)
+	// Say where the profiles actually came from: a live read can fall back to
+	// the stored list when the reader is busy, and claiming "hardware" then
+	// would misreport the card.
+	source := "registry"
+	if complete, _ := record["profiles_complete"].(bool); complete {
+		source = "hardware"
+	}
+	return map[string]any{"source": source, "slot": record}, nil
 }
 
 func (service *nodeActionService) listCardProfiles(ctx context.Context, command nodemqtt.Command) (any, *nodemqtt.ActionError) {
@@ -732,9 +755,13 @@ func (service *nodeActionService) listCardProfiles(ctx context.Context, command 
 	if targetErr != nil {
 		return nil, targetErr
 	}
-	record := service.slotRecord(ctx, config)
+	record := service.slotRecord(ctx, config, true)
+	source := "registry"
+	if complete, _ := record["profiles_complete"].(bool); complete {
+		source = "hardware"
+	}
 	return map[string]any{
-		"source": "hardware", "binding_version": 1,
+		"source": source, "binding_version": 1,
 		"current_iccid": record["current_iccid"], "profiles": record["profiles"],
 		"complete":      record["profiles_complete"],
 		"observed_at":   record["profiles_observed_at"],
@@ -952,7 +979,7 @@ func (service *nodeActionService) collectPhones(ctx context.Context) (phoneColle
 			result.items = append(result.items, service.cachedUnavailableRecords(config.ID, "设备正忙，资料未刷新")...)
 			continue
 		}
-		profiles, listErr := service.deviceProfiles(ctx, config)
+		profiles, listErr := service.deviceProfiles(ctx, config, false)
 		release()
 		if listErr != nil {
 			failures++
@@ -997,9 +1024,13 @@ func (service *nodeActionService) cachedUnavailableRecords(deviceID, message str
 	return result
 }
 
-func (service *nodeActionService) deviceProfiles(ctx context.Context, config store.Device) ([]device.EsimProfile, error) {
+// deviceProfiles returns a device's profile list. live reads the card, which
+// takes the group's reader transaction; bulk callers must pass false, or a
+// sweep over every configured device would contend with each running line's
+// AKA and profile switches.
+func (service *nodeActionService) deviceProfiles(ctx context.Context, config store.Device, live bool) ([]device.EsimProfile, error) {
 	controller := service.esimController(config)
-	if controller != nil {
+	if live && controller != nil {
 		var info device.EsimInfo
 		err := service.withReader(ctx, config.ID, func(ctx context.Context, physicalID string) error {
 			var readErr error

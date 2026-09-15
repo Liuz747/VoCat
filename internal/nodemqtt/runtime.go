@@ -49,6 +49,56 @@ type HealthProvider interface {
 	NodeMQTTHealth(context.Context) HealthSnapshot
 }
 
+// Descriptor is what this node advertises about itself. node.hello and
+// node.describe must never disagree — the server decides what it may send from
+// the hello — so both are rendered from this one value.
+type Descriptor struct {
+	NodeType               string
+	Capabilities           []string
+	SMSTextChars           int
+	InventoryPageSize      int
+	CardOperationsParallel int
+}
+
+// Describer is implemented by an Executor that knows its own capabilities.
+type Describer interface {
+	NodeDescriptor() Descriptor
+}
+
+// Payload renders the body shared by node.hello and node.describe.
+func (descriptor Descriptor) Payload(maxPayloadBytes, outboxPending int) map[string]any {
+	return map[string]any{
+		"node_type":        descriptor.NodeType,
+		"software_version": buildinfo.Version,
+		"protocol_version": ProtocolVersion,
+		"capabilities":     descriptor.Capabilities,
+		"limits": map[string]any{
+			"payload_bytes":            maxPayloadBytes,
+			"sms_text_chars":           descriptor.SMSTextChars,
+			"inventory_page_size":      descriptor.InventoryPageSize,
+			"card_operations_parallel": descriptor.CardOperationsParallel,
+		},
+		"outbox_pending": outboxPending,
+	}
+}
+
+// descriptorFor asks the executor what it can do, so an Executor that predates
+// Describer still reports something coherent instead of nothing.
+func (runtime *Runtime) descriptorFor() Descriptor {
+	if provider, ok := runtime.executor.(Describer); ok {
+		if value := provider.NodeDescriptor(); value.NodeType != "" && len(value.Capabilities) > 0 {
+			return value
+		}
+	}
+	return Descriptor{
+		NodeType:               "unknown",
+		Capabilities:           []string{},
+		SMSTextChars:           4096,
+		InventoryPageSize:      100,
+		CardOperationsParallel: 1,
+	}
+}
+
 type Runtime struct {
 	settings       Settings
 	store          *store.Store
@@ -599,7 +649,7 @@ func (runtime *Runtime) EmitEventWithID(id, event string, observedAt time.Time, 
 
 func (runtime *Runtime) emitHello() {
 	pending, _ := runtime.store.CountPendingNodeMQTTOutbox(runtime.ctx, runtime.settings.Node)
-	_, err := runtime.EmitEvent("node.hello", nil, map[string]any{"node_type": "mdd_cloud", "software_version": buildinfo.Version, "protocol_version": ProtocolVersion, "capabilities": []string{"phones.list", "phones.check", "sms.send", "esim.profile.download", "esim.profile.delete"}, "limits": map[string]any{"payload_bytes": runtime.settings.MaxPayloadBytes, "sms_text_chars": 4096, "inventory_page_size": 100, "card_operations_parallel": 1}, "outbox_pending": pending})
+	_, err := runtime.EmitEvent("node.hello", nil, runtime.descriptorFor().Payload(runtime.settings.MaxPayloadBytes, pending))
 	if err != nil {
 		runtime.setError(err)
 	}
@@ -782,7 +832,16 @@ func actionTimeout(action string) time.Duration {
 	switch action {
 	case "esim.profile.download":
 		return 10 * time.Minute
-	case "esim.profile.delete":
+	// Bringing a line up waits on IMS registration, which is minutes on a cold
+	// start; the multi-SIM runtime itself allows 6 minutes per operation.
+	case "tunnel.ensure", "tunnel.reconnect":
+		return 6 * time.Minute
+	// Card work queues behind a running group's AKA and profile switches.
+	case "esim.profile.delete", "esim.profile.enable", "slot.refresh", "esim.profiles.list", "tunnel.stop":
+		return 3 * time.Minute
+	// A bulk sweep reads stored inventory, not cards, but still walks every
+	// configured device.
+	case "inventory.get":
 		return 2 * time.Minute
 	case "sms.send":
 		return time.Minute

@@ -39,7 +39,7 @@ func newNodeMQTTSettingsRuntime(ctx context.Context, database *store.Store, exec
 		return nil, err
 	}
 	manager.settings = settings
-	executor.setNode(settings.Node)
+	executor.setIdentity(settings.Node, settings.MaxPayloadBytes)
 	if settings.Enabled {
 		runtime, startErr := nodemqtt.Start(ctx, settings, database, executor, executor, logger)
 		if startErr != nil {
@@ -123,7 +123,7 @@ func (manager *nodeMQTTSettingsRuntime) Apply(ctx context.Context, settings node
 	}
 	manager.runtime = nextRuntime
 	manager.settings = settings
-	manager.executor.setNode(settings.Node)
+	manager.executor.setIdentity(settings.Node, settings.MaxPayloadBytes)
 	if oldRuntime != nil {
 		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		_ = oldRuntime.Close(closeCtx)
