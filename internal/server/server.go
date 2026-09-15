@@ -51,6 +51,7 @@ type Options struct {
 	UpdateRepository    string
 	UpdateToken         string
 	HTTPS               *httpsmode.Manager
+	NodeMQTTSettings    NodeMQTTSettingsController
 }
 
 // Server is the single HTTP handler for the JSON API and embedded SPA.
@@ -103,6 +104,7 @@ type Server struct {
 	cellularDataEventOnce     sync.Once
 	cellularDataLifecycleOnce sync.Once
 	cellularData              *cellularDataRuntime
+	nodeMQTTSettings          NodeMQTTSettingsController
 }
 
 func New(options Options) (*Server, error) {
@@ -153,6 +155,7 @@ func New(options Options) (*Server, error) {
 		updateRepository:    strings.TrimSpace(options.UpdateRepository),
 		updateToken:         strings.TrimSpace(options.UpdateToken),
 		https:               options.HTTPS,
+		nodeMQTTSettings:    options.NodeMQTTSettings,
 		netTraffic:          newLiveNetTracker(),
 		hostStats:           newHostStatsSampler(),
 		publicIPs:           make(map[string]cachedPublicIP),

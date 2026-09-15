@@ -394,6 +394,38 @@ func (s *Store) ListInboundSMSAfterID(ctx context.Context, afterID int64, limit 
 	return values, nil
 }
 
+// MaxInboundSMSID is the newest stored inbound row id. The server-node MQTT
+// runtime uses it to skip history on first start and only push what arrives
+// afterwards.
+func (s *Store) MaxInboundSMSID(ctx context.Context) (int64, error) {
+	var value int64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id),0) FROM sms_messages WHERE direction IN ('inbound','received')`).Scan(&value)
+	return value, err
+}
+
+// ListNodeMQTTDeliveryCandidates returns outbound rows this node sent over MQTT
+// whose delivery state has settled, so the runtime can emit sms.delivery once.
+func (s *Store) ListNodeMQTTDeliveryCandidates(ctx context.Context, afterID int64, limit int) ([]SMSMessage, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, smsMessageSelect+` WHERE message_id LIKE 'node-mqtt:%'
+		AND id>? AND delivery_state IN ('delivered','undeliverable','failed') ORDER BY id LIMIT ?`, afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []SMSMessage
+	for rows.Next() {
+		value, scanErr := scanSMSMessage(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		result = append(result, value)
+	}
+	return result, rows.Err()
+}
+
 // ApplySMSDeliveryReport attaches a TP-STATUS report to the newest matching
 // outbound submission and advances its aggregate delivery state. Multipart
 // messages become delivered only after every submitted part is reported.

@@ -520,3 +520,31 @@ export type Notice = {
   title: string;
   detail?: string;
 } | null;
+
+export interface NodeMQTTSettings {
+  enabled: boolean;
+  scheme: "tcp" | "tls";
+  host: string;
+  port: number;
+  node: string;
+  clientId: string;
+  username: string;
+  password: string;
+  caCertificate?: string;
+  keepAliveSeconds: number;
+  sessionExpirySeconds: number;
+  heartbeatSeconds: number;
+  businessAckEnabled: boolean;
+  commandWorkers: number;
+  maxPayloadBytes: number;
+  phoneCacheSeconds: number;
+  phoneRefreshTimeoutSeconds: number;
+}
+
+export interface NodeMQTTStatus {
+  enabled: boolean;
+  connected: boolean;
+  subscribed: boolean;
+  lastError?: string;
+  outboxPending: number;
+}

@@ -9,6 +9,7 @@ import {
   SendClockRegular,
   PanelLeftContractRegular,
   PanelLeftExpandRegular,
+  PlugConnectedRegular,
   RouterRegular,
   SettingsRegular,
   SignOutRegular,
@@ -34,6 +35,7 @@ const NAV = [
   { to: "/calls", label: "通话", icon: CallRegular },
   { to: "/automatic-tasks", label: "自动任务", icon: SendClockRegular },
   { to: "/logs", label: "实时日志", icon: DocumentTextRegular },
+  { to: "/node-mqtt", label: "总云 MQTT", icon: PlugConnectedRegular },
   { to: "/settings", label: "系统设置", icon: SettingsRegular },
 ];
 

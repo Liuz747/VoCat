@@ -19,6 +19,7 @@ import LogsPage from "./pages/LogsPage";
 import SettingsPage from "./pages/SettingsPage";
 import ExtensionPage from "./pages/ExtensionPage";
 import CallsPage from "./pages/CallsPage";
+import NodeMQTTSettingsPage from "./pages/NodeMQTTSettingsPage";
 
 const THEME_KEY = "theme";
 const DISCLAIMER_KEY = "vocat_disclaimer_agreed_at";
@@ -120,6 +121,7 @@ function AppRoot() {
           <Route path="extensions/:pluginId/:contributionId" element={<ExtensionPage />} />
           <Route path="logs" element={<LogsPage />} />
           <Route path="settings" element={<SettingsPage />} />
+          <Route path="node-mqtt" element={<NodeMQTTSettingsPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

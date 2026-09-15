@@ -583,6 +583,21 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 	}
 	go reconcileCardPolicies(pollContext, logger, database, deviceManager, vowifiManager, multiSIMManager)
 
+	// Server-node MQTT (cardpool v1). The runtime stays idle until an admin
+	// enables it on the settings page, so an unconfigured node costs nothing.
+	nodeActions := newNodeActionService(database, deviceManager, vowifiManager, multiSIMManager, multiSIMBridge)
+	nodeMQTT, err := newNodeMQTTSettingsRuntime(pollContext, database, nodeActions, logger.With("category", "node_mqtt"))
+	if err != nil {
+		return fmt.Errorf("configure server-node MQTT runtime: %w", err)
+	}
+	defer func() {
+		stopContext, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		defer cancel()
+		if err := nodeMQTT.Close(stopContext); err != nil {
+			logger.Warn("stop server-node MQTT runtime", "error", err)
+		}
+	}()
+
 	handler, err := server.New(server.Options{
 		Store:               database,
 		Auth:                authService,
@@ -601,6 +616,7 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 		UpdateRepository:    strings.TrimSpace(os.Getenv("VOCAT_REPO")),
 		UpdateToken:         strings.TrimSpace(os.Getenv("GITHUB_TOKEN")),
 		HTTPS:               httpsManager,
+		NodeMQTTSettings:    nodeMQTT,
 	})
 	if err != nil {
 		return err

@@ -237,6 +237,43 @@ func (m *Manager) Reconnect(deviceID, iccid string) error {
 	return err
 }
 
+// Disconnect cleanly tears down one line's IMS and IKE sessions while keeping
+// the multi-SIM group and its sibling lines running. A later Reconnect restores
+// the line's desired state and establishes it again.
+func (m *Manager) Disconnect(deviceID, iccid string) error {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return ErrClosed
+	}
+	g := m.groups[deviceID]
+	if g == nil || !g.owned || !g.state.Enabled {
+		m.mu.Unlock()
+		return ErrNotRegistered
+	}
+	if g.state.Busy || g.state.Phase != "running" {
+		m.mu.Unlock()
+		return ErrOperationInProgress
+	}
+	var item *line
+	for _, candidate := range g.lines {
+		if candidate.profile.ICCID == iccid {
+			item = candidate
+			break
+		}
+	}
+	if item == nil || item.orchestrator == nil {
+		m.mu.Unlock()
+		return ErrNotRegistered
+	}
+	_, err := g.runtime.RequestEnabled(item.sessionID, false)
+	m.mu.Unlock()
+	if err == nil {
+		m.options.Logger.Info("multisim disconnect_requested", "device_id", deviceID, "session_id", item.sessionID, "profile_suffix", profileSuffix(item.profile.ICCID))
+	}
+	return err
+}
+
 func (m *Manager) run(g *group, cycleCtx context.Context) {
 	defer m.wg.Done()
 	var prepareRetry time.Duration

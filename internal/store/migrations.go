@@ -533,6 +533,49 @@ func migrationStatements(version int) []string {
 			// (2026-09-14, 49 blank-eUICC modules after a hub reset).
 			`ALTER TABLE devices ADD COLUMN vowifi_user_disabled INTEGER NOT NULL DEFAULT 0 CHECK (vowifi_user_disabled IN (0, 1))`,
 		}
+	case 28:
+		return []string{
+			// Server-node MQTT (cardpool v1). Ported from the SimHubMq fork's
+			// commit f167169, where the same tables were migration 27; ours
+			// is 28 because 27 is already taken by vowifi_user_disabled.
+			`CREATE TABLE IF NOT EXISTS node_mqtt_tasks (
+				id TEXT PRIMARY KEY,
+				node TEXT NOT NULL,
+				action TEXT NOT NULL,
+				request_hash TEXT NOT NULL,
+				request_json TEXT NOT NULL,
+				state TEXT NOT NULL CHECK(state IN ('accepted','running','succeeded','rejected','failed','expired','uncertain')),
+				latest_seq INTEGER NOT NULL DEFAULT 0 CHECK(latest_seq >= 0),
+				result_json TEXT NOT NULL DEFAULT 'null',
+				error_json TEXT NOT NULL DEFAULT 'null',
+				expires_at INTEGER NOT NULL DEFAULT 0,
+				started_at INTEGER NOT NULL DEFAULT 0,
+				finished_at INTEGER NOT NULL DEFAULT 0,
+				created_at INTEGER NOT NULL,
+				updated_at INTEGER NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS node_mqtt_tasks_state_idx
+				ON node_mqtt_tasks(node, state, updated_at)`,
+			`CREATE TABLE IF NOT EXISTS node_mqtt_outbox (
+				kind TEXT NOT NULL CHECK(kind IN ('task','event')),
+				business_id TEXT NOT NULL,
+				seq INTEGER NOT NULL DEFAULT 0 CHECK(seq >= 0),
+				node TEXT NOT NULL,
+				payload_json TEXT NOT NULL,
+				attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+				next_attempt_at INTEGER NOT NULL,
+				created_at INTEGER NOT NULL,
+				acked_at INTEGER NOT NULL DEFAULT 0,
+				PRIMARY KEY(kind, business_id, seq)
+			)`,
+			`CREATE INDEX IF NOT EXISTS node_mqtt_outbox_pending_idx
+				ON node_mqtt_outbox(node, acked_at, next_attempt_at, created_at)`,
+			`CREATE TABLE IF NOT EXISTS node_mqtt_meta (
+				key TEXT PRIMARY KEY,
+				value_json TEXT NOT NULL,
+				updated_at INTEGER NOT NULL
+			)`,
+		}
 	default:
 		return nil
 	}

@@ -14,15 +14,25 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 27
+const schemaVersion = 28
 
 var ErrNotFound = errors.New("store: not found")
 
 // Store owns the SQLite connection used by the process.
 type Store struct {
 	db           *sql.DB
+	path         string
 	logMu        sync.Mutex
 	logClearedAt time.Time
+}
+
+// DatabasePath returns the configured filesystem path. In-memory databases
+// return an empty string because they have no durable sibling files.
+func (s *Store) DatabasePath() string {
+	if s == nil || !isFilesystemPath(s.path) {
+		return ""
+	}
+	return s.path
 }
 
 type Admin struct {
@@ -80,7 +90,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 			return closeOnError(fmt.Errorf("secure sqlite file: %w", err))
 		}
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, path: path}, nil
 }
 
 func prepareDatabasePath(path string) error {

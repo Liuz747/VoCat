@@ -79,6 +79,9 @@ func (s *Server) routeSettingsAPI(
 	cleanPath string,
 ) bool {
 	cleanPath = strings.Trim(cleanPath, "/")
+	if s.routeNodeMQTTSettingsAPI(w, r, cleanPath) {
+		return true
+	}
 	switch cleanPath {
 	case "settings/notifications":
 		s.handleNotificationSettings(w, r)
