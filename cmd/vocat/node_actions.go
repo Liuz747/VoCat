@@ -162,9 +162,11 @@ func (service *nodeActionService) NodeMQTTHealth(ctx context.Context) nodemqtt.H
 		result.Health = "error"
 		return result
 	}
+	// Presence comes from the device manager's live view — the same source the
+	// dashboard uses. The fork asked the device_runtime table, which nothing
+	// populates on this build, so every module counted as offline.
 	for _, config := range configs {
-		runtime, runtimeErr := service.database.DeviceRuntime(ctx, config.ID)
-		if runtimeErr == nil && runtime.Healthy {
+		if entry, resolveErr := service.mapper.Get(config.ID); resolveErr == nil && entry.Discovered {
 			result.DevicesOnline++
 		} else {
 			result.DevicesOffline++
@@ -181,7 +183,24 @@ func (service *nodeActionService) NodeMQTTHealth(ctx context.Context) nodemqtt.H
 			}
 		}
 	}
-	if result.DevicesOffline > 0 {
+	// An idle module is the normal state on this host: most carry a blank eUICC
+	// and sit at CFUN=4 by design, so "any device offline" would pin the node
+	// to degraded forever. Degraded means work this node is supposed to be
+	// doing is not happening — judge it by the enabled multi-SIM groups.
+	expected, stalled := 0, 0
+	if groups, groupErr := service.database.ListMultiSIMConfigs(ctx); groupErr == nil {
+		for _, group := range groups {
+			if !group.Enabled {
+				continue
+			}
+			expected++
+			if service.multisim == nil || !service.multisim.Owns(group.DeviceID) ||
+				service.multisim.State(group.DeviceID).Phase != "running" {
+				stalled++
+			}
+		}
+	}
+	if stalled > 0 || (expected > 0 && result.RegisteredTunnels == 0) {
 		result.Health = "degraded"
 	}
 	return result
