@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import type { DashboardDevice, DashboardHost, DashboardUpcomingTask } from "../types";
 import { usePolling } from "../lib/usePolling";
-import { useI18n } from "../lib/i18n";
+import { tf, useI18n } from "../lib/i18n";
 import { PageHeader } from "../components/ui/PageHeader";
 import { RefreshButton } from "../components/ui/RefreshButton";
 import { ErrorState } from "../components/ui/ErrorState";
@@ -71,8 +71,11 @@ export default function DashboardPage() {
   usePolling(fetchHost, 2000);
   usePolling(fetchUpcomingTasks, TASKS_POLL_INTERVAL);
 
-  const total = devices.length;
-  const online = devices.filter((d) => d?.healthy).length;
+  // Records whose module is unplugged or moved to another host stay configured but are not part of the live fleet.
+  const attached = devices.filter((d) => d.physicalPresent !== false && d.lifecyclePhase !== "missing");
+  const detachedCount = devices.length - attached.length;
+  const total = attached.length;
+  const online = attached.filter((d) => d?.healthy).length;
   const openDevice = (id: string) => navigate(`/devices?device=${encodeURIComponent(id)}&tab=overview`);
 
   return (
@@ -93,14 +96,21 @@ export default function DashboardPage() {
       ) : null}
       {devicesLoading && devices.length === 0 ? (
         <ListSkeleton rows={10} />
-      ) : devices.length === 0 ? (
+      ) : attached.length === 0 ? (
         <EmptyState title={t("暂无设备接入")} subtitle={t("请先在设备管理中添加或接管设备")} />
       ) : (
-        <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
-          {devices.map((d) => (
-            <DeviceCard key={d.id} device={d} onOpen={openDevice} />
-          ))}
-        </div>
+        <>
+          <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
+            {attached.map((d) => (
+              <DeviceCard key={d.id} device={d} onOpen={openDevice} />
+            ))}
+          </div>
+          {detachedCount > 0 ? (
+            <div className="mt-4 text-center text-xs text-[var(--text-secondary,#888)]">
+              {tf("另有 {count} 台已拔出", { count: detachedCount })}
+            </div>
+          ) : null}
+        </>
       )}
     </div>
   );

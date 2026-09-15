@@ -17,7 +17,7 @@ import { DeviceConfigTab } from "../components/devices/DeviceConfigTab";
 import { CardPolicyPanel } from "../components/devices/CardPolicyPanel";
 import { DeviceAddDialog } from "../components/devices/DeviceAddDialog";
 import { CarrierWebsheetDialog, type CarrierWebsheet } from "../components/devices/CarrierWebsheetDialog";
-import { copyText, isDeviceOnline, isQmiControl, isRecoveringPhase, readEventStream, simOperatorDisplay } from "../components/devices/shared";
+import { copyText, isDetached, isDeviceOnline, isQmiControl, isRecoveringPhase, readEventStream, simOperatorDisplay } from "../components/devices/shared";
 import type { AddDeviceForm, DeviceDetail, LoadError } from "../components/devices/types";
 import { tf, useI18n } from "../lib/i18n";
 
@@ -80,7 +80,7 @@ export default function DevicesPage() {
   const [websheetOpen, setWebsheetOpen] = useState(false);
   const [cardPolicy, setCardPolicy] = useState<CardPolicy | null>(null);
   const [query, setQuery] = useState("");
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("present");
   const [sortKey, setSortKey] = useState<SortKey>("name");
   const [sortDir, setSortDir] = useState<SortDir>("asc");
 
@@ -208,7 +208,7 @@ export default function DevicesPage() {
         const urlDevice = (searchParamsRef.current.get("device") || "").trim();
         let next = selectedIdRef.current;
         if (urlDevice) next = urlDevice;
-        else if (!next && devices.length) next = devices[0].id;
+        else if (!next && devices.length) next = (devices.find((d) => !isDetached(d)) || devices[0]).id;
         else if (next && devices.length === 0) next = "";
         if (next !== selectedIdRef.current) {
           setSelectedId(next);
@@ -633,7 +633,8 @@ export default function DevicesPage() {
   const filteredDevices = useMemo(() => {
     const q = query.trim().toLowerCase();
     let d = list.slice();
-    if (statusFilter === "online") d = d.filter((c) => isDeviceOnline(c));
+    if (statusFilter === "present") d = d.filter((c) => !isDetached(c) || c.id === selectedId);
+    else if (statusFilter === "online") d = d.filter((c) => isDeviceOnline(c));
     else if (statusFilter === "offline") d = d.filter((c) => !c?.running && !isRecoveringPhase(c.lifecyclePhase));
     if (q) {
       d = d.filter((c) =>
@@ -656,7 +657,8 @@ export default function DevicesPage() {
       return 0;
     });
     return d;
-  }, [list, query, statusFilter, sortKey, sortDir]);
+  }, [list, query, statusFilter, sortKey, sortDir, selectedId]);
+  const detachedCount = useMemo(() => list.filter((d) => isDetached(d)).length, [list]);
 
   const selectedListItem = useMemo(() => list.find((d) => d.id === selectedId) || null, [list, selectedId]);
   const simOperator = useMemo(() => simOperatorDisplay(detail), [detail]);
@@ -743,6 +745,7 @@ export default function DevicesPage() {
             filteredDevices={filteredDevices}
             rotationDeviceIds={rotationByDevice}
             deviceCount={list.length}
+            detachedCount={detachedCount}
             deviceLimit={deviceLimit}
             onQueryChange={setQuery}
             onStatusFilterChange={setStatusFilter}

@@ -177,6 +177,8 @@ export interface DashboardDevice {
   proxyPort: number;
   publicIp: string;
   healthy: boolean;
+  physicalPresent?: boolean;
+  lifecyclePhase?: string;
   operator: string;
   signalDbm: number;
   networkMode: string;

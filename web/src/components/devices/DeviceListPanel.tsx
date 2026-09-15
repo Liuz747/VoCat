@@ -5,7 +5,7 @@ import { DeviceListItemCard } from "./DeviceListItemCard";
 import type { RotationTaskSummary } from "./types";
 import { tl, useI18n } from "../../lib/i18n";
 
-export type StatusFilter = "all" | "online" | "offline";
+export type StatusFilter = "present" | "all" | "online" | "offline";
 export type SortKey = "name" | "signal";
 export type SortDir = "asc" | "desc";
 
@@ -19,6 +19,7 @@ export interface DeviceListPanelProps {
   selectedId: string;
   filteredDevices: DeviceListItem[];
   deviceCount: number;
+  detachedCount: number;
   deviceLimit: number;
   onQueryChange: (v: string) => void;
   onStatusFilterChange: (v: StatusFilter) => void;
@@ -49,7 +50,7 @@ function statusLine(d: DeviceListItem): string {
 
 export function DeviceListPanel(props: DeviceListPanelProps) {
   const { t } = useI18n();
-  const { loading, query, statusFilter, sortKey, sortDir, selectedId, filteredDevices, deviceCount, deviceLimit } = props;
+  const { loading, query, statusFilter, sortKey, sortDir, selectedId, filteredDevices, deviceCount, detachedCount, deviceLimit } = props;
   return (
     <div className="ui-card p-5">
       <div className="mb-4 flex items-center gap-3">
@@ -61,7 +62,8 @@ export function DeviceListPanel(props: DeviceListPanelProps) {
           onChange={(v) => props.onStatusFilterChange(v as StatusFilter)}
           placeholder={t("在线")}
           options={[
-            { value: "all", label: t("全部状态") },
+            { value: "present", label: t("在位设备") },
+            { value: "all", label: detachedCount > 0 ? `${t("全部（含已拔出）")} +${detachedCount}` : t("全部状态") },
             { value: "online", label: t("仅在线") },
             { value: "offline", label: t("仅离线") },
           ]}

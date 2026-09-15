@@ -2042,6 +2042,8 @@ func (s *Server) dashboardDevices() []map[string]any {
 			"proxy_port":        entry["proxy_port"],
 			"public_ip":         entry["public_ip"],
 			"healthy":           entry["healthy"],
+			"physical_present":  entry["physical_present"],
+			"lifecycle_phase":   entry["lifecycle_phase"],
 			"operator":          modemStatus["operator"],
 			"signal_dbm":        modemStatus["signal_dbm"],
 			"network_mode":      modemStatus["network_mode"],

@@ -21,6 +21,11 @@ export function isRecoveringPhase(phase?: string): boolean {
   );
 }
 
+// Configured record whose module is no longer on USB (unplugged or moved to another host).
+export function isDetached(device?: { physicalPresent?: boolean; lifecyclePhase?: string } | null): boolean {
+  return device?.physicalPresent === false || device?.lifecyclePhase === "missing";
+}
+
 // ra: human label for a lifecycle phase.
 export function lifecycleLabel(phase?: string): string {
   switch (phase) {
