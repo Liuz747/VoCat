@@ -29,6 +29,8 @@ import (
 type nodeActionService struct {
 	database   *store.Store
 	devices    *device.Manager
+	esim       nodeESIMController
+	readCard   func(context.Context, string, func(context.Context, string) error) error
 	vowifi     *vowifiruntime.Manager
 	multisim   *multisim.Manager
 	cards      *multiSIMIntegration
@@ -76,11 +78,14 @@ type nodePhoneRecord struct {
 }
 
 func newNodeActionService(database *store.Store, devices *device.Manager, vowifi *vowifiruntime.Manager, multi *multisim.Manager, cards *multiSIMIntegration) *nodeActionService {
-	return &nodeActionService{
+	service := &nodeActionService{
+		esim:     devices,
 		database: database, devices: devices, vowifi: vowifi, multisim: multi, cards: cards,
 		mapper:    integration.ATMapper{Store: database, Devices: devices},
 		snapshots: make(map[string]phoneSnapshot),
 	}
+	service.readCard = service.withReader
+	return service
 }
 
 // setIdentity records the configured node id and payload ceiling. Execute()
@@ -449,49 +454,58 @@ func (service *nodeActionService) downloadProfile(ctx context.Context, command n
 	if controller == nil {
 		return nil, reject("UNSUPPORTED_ACTION", "目标设备不支持 eSIM 下载")
 	}
-	var result *device.EsimDownloadResult
-	err := service.withReader(ctx, config.ID, func(ctx context.Context, physicalID string) error {
-		var downloadErr error
-		result, downloadErr = controller.ESIMDownloadProfile(ctx, physicalID, device.EsimDownloadParams{SMDP: smdp, MatchingID: matchingID, ConfirmationCode: params.ConfirmationCode, IMEI: config.ModemIMEI}, func(value device.EsimProgress) { pct := value.Pct; progress(value.Step, &pct) })
-		return downloadErr
-	})
-	if err != nil {
-		return nil, classifySideEffect(err, "写卡结果无法确认")
-	}
-	if result == nil || normalizeICCID(result.ICCID) == "" {
-		return nil, uncertain("DOWNLOAD_FAILED", "下载命令已完成，但无法核实新增 Profile")
-	}
-	// Our EsimDownloadResult carries only the ICCID, unlike the fork's, so read
-	// the card back for the new profile's AID and state. The multi-tunnel config
-	// sync below needs the AID and cannot proceed without it.
-	profile := device.EsimProfile{ICCID: normalizeICCID(result.ICCID)}
-	if profiles, listErr := service.deviceProfiles(ctx, config, true); listErr == nil {
-		for _, candidate := range profiles {
-			if normalizeICCID(candidate.ICCID) == profile.ICCID {
-				profile = candidate
-				profile.ICCID = normalizeICCID(candidate.ICCID)
+	var profile *device.EsimProfile
+	var confirmationErr error
+	err := service.readCard(ctx, config.ID, func(ctx context.Context, physicalID string) error {
+		result, downloadErr := controller.ESIMDownloadProfile(ctx, physicalID, device.EsimDownloadParams{SMDP: smdp, MatchingID: matchingID, ConfirmationCode: params.ConfirmationCode, IMEI: config.ModemIMEI}, func(value device.EsimProgress) { pct := value.Pct; progress(value.Step, &pct) })
+		if downloadErr != nil {
+			return downloadErr
+		}
+		if result == nil || normalizeICCID(result.ICCID) == "" {
+			confirmationErr = errors.New("downloaded ICCID unavailable")
+			return nil
+		}
+		// Keep the same pinned reader and AKA transaction through readback.
+		info, readErr := controller.ESIMListProfiles(ctx, physicalID)
+		if readErr != nil {
+			confirmationErr = readErr
+			return nil
+		}
+		for _, candidate := range info.Profiles {
+			if normalizeICCID(candidate.ICCID) == normalizeICCID(result.ICCID) {
+				candidate.ICCID = normalizeICCID(candidate.ICCID)
+				profile = &candidate
 				break
 			}
 		}
-	}
-	state := strings.ToLower(strings.TrimSpace(profile.StateText))
-	if state != "enabled" && state != "disabled" {
-		if profile.State == 1 {
-			state = "enabled"
-		} else {
-			state = "disabled"
-		}
-	}
-	resultValue := map[string]any{"binding_version": 1, "iccid": profile.ICCID, "written": true, "profile_state": state}
-	// Every device on this node is an EC20 that may be running a multi-tunnel
-	// group, so the config sync is unconditional; addDownloadedProfile itself
-	// no-ops when the device has no enabled multi-SIM config.
-	if err := service.addDownloadedProfile(ctx, config.ID, profile); err != nil {
-		service.clearPhoneCache()
-		return nil, &nodemqtt.ActionError{State: "failed", Code: "INTERNAL_ERROR", Message: "Profile 已写入，但多隧道配置同步失败", Certainty: "known_failed", Result: resultValue}
-	}
+		return nil
+	})
 	service.clearPhoneCache()
-	return resultValue, nil
+	if err != nil {
+		return nil, classifySideEffect(err, "写卡结果无法确认")
+	}
+	if confirmationErr != nil || profile == nil {
+		return nil, uncertain("DOWNLOAD_FAILED", "下载命令已完成，但无法核实新增 Profile；请读取卡片确认，不要重新下载")
+	}
+	state := nodeProfileState(*profile)
+	// Download only installs the profile. A separate tunnel.ensure opts it
+	// into the running group without restarting existing lines.
+	return map[string]any{"binding_version": 1, "iccid": profile.ICCID, "written": true, "profile_state": state}, nil
+}
+
+func nodeProfileState(profile device.EsimProfile) string {
+	state := strings.ToLower(strings.TrimSpace(profile.StateText))
+	if state == "enabled" || state == "disabled" {
+		return state
+	}
+	switch profile.State {
+	case 0:
+		return "disabled"
+	case 1:
+		return "enabled"
+	default:
+		return "unknown"
+	}
 }
 
 func (service *nodeActionService) deleteProfile(ctx context.Context, command nodemqtt.Command) (any, *nodemqtt.ActionError) {
@@ -782,9 +796,9 @@ func (service *nodeActionService) listCardProfiles(ctx context.Context, command 
 	return map[string]any{
 		"source": source, "binding_version": 1,
 		"current_iccid": record["current_iccid"], "profiles": record["profiles"],
-		"complete":      record["profiles_complete"],
-		"observed_at":   record["profiles_observed_at"],
-		"revision":      service.revision("profiles:" + config.ID),
+		"complete":    record["profiles_complete"],
+		"observed_at": record["profiles_observed_at"],
+		"revision":    service.revision("profiles:" + config.ID),
 	}, nil
 }
 
@@ -804,7 +818,7 @@ func (service *nodeActionService) enableProfile(ctx context.Context, command nod
 		return nil, reject("SLOT_BUSY", "目标卡槽正在执行其他操作")
 	}
 	defer release()
-	err := service.withReader(ctx, config.ID, func(ctx context.Context, physicalID string) error {
+	err := service.readCard(ctx, config.ID, func(ctx context.Context, physicalID string) error {
 		return service.devices.ESIMSwitchProfile(ctx, physicalID, record.Target.ICCID, record.AID)
 	})
 	if err != nil {
@@ -888,7 +902,31 @@ func (service *nodeActionService) ensureTunnel(ctx context.Context, command node
 	if service.multisim == nil || !service.multisim.Owns(config.ID) {
 		return nil, reject("UNSUPPORTED_ACTION", "该设备没有运行中的多隧道组")
 	}
-	if err := service.multisim.Reconnect(config.ID, iccid); err != nil {
+	release, lockErr := service.lockResource(ctx, "device:"+config.ID)
+	if lockErr != nil {
+		return nil, reject("SLOT_BUSY", "目标卡槽正在执行其他操作")
+	}
+	group := service.multisim.State(config.ID)
+	if group.Phase != "running" || group.Busy {
+		release()
+		return nil, reject("SLOT_BUSY", "多隧道组尚未就绪")
+	}
+	exists := false
+	for _, line := range group.Lines {
+		if normalizeICCID(line.ICCID) == iccid {
+			exists = true
+			break
+		}
+	}
+	var startErr error
+	if exists {
+		startErr = service.multisim.Reconnect(config.ID, iccid)
+	} else {
+		startErr = service.ensureProfileConfigured(ctx, config.ID, device.EsimProfile{ICCID: iccid, AID: record.AID})
+	}
+	release()
+	service.clearPhoneCache()
+	if err := startErr; err != nil {
 		if errors.Is(err, multisim.ErrOperationInProgress) {
 			return nil, reject("SLOT_BUSY", "多隧道组正在执行其他操作")
 		}
@@ -954,7 +992,7 @@ type nodeESIMController interface {
 }
 
 func (service *nodeActionService) esimController(_ store.Device) nodeESIMController {
-	return service.devices
+	return service.esim
 }
 
 func (service *nodeActionService) currentPhones(ctx context.Context) (phoneCollection, error) {
@@ -1071,7 +1109,7 @@ func (service *nodeActionService) deviceProfiles(ctx context.Context, config sto
 	controller := service.esimController(config)
 	if live && controller != nil {
 		var info device.EsimInfo
-		err := service.withReader(ctx, config.ID, func(ctx context.Context, physicalID string) error {
+		err := service.readCard(ctx, config.ID, func(ctx context.Context, physicalID string) error {
 			var readErr error
 			info, readErr = controller.ESIMListProfiles(ctx, physicalID)
 			return readErr
@@ -1154,6 +1192,29 @@ func (service *nodeActionService) resolveCommandTarget(ctx context.Context, targ
 		return nodePhoneRecord{}, store.Device{}, actionFailure(err, "POOL_OFFLINE")
 	}
 	record, resolveErr := service.resolveRecord(ctx, target, collection.items)
+	if resolveErr == nil || target.ICCID == "" || (resolveErr.Code != "PROFILE_NOT_FOUND" && resolveErr.Code != "PHONE_NOT_FOUND") {
+		return record, config, resolveErr
+	}
+	// A downloaded profile need not be part of the desired running group.
+	// Explicit ICCID operations read the card before declaring it missing.
+	profiles, readErr := service.deviceProfiles(ctx, config, true)
+	if readErr != nil {
+		return nodePhoneRecord{}, config, actionFailure(readErr, "POOL_OFFLINE")
+	}
+	var records []nodePhoneRecord
+	for _, profile := range profiles {
+		iccid := normalizeICCID(profile.ICCID)
+		if iccid != normalizeICCID(target.ICCID) {
+			continue
+		}
+		phone, _ := service.database.PhoneNumberForICCID(ctx, iccid)
+		var phonePointer *string
+		if nodemqtt.ValidE164(phone) {
+			phonePointer = &phone
+		}
+		records = append(records, nodePhoneRecord{Target: nodeActionTarget{Device: config.ID, Slot: target.Slot, ICCID: iccid, Phone: phonePointer, BindingVersion: 1}, AID: profile.AID, ProfileState: nodeProfileState(profile)})
+	}
+	record, resolveErr = service.resolveRecord(ctx, target, records)
 	return record, config, resolveErr
 }
 
@@ -1234,7 +1295,7 @@ func (service *nodeActionService) profileRuntimeActive(deviceID, iccid string) b
 	return false
 }
 
-func (service *nodeActionService) addDownloadedProfile(ctx context.Context, deviceID string, profile device.EsimProfile) error {
+func (service *nodeActionService) ensureProfileConfigured(ctx context.Context, deviceID string, profile device.EsimProfile) error {
 	cfg, err := service.database.MultiSIMConfig(ctx, deviceID)
 	if errors.Is(err, store.ErrNotFound) {
 		return nil
@@ -1242,18 +1303,21 @@ func (service *nodeActionService) addDownloadedProfile(ctx context.Context, devi
 	if err != nil || !cfg.Enabled {
 		return err
 	}
+	found := false
 	for _, existing := range cfg.Profiles {
 		if normalizeICCID(existing.ICCID) == profile.ICCID {
-			return nil
+			found = true
+			break
 		}
 	}
-	if strings.TrimSpace(profile.AID) == "" {
-		return errors.New("downloaded profile AID is unavailable")
-	}
-	added := store.MultiSIMProfile{ICCID: profile.ICCID, AID: profile.AID, Name: firstNonEmpty(profile.Name, profile.ServiceProvider)}
-	cfg.Profiles = append(cfg.Profiles, added)
-	if _, err := service.database.SaveMultiSIMConfig(ctx, cfg); err != nil {
-		return err
+	if !found {
+		if strings.TrimSpace(profile.AID) == "" {
+			return errors.New("downloaded profile AID is unavailable")
+		}
+		cfg.Profiles = append(cfg.Profiles, store.MultiSIMProfile{ICCID: profile.ICCID, AID: profile.AID, Name: firstNonEmpty(profile.Name, profile.ServiceProvider)})
+		if _, err := service.database.SaveMultiSIMConfig(ctx, cfg); err != nil {
+			return err
+		}
 	}
 	// Our multisim manager has no AddProfile/RemoveProfile; it reconciles a
 	// running group against a whole desired profile list, so re-Apply the saved
