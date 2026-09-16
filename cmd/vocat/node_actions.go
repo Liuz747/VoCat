@@ -1115,6 +1115,11 @@ func (service *nodeActionService) deviceProfiles(ctx context.Context, config sto
 			return readErr
 		})
 		if err == nil {
+			// Card operations and multisim.Config use the ISD-R address,
+			// not each profile's ISD-P application address.
+			for index := range info.Profiles {
+				info.Profiles[index].AID = info.AID
+			}
 			return info.Profiles, nil
 		}
 		// A restore or a re-attachment can take the borrowed reader back mid
@@ -1303,6 +1308,8 @@ func (service *nodeActionService) ensureProfileConfigured(ctx context.Context, d
 	if err != nil || !cfg.Enabled {
 		return err
 	}
+	previous := cfg
+	previous.Profiles = append([]store.MultiSIMProfile(nil), cfg.Profiles...)
 	found := false
 	for _, existing := range cfg.Profiles {
 		if normalizeICCID(existing.ICCID) == profile.ICCID {
@@ -1322,8 +1329,15 @@ func (service *nodeActionService) ensureProfileConfigured(ctx context.Context, d
 	// Our multisim manager has no AddProfile/RemoveProfile; it reconciles a
 	// running group against a whole desired profile list, so re-Apply the saved
 	// config and let profileDiff() add just the new line.
-	if service.multisim != nil && service.multisim.Owns(deviceID) {
-		return service.multisim.Apply(ctx, runtimeMultiSIMConfigForNode(cfg))
+	if err := service.multisim.Apply(ctx, runtimeMultiSIMConfigForNode(cfg)); err != nil {
+		if !found {
+			rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			if _, rollbackErr := service.database.SaveMultiSIMConfig(rollbackCtx, previous); rollbackErr != nil {
+				return fmt.Errorf("group apply failed: %v; saved config rollback failed: %w", err, rollbackErr)
+			}
+		}
+		return err
 	}
 	return nil
 }

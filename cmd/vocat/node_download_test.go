@@ -11,6 +11,7 @@ import (
 	"vocat/internal/device"
 	"vocat/internal/nodemqtt"
 	"vocat/internal/store"
+	"vocat/internal/vowifi/multisim"
 )
 
 const testDownloadICCID = "8901240527191882177"
@@ -117,17 +118,46 @@ func TestNodeExplicitTargetFindsWrittenProfileOutsideGroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	locked := false
-	f := &nodeDownloadController{t: t, locked: &locked, info: device.EsimInfo{Profiles: []device.EsimProfile{{ICCID: testDownloadICCID, AID: "A001"}}}}
+	f := &nodeDownloadController{t: t, locked: &locked, info: device.EsimInfo{AID: "A000", Profiles: []device.EsimProfile{{ICCID: testDownloadICCID, AID: "A001"}}}}
 	service := &nodeActionService{database: db, esim: f, phoneCache: phoneCollection{generatedAt: time.Now()}, readCard: func(ctx context.Context, _ string, op func(context.Context, string) error) error {
 		locked = true
 		defer func() { locked = false }()
 		return op(ctx, "physical")
 	}}
 	record, _, failure := service.resolveCommandTarget(ctx, nodemqtt.Target{Device: "record", Slot: "123456789012345", ICCID: testDownloadICCID, BindingVersion: 1})
-	if failure != nil || record.Target.ICCID != testDownloadICCID || record.AID != "A001" {
+	if failure != nil || record.Target.ICCID != testDownloadICCID || record.AID != "A000" {
 		t.Fatalf("record=%+v error=%+v", record, failure)
 	}
 	if _, err = db.MultiSIMConfig(ctx, "record"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("target lookup modified config: %v", err)
+	}
+}
+
+func TestNodeEnsureRejectedConfigRollsBack(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.UpsertDevice(ctx, store.Device{ID: "record", Name: "test", ModemIMEI: "123456789012345"}); err != nil {
+		t.Fatal(err)
+	}
+	initial := store.MultiSIMConfig{DeviceID: "record", Enabled: true, Profiles: []store.MultiSIMProfile{{ICCID: "8900000000000000001", AID: "A000"}}}
+	if _, err = db.SaveMultiSIMConfig(ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+	multi := multisim.New(multisim.Options{}) // No factory: Apply must reject the change.
+	defer multi.Close(ctx)
+	service := &nodeActionService{database: db, multisim: multi}
+	if err = service.ensureProfileConfigured(ctx, "record", device.EsimProfile{ICCID: testDownloadICCID, AID: "A000"}); err == nil {
+		t.Fatal("Apply unexpectedly succeeded")
+	}
+	saved, err := db.MultiSIMConfig(ctx, "record")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(saved.Profiles) != 1 || saved.Profiles[0] != initial.Profiles[0] {
+		t.Fatalf("rejected change persisted: %+v", saved)
 	}
 }
