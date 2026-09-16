@@ -88,8 +88,8 @@ func TestPhonesListReadsProfilesWithoutSavedGroupAndKeepsWireShape(t *testing.T)
 		t.Fatalf("changed result shape: %v", result)
 	}
 	items := result["items"].([]any)
-	if len(items) != 2 {
-		t.Fatalf("got %d phone rows; want two real cards, no blank-card row", len(items))
+	if len(items) != 3 {
+		t.Fatalf("got %d phone rows; want two profiles plus one explicit empty-card row", len(items))
 	}
 	if f.reads != 3 {
 		t.Fatalf("read %d cards, want 3", f.reads)
@@ -97,8 +97,15 @@ func TestPhonesListReadsProfilesWithoutSavedGroupAndKeepsWireShape(t *testing.T)
 	for i, item := range items {
 		row := item.(map[string]any)
 		target := row["target"].(map[string]any)
-		if target["slot"] != d.entries[i].Snapshot.IMEI || target["iccid"] != f.cards[d.entries[i].ID].Profiles[0].ICCID {
-			t.Fatalf("missing real profile: %v", target)
+		wantICCID := ""
+		if profiles := f.cards[d.entries[i].ID].Profiles; len(profiles) > 0 {
+			wantICCID = profiles[0].ICCID
+		}
+		if target["slot"] != d.entries[i].Snapshot.IMEI || target["iccid"] != wantICCID {
+			t.Fatalf("missing module/profile identity: %v", target)
+		}
+		if i == 2 && row["reason"] != "空卡，无 Profile" {
+			t.Fatalf("empty card not explicit: %v", row)
 		}
 		if len(row) != 5 || len(target) != 5 || target["phone"] != nil || row["available"] != false || row["tunnel_state"] != "stopped" {
 			t.Fatalf("unexpected shape or readiness: %v", row)
@@ -157,5 +164,28 @@ func TestPhonesListRejectsSameIMEIUSBReenumeration(t *testing.T) {
 				t.Fatalf("USB reenumeration accepted: %v %+v", r, e)
 			}
 		})
+	}
+}
+
+func TestPhonesListAllNineteenSlotsIncludingEmptyCards(t *testing.T) {
+	s, d, f := phoneHardwareFixture(t, 19)
+	for i, entry := range d.entries {
+		if i%2 == 0 {
+			f.cards[entry.ID] = device.EsimInfo{AID: "A0000005591010"}
+		}
+	}
+	r := callPhones(t, s, 50, "")
+	items := r["items"].([]any)
+	slots := map[string]bool{}
+	for _, raw := range items {
+		row := raw.(map[string]any)
+		target := row["target"].(map[string]any)
+		slots[target["slot"].(string)] = true
+		if len(row) != 5 || len(target) != 5 {
+			t.Fatal("wire fields changed")
+		}
+	}
+	if len(slots) != 19 || len(items) != 19 {
+		t.Fatalf("got %d rows / %d slots", len(items), len(slots))
 	}
 }

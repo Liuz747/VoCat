@@ -18,7 +18,8 @@ type nodeFreshProfileReader interface {
 }
 
 // collectLivePhones preserves the PhoneRecord schema: one row per real profile,
-// including disabled/unknown-number profiles. Confirmed blank cards add no rows.
+// including disabled/unknown-number profiles. Confirmed blank cards carry one
+// explicitly unavailable row with an empty ICCID, as requested by the operator.
 func (service *nodeActionService) collectLivePhones(ctx context.Context) (phoneCollection, *nodemqtt.ActionError) {
 	result := phoneCollection{items: []nodePhoneRecord{}}
 	reader, ok := service.esim.(nodeFreshProfileReader)
@@ -49,6 +50,10 @@ func (service *nodeActionService) collectLivePhones(ctx context.Context) (phoneC
 		profiles, readFailure := service.readPhoneProfiles(ctx, reader, id, imei, identity)
 		if readFailure != nil {
 			return phoneCollection{}, readFailure
+		}
+		if len(profiles) == 0 {
+			reason := "空卡，无 Profile"
+			result.items = append(result.items, nodePhoneRecord{Target: nodeActionTarget{Device: id, Slot: imei, BindingVersion: 1}, Available: false, TunnelState: "stopped", Reason: &reason, ObservedAt: nodemqtt.FormatTime(time.Now().UTC())})
 		}
 		for _, profile := range profiles {
 			iccid := normalizeICCID(profile.ICCID)

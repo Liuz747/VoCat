@@ -2,7 +2,7 @@
 
 Use `inventory.get` to enumerate attached Quectel EC20 modules. `phones.list`
 reads the profiles on the attached cards: several profiles can share an IMEI,
-and a confirmed blank card does not produce a phone row. Deduplicating
+and confirmed blank cards have an explicit unavailable row with an empty ICCID. Deduplicating
 `phones.list` cannot produce a complete hardware inventory.
 
 Send the usual command envelope (`id`, `action`, `time`, `expires_at`, `params`)
@@ -49,8 +49,13 @@ transaction. It includes profiles without a saved multi-tunnel group, profiles
 on single-line devices, disabled profiles, and profiles whose phone number is
 unknown (`phone: null`, with the real ICCID). `target.slot` remains the module
 IMEI. `available`, `tunnel_state`, `reason` and `observed_at` describe that
-profile's current tunnel state. No extra result fields or synthetic empty-card
-phone records are added.
+profile's current tunnel state. No extra result fields are added. By operator request, a confirmed blank card
+also has one row: its real `target.slot`, `target.iccid: ""`, `phone: null`,
+`available: false`, `tunnel_state: "stopped"`, and reason `空卡，无 Profile`.
+This row identifies a module, not an addressable phone/Profile. Consumers must
+accept this empty-card row before validating a real Profile ICCID, update device
+identity as needed, and skip number creation or phone actions for it. This is an
+explicit extension of the design document, which excludes blank-card rows.
 
 Historical/offline device records are excluded. A card-read error, malformed
 response, unregistered device, or USB identity/generation change fails the
@@ -62,6 +67,6 @@ cards. Reusing a task ID replays the old task; use a new ID, current timestamps,
 and no cursor for a new hardware observation.
 
 This change is scoped to `phones.list`; `phones.check` and internal target
-lookup still have their existing saved-configuration/cache behavior. It does
-not make a blank card appear as an addressable phone. Use `inventory.get` to
-list every attached module, including blank cards.
+lookup still have their existing saved-configuration/cache behavior. A blank-card row
+never supplies a usable phone target. `inventory.get` remains the dedicated
+module endpoint; `phones.list.items[].target.slot` now also covers blank modules.
