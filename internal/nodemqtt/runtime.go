@@ -837,7 +837,7 @@ func actionTimeout(action string) time.Duration {
 	case "tunnel.ensure", "tunnel.reconnect":
 		return 6 * time.Minute
 	// Card work queues behind a running group's AKA and profile switches.
-	case "esim.profile.delete", "esim.profile.enable", "slot.refresh", "esim.profiles.list", "tunnel.stop":
+	case "esim.profile.delete", "esim.profile.enable", "slot.refresh", "esim.profiles.list", "tunnel.stop", "phones.list":
 		return 3 * time.Minute
 	// A bulk sweep reads stored inventory, not cards, but still walks every
 	// configured device.

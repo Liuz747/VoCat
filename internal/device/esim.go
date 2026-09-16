@@ -791,6 +791,15 @@ func validProfileICCID(iccid string) bool {
 
 // ESIMListProfiles reads the eUICC profile list via ES10c GetProfilesInfo.
 func (manager *Manager) ESIMListProfiles(ctx context.Context, id string) (EsimInfo, error) {
+	return manager.listESIMProfiles(ctx, id, false)
+}
+
+// ESIMListProfilesFresh never substitutes the UI recovery cache for a card read.
+func (manager *Manager) ESIMListProfilesFresh(ctx context.Context, id string) (EsimInfo, error) {
+	return manager.listESIMProfiles(ctx, id, true)
+}
+
+func (manager *Manager) listESIMProfiles(ctx context.Context, id string, fresh bool) (EsimInfo, error) {
 	ctx, cancel := boundESIMContext(ctx)
 	defer cancel()
 	if err := manager.lockESIMContext(ctx, id); err != nil {
@@ -798,7 +807,7 @@ func (manager *Manager) ESIMListProfiles(ctx context.Context, id string) (EsimIn
 	}
 	defer manager.unlockESIM(id)
 	if manager.esimRecoveryActive(id) {
-		if cached, ok := manager.cachedESIMInfo(id); ok {
+		if cached, ok := manager.cachedESIMInfo(id); ok && !fresh {
 			return cached, nil
 		}
 		return EsimInfo{}, errESIMRecovering
@@ -816,7 +825,17 @@ func (manager *Manager) ESIMListProfiles(ctx context.Context, id string) (EsimIn
 			lastErr = err
 			continue
 		}
-		info := EsimInfo{AID: aid, Profiles: parseProfilesInfo(payload)}
+		var profiles []EsimProfile
+		if fresh {
+			var parseErr error
+			profiles, parseErr = parseProfilesInfoFresh(payload)
+			if parseErr != nil {
+				return EsimInfo{}, parseErr
+			}
+		} else {
+			profiles = parseProfilesInfo(payload)
+		}
+		info := EsimInfo{AID: aid, Profiles: profiles}
 		manager.cacheESIMInfo(id, info)
 		return info, nil
 	}

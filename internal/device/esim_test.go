@@ -466,3 +466,17 @@ func TestMarkCachedProfileEnabled(t *testing.T) {
 		t.Fatalf("target profile state = %#v", info.Profiles[1])
 	}
 }
+
+func TestESIMListProfilesFreshRejectsRecoveryCache(t *testing.T) {
+	manager := &Manager{esimRecoveries: map[string]chan struct{}{"dev": make(chan struct{})}, esimCache: map[string]EsimInfo{"dev": {Profiles: []EsimProfile{{ICCID: "stale"}}}}}
+	reader, ok := any(manager).(interface {
+		ESIMListProfilesFresh(context.Context, string) (EsimInfo, error)
+	})
+	if !ok {
+		t.Fatal("fresh profile reader is unavailable")
+	}
+	info, err := reader.ESIMListProfilesFresh(context.Background(), "dev")
+	if err == nil || len(info.Profiles) != 0 {
+		t.Fatalf("stale recovery cache returned as hardware: %+v %v", info, err)
+	}
+}

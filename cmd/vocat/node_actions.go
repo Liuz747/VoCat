@@ -270,10 +270,10 @@ func (service *nodeActionService) listPhones(ctx context.Context, command nodemq
 		return nil, reject("CURSOR_EXPIRED", cursorErr.Error())
 	}
 	if params.Cursor == "" {
-		var err error
-		collection, err = service.currentPhones(ctx)
-		if err != nil {
-			return nil, actionFailure(err, "POOL_OFFLINE")
+		var failure *nodemqtt.ActionError
+		collection, failure = service.collectLivePhones(ctx)
+		if failure != nil {
+			return nil, failure
 		}
 	}
 	end := offset + params.PageSize
@@ -289,6 +289,9 @@ func (service *nodeActionService) listPhones(ctx context.Context, command nodemq
 			token = strings.SplitN(params.Cursor, ".", 2)[0]
 		}
 		service.cacheMu.Lock()
+		if service.snapshots == nil {
+			service.snapshots = make(map[string]phoneSnapshot)
+		}
 		service.snapshots[token] = phoneSnapshot{collection: collection, expiresAt: time.Now().Add(5 * time.Minute), pageSize: params.PageSize}
 		service.cacheMu.Unlock()
 		next = token + "." + strconv.Itoa(end)
