@@ -1,6 +1,5 @@
 [Unit]
 Description=SIMHub / VoCat VoWiFi SMS gateway (persistent unit, replaces transient vocat-trial)
-Documentation=file:///home/liuz747/Jobs/Esim/wiki/20-VoCat-运维手册.md
 After=network-online.target
 Wants=network-online.target
 # Never give up restarting: a crash loop is still better than nobody owning the modems.
@@ -11,17 +10,19 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=/opt/vocat
-# /opt/vocat/bin/ip is a static iproute2 5.15; Ubuntu 18.04's 4.15 lacks `ip -j` (wiki/20 §2.2).
+# Older hosts may provide a compatible iproute2 in /opt/vocat/bin.
 Environment=PATH=/opt/vocat/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=VOCAT_ADDR=0.0.0.0:7575
 Environment=VOCAT_DATABASE_PATH=/opt/vocat/data/vocat.db
+EnvironmentFile=-/etc/vocat/vocat.env
+UMask=0077
 ExecStart=/opt/vocat/bin/vocat serve
 Restart=always
 RestartSec=5s
-# Shutdown does a full IMS de-REGISTER for every line; give it time (wiki/20 §5.1 rule 2).
+# Shutdown does a full IMS de-REGISTER for every line; give it time.
 TimeoutStopSec=120s
 KillMode=mixed
-# Same limit the transient unit carried since 2026-09-09 (wiki/20 §5.1 rule 4).
+# Allow concurrent multi-profile tunnels and modem descriptors.
 LimitNOFILE=65536
 
 [Install]

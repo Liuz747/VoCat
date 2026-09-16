@@ -19,6 +19,8 @@ vc.jar
 .env
 .env.*
 !.env.example
+*.node-mqtt.key
+/data/
 
 # ---- Frontend build products ----
 web/dist/

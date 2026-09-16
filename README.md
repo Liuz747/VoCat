@@ -28,6 +28,12 @@ Vocat is an open-source web control panel and engineering toolkit for Quectel EC
 
 The backend is written in Go, the interface is built with React and TypeScript, and the production frontend is embedded into the Go binary. A single executable contains the web application and uses SQLite for persistent state.
 
+This fork also includes EC20 multi-profile tunnels and a native MQTT 5 node interface.
+See [the release baseline and deployment guide](docs/operations/release-baseline.md)
+for the included changes, reproducible build steps, isolated test deployments, and
+known verification limits. Host addresses, credentials, and live deployment state
+belong in the operator's private inventory, not this repository.
+
 <p align="center">
   <img src="img\image.png">
   <img src="img\image-1.png">
@@ -315,6 +321,10 @@ go run ./cmd/vocat
 Run all tests:
 
 ```bash
+# The Go embed directive requires web/dist, including on a fresh checkout.
+npm --prefix web ci
+npm --prefix web run build
+npm --prefix web test
 go test ./...
 ```
 

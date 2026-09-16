@@ -7,7 +7,7 @@ import (
 )
 
 func TestDecodeCommandStrictAndBeijingTime(t *testing.T) {
-	payload := []byte(`{"id":"cmd-1","action":"sms.send","time":"2026-09-13 08:00:00","expires_at":"2026-09-13 08:02:00","target":{"device":"pool","slot":"6","phone":"+18603161135","binding_version":1},"params":{"to":"10086","text":"hello"}}`)
+	payload := []byte(`{"id":"cmd-1","action":"sms.send","time":"2026-09-13 08:00:00","expires_at":"2026-09-13 08:02:00","target":{"device":"pool","slot":"6","phone":"+12025550123","binding_version":1},"params":{"to":"10086","text":"hello"}}`)
 	command, err := DecodeCommand(payload)
 	if err != nil {
 		t.Fatal(err)
@@ -25,7 +25,7 @@ func TestDecodeCommandStrictAndBeijingTime(t *testing.T) {
 }
 
 func TestValidateTarget(t *testing.T) {
-	phone := "+18603161135"
+	phone := "+12025550123"
 	target := &Target{Device: "pool", Slot: "6", Phone: &phone, BindingVersion: 1}
 	if err := ValidateTarget(target, true); err != nil {
 		t.Fatal(err)

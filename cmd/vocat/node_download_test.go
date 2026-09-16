@@ -14,7 +14,7 @@ import (
 	"vocat/internal/vowifi/multisim"
 )
 
-const testDownloadICCID = "8901240527191882177"
+const testDownloadICCID = "8900000000000000002"
 
 type nodeDownloadController struct {
 	nodeESIMController
