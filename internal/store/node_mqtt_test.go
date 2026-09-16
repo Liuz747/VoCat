@@ -3,9 +3,103 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestNodeMQTTAcknowledgedTaskCanReplayUntilDedupeExpires(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	payload := json.RawMessage(`{"id":"retained-task","seq":1,"state":"succeeded","result":null,"error":null}`)
+	_, _, err = db.RecordTerminalNodeMQTTTask(ctx, NodeMQTTTask{ID: "retained-task", Node: "test-node", Action: "node.describe", RequestHash: "hash", RequestJSON: json.RawMessage(`{}`)}, "succeeded", json.RawMessage(`null`), payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = db.AckNodeMQTTOutbox(ctx, "test-node", "task", "retained-task", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.CleanupNodeMQTT(ctx, "test-node", time.Now().Add(8*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.RequeueLatestNodeMQTTTask(ctx, "retained-task"); err != nil {
+		t.Fatal(err)
+	}
+	items, err := db.PendingNodeMQTTOutbox(ctx, "test-node", time.Now().Add(time.Second), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || string(items[0].Payload) != string(payload) {
+		t.Fatalf("duplicate task lost its exact reply after ACK cleanup: %+v", items)
+	}
+	if err = db.AckNodeMQTTOutbox(ctx, "test-node", "task", "retained-task", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.CleanupNodeMQTT(ctx, "test-node", time.Now().Add(31*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.NodeMQTTTask(ctx, "retained-task"); err != ErrNotFound {
+		t.Fatalf("expired dedupe task retained: %v", err)
+	}
+	var count int
+	if err = db.db.QueryRow(`SELECT COUNT(*) FROM node_mqtt_outbox WHERE business_id='retained-task'`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("expired reply count=%d err=%v", count, err)
+	}
+}
+
+func TestNodeMQTTUnackedSurvivesRestartCleanupAndWrongAck(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "node.db")
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := json.RawMessage(`{"id":"durable-event","event":"node.hello","data":{}}`)
+	if err = db.EnqueueNodeMQTTEvent(ctx, "test-node", "durable-event", payload); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.MarkNodeMQTTOutboxAttempt(ctx, "event", "durable-event", 0, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	for _, ack := range []struct {
+		node, kind, id string
+		seq            int
+	}{{"other-node", "event", "durable-event", 0}, {"test-node", "task", "durable-event", 0}, {"test-node", "event", "durable-event", 1}, {"test-node", "event", "unknown", 0}} {
+		if err = db.AckNodeMQTTOutbox(ctx, ack.node, ack.kind, ack.id, ack.seq); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = db.CleanupNodeMQTT(ctx, "test-node", time.Now().Add(365*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.WakeNodeMQTTOutbox(ctx, "test-node"); err != nil {
+		t.Fatal(err)
+	}
+	items, err := db.PendingNodeMQTTOutbox(ctx, "test-node", time.Now().Add(time.Second), 100)
+	if err != nil || len(items) != 1 || string(items[0].Payload) != string(payload) || items[0].Attempts != 1 {
+		t.Fatalf("unacked record not preserved: %+v err=%v", items, err)
+	}
+	for range 2 {
+		if err = db.AckNodeMQTTOutbox(ctx, "test-node", "event", "durable-event", 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if count, err := db.CountPendingNodeMQTTOutbox(ctx, "test-node"); err != nil || count != 0 {
+		t.Fatalf("exact repeated ACK did not clear pending: %d %v", count, err)
+	}
+}
 
 func TestNodeMQTTTaskAndOutboxAreDurableAndExact(t *testing.T) {
 	ctx := context.Background()

@@ -34,6 +34,9 @@ for the included changes, reproducible build steps, isolated test deployments, a
 known verification limits. Host addresses, credentials, and live deployment state
 belong in the operator's private inventory, not this repository.
 
+For durable task/event delivery, see [business ACK integration and the reference
+receiver](docs/operations/mqtt-business-ack.md).
+
 <p align="center">
   <img src="img\image.png">
   <img src="img\image-1.png">

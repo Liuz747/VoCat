@@ -278,12 +278,19 @@ func (s *Store) CleanupNodeMQTT(ctx context.Context, node string, now time.Time)
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM node_mqtt_outbox WHERE node=? AND acked_at>0 AND acked_at<?`, node, now.Add(-7*24*time.Hour).Unix()); err != nil {
-		return err
-	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM node_mqtt_tasks
 		WHERE node=? AND state IN ('succeeded','rejected','failed','expired') AND finished_at>0 AND finished_at<?
 		AND NOT EXISTS (SELECT 1 FROM node_mqtt_outbox o WHERE o.kind='task' AND o.business_id=node_mqtt_tasks.id AND o.acked_at=0)`, node, now.Add(-30*24*time.Hour).Unix()); err != nil {
+		return err
+	}
+	// A duplicate command replays its latest outbox payload. Keep that exact
+	// reply for as long as the dedupe record exists (including uncertain tasks),
+	// even after the usual seven-day retention for acknowledged messages.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM node_mqtt_outbox
+		WHERE node=? AND acked_at>0 AND acked_at<?
+		AND NOT EXISTS (SELECT 1 FROM node_mqtt_tasks t
+			WHERE node_mqtt_outbox.kind='task' AND t.node=node_mqtt_outbox.node
+			AND t.id=node_mqtt_outbox.business_id AND t.latest_seq=node_mqtt_outbox.seq)`, node, now.Add(-7*24*time.Hour).Unix()); err != nil {
 		return err
 	}
 	return tx.Commit()
