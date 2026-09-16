@@ -27,23 +27,24 @@ import (
 )
 
 type nodeActionService struct {
-	database   *store.Store
-	devices    *device.Manager
-	esim       nodeESIMController
-	readCard   func(context.Context, string, func(context.Context, string) error) error
-	vowifi     *vowifiruntime.Manager
-	multisim   *multisim.Manager
-	cards      *multiSIMIntegration
-	mapper     integration.ATMapper
-	nodeMu     sync.RWMutex
-	node       string
-	maxPayload int
-	revisions  sync.Map
-	cacheMu    sync.Mutex
-	phoneCache phoneCollection
-	snapshots  map[string]phoneSnapshot
-	phoneGroup singleflight.Group
-	locks      sync.Map
+	database           *store.Store
+	devices            *device.Manager
+	esim               nodeESIMController
+	readCard           func(context.Context, string, func(context.Context, string) error) error
+	vowifi             *vowifiruntime.Manager
+	multisim           *multisim.Manager
+	cards              *multiSIMIntegration
+	mapper             integration.ATMapper
+	nodeMu             sync.RWMutex
+	node               string
+	maxPayload         int
+	revisions          sync.Map
+	cacheMu            sync.Mutex
+	phoneCache         phoneCollection
+	snapshots          map[string]phoneSnapshot
+	inventorySnapshots map[string]nodeInventorySnapshot
+	phoneGroup         singleflight.Group
+	locks              sync.Map
 }
 
 type nodeResourceLock struct{ token chan struct{} }
@@ -701,57 +702,6 @@ func (service *nodeActionService) slotRecord(ctx context.Context, config store.D
 	}
 	record["tunnels"] = tunnels
 	return record
-}
-
-func (service *nodeActionService) getInventory(ctx context.Context, command nodemqtt.Command) (any, *nodemqtt.ActionError) {
-	if command.Target != nil {
-		return nil, reject("INVALID_ARGUMENT", "inventory.get 不允许 target")
-	}
-	var params struct {
-		PageSize int    `json:"page_size"`
-		Cursor   string `json:"cursor"`
-	}
-	if err := decodeNodeParams(command.Params, &params); err != nil {
-		return nil, reject("INVALID_ARGUMENT", err.Error())
-	}
-	if params.PageSize == 0 {
-		params.PageSize = 50
-	}
-	if params.PageSize < 1 || params.PageSize > 100 {
-		return nil, reject("INVALID_ARGUMENT", "page_size 必须在 1 到 100 之间")
-	}
-	offset := 0
-	if cursor := strings.TrimSpace(params.Cursor); cursor != "" {
-		value, err := strconv.Atoi(cursor)
-		if err != nil || value < 0 {
-			return nil, reject("INVALID_ARGUMENT", "cursor 无效")
-		}
-		offset = value
-	}
-	configs, err := service.database.ListDevices(ctx)
-	if err != nil {
-		return nil, failed("INTERNAL_ERROR", "读取设备列表失败")
-	}
-	if offset > len(configs) {
-		offset = len(configs)
-	}
-	end := offset + params.PageSize
-	if end > len(configs) {
-		end = len(configs)
-	}
-	items := make([]any, 0, end-offset)
-	for _, config := range configs[offset:end] {
-		items = append(items, service.slotRecord(ctx, config, false))
-	}
-	var cursor *string
-	if end < len(configs) {
-		value := strconv.Itoa(end)
-		cursor = &value
-	}
-	return map[string]any{
-		"source": "registry", "generated_at": nodemqtt.FormatTime(time.Now().UTC()),
-		"items": items, "cursor": cursor, "complete": cursor == nil,
-	}, nil
 }
 
 func (service *nodeActionService) refreshSlot(ctx context.Context, command nodemqtt.Command) (any, *nodemqtt.ActionError) {
