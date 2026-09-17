@@ -1498,6 +1498,16 @@ func pollDeviceSnapshots(
 				continue
 			}
 			if multiSIMOwnsPhysical(ctx, database, manager, entry.ID, owners...) {
+				// Ownership suppresses SIM/radio polling, not hardware identity.
+				// A group may start before the first full snapshot is collected.
+				if entry.Snapshot == nil || strings.TrimSpace(entry.Snapshot.IMEI) == "" {
+					identityContext, cancelIdentity := context.WithTimeout(ctx, 5*time.Second)
+					_, identityErr := manager.RefreshIMEI(identityContext, entry.ID)
+					cancelIdentity()
+					if identityErr != nil {
+						logger.Warn("multi-tunnel modem identity refresh failed", "device_id", entry.ID, "error", identityErr)
+					}
+				}
 				continue
 			}
 			entry := entry

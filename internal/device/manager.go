@@ -596,6 +596,46 @@ func (manager *Manager) validateActive(
 	return nil
 }
 
+// RefreshIMEI reads only the modem identity. Multi-tunnel readers cannot run
+// the ordinary snapshot refresh because it touches SIM and radio state.
+func (manager *Manager) RefreshIMEI(ctx context.Context, id string) (string, error) {
+	state, err := manager.lookup(id)
+	if err != nil {
+		return "", err
+	}
+	if err := lockMutexContext(ctx, &state.opMu); err != nil {
+		return "", err
+	}
+	defer state.opMu.Unlock()
+	if err := manager.validateActive(id, state); err != nil {
+		return "", err
+	}
+	client, err := manager.clientLocked(ctx, state, manager.candidateFor(state))
+	if err != nil {
+		return "", err
+	}
+	response, err := manager.command(ctx, client, "AT+CGSN")
+	if err != nil {
+		return "", err
+	}
+	imei := parseIdentifier(response, []string{"+CGSN:", "+GSN:"}, 15, 15)
+	if imei == "" {
+		return "", errors.New("modem returned no valid IMEI")
+	}
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if manager.devices[id] != state || !state.discovered {
+		return "", ErrNotFound
+	}
+	snapshot := Snapshot{DeviceID: id, OperatingMode: -1}
+	if state.snapshot != nil {
+		snapshot = *state.snapshot
+	}
+	snapshot.IMEI = imei
+	state.snapshot = &snapshot
+	return imei, nil
+}
+
 func (manager *Manager) Refresh(ctx context.Context, id string) (Snapshot, error) {
 	state, err := manager.lookup(id)
 	if err != nil {

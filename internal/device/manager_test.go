@@ -3,6 +3,7 @@ package device
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -371,4 +372,30 @@ func TestExecuteSensitiveATDoesNotPersistCommandOrModemError(t *testing.T) {
 		t.Fatalf("LastError = %q", entry.LastError)
 	}
 	client.assertDone(t)
+}
+
+func TestRefreshIMEIOnlyReadsIdentityAndPreservesCardState(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		t.Run(fmt.Sprint(existing), func(t *testing.T) {
+			client := &transcriptClient{steps: []clientStep{{command: "AT+CGSN", response: okResponse("868704041203330")}}}
+			manager, id := newStartedTestManager(t, client)
+			original := Snapshot{DeviceID: id, ICCID: "8901240527194105436", SIMReady: true, FlightMode: true, OperatingMode: 4, UpdatedAt: time.Unix(10, 0)}
+			if existing {
+				manager.mu.Lock()
+				manager.devices[id].snapshot = &original
+				manager.mu.Unlock()
+			}
+			imei, err := manager.RefreshIMEI(context.Background(), id)
+			if err != nil || imei != "868704041203330" {
+				t.Fatalf("identity=%q err=%v", imei, err)
+			}
+			d, err := manager.Get(id)
+			if err != nil || d.Snapshot == nil || d.Snapshot.IMEI != imei {
+				t.Fatalf("snapshot=%+v err=%v", d, err)
+			}
+			if existing && (d.Snapshot.ICCID != original.ICCID || !d.Snapshot.SIMReady || !d.Snapshot.FlightMode || d.Snapshot.UpdatedAt != original.UpdatedAt) {
+				t.Fatalf("card state changed: %+v", d.Snapshot)
+			}
+		})
+	}
 }
