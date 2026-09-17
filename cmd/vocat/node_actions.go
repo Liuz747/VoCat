@@ -495,6 +495,8 @@ func (service *nodeActionService) downloadProfile(ctx context.Context, command n
 		for _, candidate := range info.Profiles {
 			if normalizeICCID(candidate.ICCID) == normalizeICCID(result.ICCID) {
 				candidate.ICCID = normalizeICCID(candidate.ICCID)
+				// Group authentication addresses ISD-R, never the profile ISD-P.
+				candidate.AID = info.AID
 				profile = &candidate
 				break
 			}
@@ -508,10 +510,35 @@ func (service *nodeActionService) downloadProfile(ctx context.Context, command n
 	if confirmationErr != nil || profile == nil {
 		return nil, uncertain("DOWNLOAD_FAILED", "下载命令已完成，但无法核实新增 Profile；请读取卡片确认，不要重新下载")
 	}
-	state := nodeProfileState(*profile)
-	// Download only installs the profile. A separate tunnel.ensure opts it
-	// into the running group without restarting existing lines.
-	return map[string]any{"binding_version": 1, "iccid": profile.ICCID, "written": true, "profile_state": state}, nil
+	result := map[string]any{
+		"binding_version": 1, "iccid": profile.ICCID, "written": true,
+		"profile_state": nodeProfileState(*profile), "sms_ready": false,
+		"tunnel_state": "starting",
+	}
+	progress("starting_tunnel", nil)
+	if err := service.ensureProfileConfigured(ctx, config.ID, *profile); err != nil {
+		failure := uncertain("AUTO_TUNNEL_START_FAILED", "卡已写入，但自动开线配置未完成；请查询状态，不要重新下载")
+		result["tunnel_state"] = "not_started"
+		result["tunnel_error"] = err.Error()
+		failure.Result = result
+		return nil, failure
+	}
+	service.clearPhoneCache()
+	if !service.awaitTunnel(ctx, config.ID, profile.ICCID, true) {
+		state, _, reason, _ := service.tunnelStatus(config.ID, profile.ICCID)
+		result["tunnel_state"] = state
+		if reason != nil {
+			result["tunnel_error"] = *reason
+		}
+		failure := uncertain("TUNNEL_NOT_READY", "卡已写入并保存自动开线配置，但尚未确认短信就绪；请查询状态，不要重新下载")
+		failure.Result = result
+		return nil, failure
+	}
+	result["tunnel_state"] = "registered"
+	result["sms_ready"] = true
+	// This is the readback state at download time. A multi-profile reader
+	// switches profiles for authentication, so readiness is separate.
+	return result, nil
 }
 
 func nodeProfileState(profile device.EsimProfile) string {
@@ -1270,16 +1297,23 @@ func (service *nodeActionService) profileRuntimeActive(deviceID, iccid string) b
 	return false
 }
 
+// ensureProfileConfigured persists automatic startup before applying it. A first
+// download creates a group; downloads into a running group add only their line.
 func (service *nodeActionService) ensureProfileConfigured(ctx context.Context, deviceID string, profile device.EsimProfile) error {
-	cfg, err := service.database.MultiSIMConfig(ctx, deviceID)
-	if errors.Is(err, store.ErrNotFound) {
-		return nil
+	if service.multisim == nil {
+		return errors.New("multi-SIM runtime is unavailable")
 	}
-	if err != nil || !cfg.Enabled {
+	cfg, err := service.database.MultiSIMConfig(ctx, deviceID)
+	missing := errors.Is(err, store.ErrNotFound)
+	if err != nil && !missing {
 		return err
 	}
 	previous := cfg
 	previous.Profiles = append([]store.MultiSIMProfile(nil), cfg.Profiles...)
+	if missing || !cfg.Enabled {
+		// Writing a new profile does not re-enable previously stopped lines.
+		cfg = store.MultiSIMConfig{DeviceID: deviceID, Enabled: true}
+	}
 	found := false
 	for _, existing := range cfg.Profiles {
 		if normalizeICCID(existing.ICCID) == profile.ICCID {
@@ -1289,21 +1323,24 @@ func (service *nodeActionService) ensureProfileConfigured(ctx context.Context, d
 	}
 	if !found {
 		if strings.TrimSpace(profile.AID) == "" {
-			return errors.New("downloaded profile AID is unavailable")
+			return errors.New("downloaded profile ISD-R AID is unavailable")
 		}
 		cfg.Profiles = append(cfg.Profiles, store.MultiSIMProfile{ICCID: profile.ICCID, AID: profile.AID, Name: firstNonEmpty(profile.Name, profile.ServiceProvider)})
 		if _, err := service.database.SaveMultiSIMConfig(ctx, cfg); err != nil {
 			return err
 		}
 	}
-	// Our multisim manager has no AddProfile/RemoveProfile; it reconciles a
-	// running group against a whole desired profile list, so re-Apply the saved
-	// config and let profileDiff() add just the new line.
 	if err := service.multisim.Apply(ctx, runtimeMultiSIMConfigForNode(cfg)); err != nil {
 		if !found {
 			rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancel()
-			if _, rollbackErr := service.database.SaveMultiSIMConfig(rollbackCtx, previous); rollbackErr != nil {
+			var rollbackErr error
+			if missing {
+				rollbackErr = service.database.DeleteMultiSIMConfig(rollbackCtx, deviceID)
+			} else {
+				_, rollbackErr = service.database.SaveMultiSIMConfig(rollbackCtx, previous)
+			}
+			if rollbackErr != nil {
 				return fmt.Errorf("group apply failed: %v; saved config rollback failed: %w", err, rollbackErr)
 			}
 		}

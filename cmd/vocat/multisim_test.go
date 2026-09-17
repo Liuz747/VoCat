@@ -309,3 +309,21 @@ func TestMultiSIMAPNUsesOnlySelectedProfileOrIMSDefault(t *testing.T) {
 		t.Fatalf("selected profile APN lost: %q", line.APN)
 	}
 }
+
+func TestMultiSIMRestoreTargetNeverUsesBlankCardPlaceholder(t *testing.T) {
+	inventory := device.EsimInfo{AID: "A000", Profiles: []device.EsimProfile{{ICCID: "8900000000000000001"}, {ICCID: "8900000000000000002"}}}
+	selected := []multisim.Profile{{ICCID: "8900000000000000002", AID: "A000"}}
+	for _, tc := range []struct{ active, want string }{
+		{"8900000000000000001", "8900000000000000001"},
+		{"89111111111111111111", "8900000000000000002"},
+		{"", "8900000000000000002"},
+	} {
+		got := multiSIMRestoreTarget(tc.active, inventory, selected)
+		if got.ICCID != tc.want || got.AID != "A000" {
+			t.Fatalf("active=%s restore=%+v", tc.active, got)
+		}
+	}
+	if got := multiSIMRestoreTarget("89111111111111111111", device.EsimInfo{}, selected); got.ICCID != "" {
+		t.Fatalf("missing profile became restore target: %+v", got)
+	}
+}

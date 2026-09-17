@@ -361,6 +361,24 @@ func (bridge *multiSIMIntegration) verify(ctx context.Context, config multisim.C
 	return nil
 }
 
+// A blank eUICC can report an ICCID for its placeholder, which is not an
+// installed profile. Restore must select a real profile after the first write.
+func multiSIMRestoreTarget(active string, inventory device.EsimInfo, selected []multisim.Profile) multisim.Profile {
+	available := make(map[string]bool, len(inventory.Profiles))
+	for _, profile := range inventory.Profiles {
+		available[profile.ICCID] = true
+	}
+	if active != "" && available[active] {
+		return multisim.Profile{ICCID: active, AID: inventory.AID}
+	}
+	for _, profile := range selected {
+		if available[profile.ICCID] {
+			return multisim.Profile{ICCID: profile.ICCID, AID: inventory.AID}
+		}
+	}
+	return multisim.Profile{}
+}
+
 func (bridge *multiSIMIntegration) prepare(ctx context.Context, config multisim.Config) error {
 	stored, err := bridge.database.Device(ctx, config.DeviceID)
 	if err != nil {
@@ -459,7 +477,7 @@ func (bridge *multiSIMIntegration) prepare(ctx context.Context, config multisim.
 	if err != nil {
 		return err
 	}
-	reader.original = multisim.Profile{ICCID: identity.ICCID, AID: inventory.AID}
+	reader.original = multiSIMRestoreTarget(identity.ICCID, inventory, config.Profiles)
 	available := make(map[string]bool)
 	for _, profile := range inventory.Profiles {
 		available[profile.ICCID] = true
