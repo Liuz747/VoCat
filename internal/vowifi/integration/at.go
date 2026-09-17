@@ -209,6 +209,11 @@ func physicalMatchScore(configuredID string, config store.Device, entry device.D
 	// Linux node names or a USB topology saved before devices were rearranged.
 	imeiMatches := config.ModemIMEI != "" && entry.Snapshot != nil &&
 		strings.EqualFold(strings.TrimSpace(config.ModemIMEI), strings.TrimSpace(entry.Snapshot.IMEI))
+	// A known different IMEI disproves the binding, even if the old USB path,
+	// tty node, and discovery ID have all been reused by the replacement.
+	if strings.TrimSpace(config.ModemIMEI) != "" && entry.Snapshot != nil && strings.TrimSpace(entry.Snapshot.IMEI) != "" && !imeiMatches {
+		return 0
+	}
 	if imeiMatches {
 		score += 10000
 	} else if device.USBTopologyPath(config.USBPath) && device.USBTopologyPath(candidate.USBPath) &&

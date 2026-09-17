@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"vocat/internal/device"
@@ -260,5 +261,21 @@ func TestATMapperPinsPhysicalReaderForWholeTransaction(t *testing.T) {
 	}
 	if devices.lockedID != "reader-a" || devices.executedID != devices.lockedID || devices.sensitiveID != devices.lockedID {
 		t.Fatalf("transaction changed readers: lock=%s AT=%s sensitive=%s", devices.lockedID, devices.executedID, devices.sensitiveID)
+	}
+}
+
+func TestATMapperRejectsKnownDifferentIMEIAtReusedUSBPath(t *testing.T) {
+	database := testStore(t)
+	cfg := store.Device{ID: "old-device", Name: "old", ATPort: "/dev/ttyUSB2", ControlDevice: "/dev/cdc-wdm0", USBPath: "/sys/bus/usb/devices/1-5", ModemIMEI: "867732033528936"}
+	if err := database.UpsertDevice(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	devices := &fakeATDevices{entries: []device.Device{{ID: cfg.ID, Discovered: true, Candidate: modem.Candidate{USBPath: cfg.USBPath, QMIControl: cfg.ControlDevice, ATPort: modem.Port{Path: cfg.ATPort}}, Snapshot: &device.Snapshot{IMEI: "860588049763140"}}}}
+	mapper := ATMapper{Store: database, Devices: devices}
+	if _, err := mapper.ExecuteAT(context.Background(), cfg.ID, "AT+CIMI"); !errors.Is(err, device.ErrNotFound) {
+		t.Fatalf("expected absent original modem, got %v", err)
+	}
+	if devices.executedID != "" {
+		t.Fatalf("command sent to replacement modem %q", devices.executedID)
 	}
 }
