@@ -138,4 +138,5 @@ type Status struct {
 	Subscribed    bool   `json:"subscribed"`
 	LastError     string `json:"last_error,omitempty"`
 	OutboxPending int    `json:"outbox_pending"`
+	OutboxPaused  int    `json:"outbox_paused"`
 }

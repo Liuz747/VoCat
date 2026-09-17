@@ -55,9 +55,10 @@ type phoneCollection struct {
 }
 
 type phoneSnapshot struct {
-	collection phoneCollection
-	expiresAt  time.Time
-	pageSize   int
+	collection        phoneCollection
+	expiresAt         time.Time
+	pageSize          int
+	includeEmptySlots bool
 }
 
 type nodeActionTarget struct {
@@ -252,8 +253,9 @@ func (service *nodeActionService) listPhones(ctx context.Context, command nodemq
 		return nil, reject("INVALID_ARGUMENT", "phones.list 不允许 target")
 	}
 	var params struct {
-		PageSize int    `json:"page_size"`
-		Cursor   string `json:"cursor"`
+		PageSize          int    `json:"page_size"`
+		Cursor            string `json:"cursor"`
+		IncludeEmptySlots bool   `json:"include_empty_slots"`
 	}
 	if err := decodeNodeParams(command.Params, &params); err != nil {
 		return nil, reject("INVALID_ARGUMENT", err.Error())
@@ -265,7 +267,7 @@ func (service *nodeActionService) listPhones(ctx context.Context, command nodemq
 		return nil, reject("INVALID_ARGUMENT", "page_size 必须在 1 到 100 之间")
 	}
 
-	collection, offset, cursorErr := service.phonePage(ctx, params.Cursor, params.PageSize)
+	collection, offset, cursorErr := service.phonePage(ctx, params.Cursor, params.PageSize, params.IncludeEmptySlots)
 	if cursorErr != nil {
 		return nil, reject("CURSOR_EXPIRED", cursorErr.Error())
 	}
@@ -274,6 +276,17 @@ func (service *nodeActionService) listPhones(ctx context.Context, command nodemq
 		collection, failure = service.collectLivePhones(ctx)
 		if failure != nil {
 			return nil, failure
+		}
+		// PhoneRecord consumers require a real ICCID. Blank modules belong to
+		// inventory.get; preserve the operator's diagnostic view as an opt-in.
+		if !params.IncludeEmptySlots {
+			profiles := make([]nodePhoneRecord, 0, len(collection.items))
+			for _, item := range collection.items {
+				if item.Target.ICCID != "" {
+					profiles = append(profiles, item)
+				}
+			}
+			collection.items = profiles
 		}
 	}
 	end := offset + params.PageSize
@@ -292,14 +305,14 @@ func (service *nodeActionService) listPhones(ctx context.Context, command nodemq
 		if service.snapshots == nil {
 			service.snapshots = make(map[string]phoneSnapshot)
 		}
-		service.snapshots[token] = phoneSnapshot{collection: collection, expiresAt: time.Now().Add(5 * time.Minute), pageSize: params.PageSize}
+		service.snapshots[token] = phoneSnapshot{collection: collection, expiresAt: time.Now().Add(5 * time.Minute), pageSize: params.PageSize, includeEmptySlots: params.IncludeEmptySlots}
 		service.cacheMu.Unlock()
 		next = token + "." + strconv.Itoa(end)
 	}
 	return map[string]any{"source": "hardware", "generated_at": nodemqtt.FormatTime(collection.generatedAt), "items": items, "cursor": next, "complete": complete}, nil
 }
 
-func (service *nodeActionService) phonePage(_ context.Context, cursor string, pageSize int) (phoneCollection, int, error) {
+func (service *nodeActionService) phonePage(_ context.Context, cursor string, pageSize int, includeEmptySlots bool) (phoneCollection, int, error) {
 	if cursor == "" {
 		return phoneCollection{}, 0, nil
 	}
@@ -324,6 +337,9 @@ func (service *nodeActionService) phonePage(_ context.Context, cursor string, pa
 	}
 	if snapshot.pageSize != pageSize {
 		return phoneCollection{}, 0, errors.New("后续分页的 page_size 必须与第一页一致")
+	}
+	if snapshot.includeEmptySlots != includeEmptySlots {
+		return phoneCollection{}, 0, errors.New("后续分页的 include_empty_slots 必须与第一页一致")
 	}
 	return snapshot.collection, offset, nil
 }

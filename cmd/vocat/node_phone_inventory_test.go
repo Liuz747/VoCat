@@ -59,8 +59,15 @@ func phoneHardwareFixture(t *testing.T, n int) (*nodeActionService, *inventoryDe
 	return s, devices, reader
 }
 func callPhones(t *testing.T, s *nodeActionService, size int, cursor string) map[string]any {
+	return callPhonesWithEmptySlots(t, s, size, cursor, false)
+}
+func callPhonesWithEmptySlots(t *testing.T, s *nodeActionService, size int, cursor string, includeEmpty bool) map[string]any {
 	t.Helper()
-	p, _ := json.Marshal(map[string]any{"page_size": size, "cursor": cursor})
+	params := map[string]any{"page_size": size, "cursor": cursor}
+	if includeEmpty {
+		params["include_empty_slots"] = true
+	}
+	p, _ := json.Marshal(params)
 	r, e := s.listPhones(context.Background(), nodemqtt.Command{Params: p})
 	if e != nil {
 		t.Fatalf("phones: %+v", e)
@@ -83,7 +90,7 @@ func TestPhonesListReadsProfilesWithoutSavedGroupAndKeepsWireShape(t *testing.T)
 	if err = s.database.UpsertDevice(context.Background(), store.Device{ID: "removed", Name: "removed", ModemIMEI: "869999999999999"}); err != nil {
 		t.Fatal(err)
 	}
-	result := callPhones(t, s, 50, "")
+	result := callPhonesWithEmptySlots(t, s, 50, "", true)
 	if len(result) != 5 {
 		t.Fatalf("changed result shape: %v", result)
 	}
@@ -174,7 +181,7 @@ func TestPhonesListAllNineteenSlotsIncludingEmptyCards(t *testing.T) {
 			f.cards[entry.ID] = device.EsimInfo{AID: "A0000005591010"}
 		}
 	}
-	r := callPhones(t, s, 50, "")
+	r := callPhonesWithEmptySlots(t, s, 50, "", true)
 	items := r["items"].([]any)
 	slots := map[string]bool{}
 	for _, raw := range items {
@@ -187,5 +194,46 @@ func TestPhonesListAllNineteenSlotsIncludingEmptyCards(t *testing.T) {
 	}
 	if len(slots) != 19 || len(items) != 19 {
 		t.Fatalf("got %d rows / %d slots", len(items), len(slots))
+	}
+}
+
+func TestPhonesListDefaultFitsPlatformAndDoesNotTurnProfilesIntoSlots(t *testing.T) {
+	s, d, f := phoneHardwareFixture(t, 2)
+	f.cards[d.entries[1].ID] = device.EsimInfo{AID: "A0000005591010"}
+	profiles := make([]device.EsimProfile, 21)
+	for i := range profiles {
+		profiles[i] = device.EsimProfile{ICCID: fmt.Sprintf("89012405271857%05d", i), StateText: "disabled"}
+	}
+	f.cards[d.entries[0].ID] = device.EsimInfo{AID: "A0000005591010", Profiles: profiles}
+	result := callPhones(t, s, 50, "")
+	items := result["items"].([]any)
+	if len(items) != 21 {
+		t.Fatalf("platform expects 21 real profiles, got %d records", len(items))
+	}
+	for _, raw := range items {
+		target := raw.(map[string]any)["target"].(map[string]any)
+		if target["iccid"] == "" || target["slot"] != d.entries[0].Snapshot.IMEI {
+			t.Fatalf("invalid profile or invented slot: %v", target)
+		}
+	}
+	inventory := inventoryCall(t, s, 50, "")
+	if len(inventory["items"].([]any)) != 2 {
+		t.Fatal("physical inventory lost blank module")
+	}
+}
+
+func TestPhonesListBlankOnlyAndCursorModeIsolation(t *testing.T) {
+	s, d, f := phoneHardwareFixture(t, 2)
+	for _, entry := range d.entries {
+		f.cards[entry.ID] = device.EsimInfo{AID: "A0000005591010"}
+	}
+	result := callPhones(t, s, 10, "")
+	if len(result["items"].([]any)) != 0 || result["complete"] != true || result["cursor"] != nil {
+		t.Fatalf("empty phone inventory is not a complete empty list: %v", result)
+	}
+	first := callPhonesWithEmptySlots(t, s, 1, "", true)
+	params, _ := json.Marshal(map[string]any{"page_size": 1, "cursor": first["cursor"]})
+	if _, err := s.listPhones(context.Background(), nodemqtt.Command{Params: params}); err == nil || err.Code != "CURSOR_EXPIRED" {
+		t.Fatalf("cursor crossed listing modes: %v", err)
 	}
 }

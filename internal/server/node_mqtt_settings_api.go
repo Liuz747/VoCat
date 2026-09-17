@@ -17,6 +17,16 @@ type NodeMQTTSettingsController interface {
 
 func (s *Server) routeNodeMQTTSettingsAPI(w http.ResponseWriter, r *http.Request, cleanPath string) bool {
 	segments := splitAPIPath(strings.Trim(cleanPath, "/"))
+	if len(segments) >= 3 && segments[0] == "settings" && segments[1] == "node-mqtt" && segments[2] == "outbox" {
+		if len(segments) == 3 {
+			s.handleNodeMQTTOutbox(w, r, "")
+			return true
+		}
+		if len(segments) == 4 && (segments[3] == "pause" || segments[3] == "resume") {
+			s.handleNodeMQTTOutbox(w, r, segments[3])
+			return true
+		}
+	}
 	if len(segments) == 2 && segments[0] == "settings" && segments[1] == "node-mqtt" {
 		s.handleNodeMQTTSettings(w, r)
 		return true

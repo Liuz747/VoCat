@@ -69,7 +69,8 @@ type Describer interface {
 func (descriptor Descriptor) Payload(maxPayloadBytes, outboxPending int) map[string]any {
 	return map[string]any{
 		"node_type":        descriptor.NodeType,
-		"software_version": buildinfo.Version,
+		"software_version": platformVersion(buildinfo.Version),
+		"software_build":   buildinfo.Version,
 		"protocol_version": ProtocolVersion,
 		"capabilities":     descriptor.Capabilities,
 		"limits": map[string]any{
@@ -80,6 +81,17 @@ func (descriptor Descriptor) Payload(maxPayloadBytes, outboxPending int) map[str
 		},
 		"outbox_pending": outboxPending,
 	}
+}
+
+// PingCode persists software_version in a 40-character field. Keep the full
+// build separately, and retain a digest so long versions do not alias.
+func platformVersion(version string) string {
+	characters := []rune(version)
+	if len(characters) <= 40 {
+		return version
+	}
+	digest := sha256.Sum256([]byte(version))
+	return string(characters[:31]) + "-" + hex.EncodeToString(digest[:4])
 }
 
 // descriptorFor asks the executor what it can do, so an Executor that predates
@@ -536,6 +548,14 @@ func (runtime *Runtime) outboxWorker() {
 			continue
 		}
 		for _, item := range items {
+			deliverable, err := runtime.store.NodeMQTTOutboxDeliverable(runtime.ctx, item.Node, item.Kind, item.BusinessID, item.Seq)
+			if err != nil {
+				runtime.setError(err)
+				break
+			}
+			if !deliverable {
+				continue
+			}
 			topic := runtime.topic(item.Kind)
 			ctx, cancel := context.WithTimeout(runtime.ctx, 10*time.Second)
 			_, publishErr := runtime.manager.Publish(ctx, &paho.Publish{Topic: topic, QoS: 1, Payload: item.Payload})
@@ -546,6 +566,9 @@ func (runtime *Runtime) outboxWorker() {
 				runtime.setError(publishErr)
 				runtime.logger.Warn("node MQTT TX failed", "topic", topic, "qos", 1, "retain", false, "kind", item.Kind, "id", item.BusinessID, "seq", item.Seq, "attempt", item.Attempts+1, "payload", logPayload(item.Payload), "error", publishErr)
 				break
+			}
+			if err := runtime.store.CompleteNodeMQTTReplay(runtime.ctx, item.Node, item.Kind, item.BusinessID, item.Seq, item.ReplayGeneration); err != nil {
+				runtime.setError(err)
 			}
 			if !runtime.settings.BusinessACKEnabled {
 				if ackErr := runtime.store.AckNodeMQTTOutbox(runtime.ctx, runtime.settings.Node, item.Kind, item.BusinessID, item.Seq); ackErr != nil {
@@ -602,7 +625,8 @@ func (runtime *Runtime) publishHeartbeat() {
 		snapshot.Health = "ok"
 	}
 	pending, _ := runtime.store.CountPendingNodeMQTTOutbox(runtime.ctx, runtime.settings.Node)
-	payload, _ := json.Marshal(map[string]any{"time": FormatTime(time.Now()), "uptime_seconds": int(time.Since(runtime.startedAt).Seconds()), "health": snapshot.Health, "devices_online": snapshot.DevicesOnline, "devices_offline": snapshot.DevicesOffline, "registered_tunnels": snapshot.RegisteredTunnels, "outbox_pending": pending})
+	paused, _ := runtime.store.CountPausedNodeMQTTOutbox(runtime.ctx, runtime.settings.Node)
+	payload, _ := json.Marshal(map[string]any{"time": FormatTime(time.Now()), "uptime_seconds": int(time.Since(runtime.startedAt).Seconds()), "health": snapshot.Health, "devices_online": snapshot.DevicesOnline, "devices_offline": snapshot.DevicesOffline, "registered_tunnels": snapshot.RegisteredTunnels, "outbox_pending": pending, "outbox_paused": paused})
 	ctx, cancel := context.WithTimeout(runtime.ctx, 5*time.Second)
 	defer cancel()
 	if _, err := runtime.manager.Publish(ctx, &paho.Publish{Topic: runtime.topic("heartbeat"), QoS: 0, Payload: payload}); err != nil {
@@ -661,8 +685,9 @@ func (runtime *Runtime) emitAlarm(code, message string, details any) {
 
 func (runtime *Runtime) Status(ctx context.Context) Status {
 	pending, _ := runtime.store.CountPendingNodeMQTTOutbox(ctx, runtime.settings.Node)
+	paused, _ := runtime.store.CountPausedNodeMQTTOutbox(ctx, runtime.settings.Node)
 	last, _ := runtime.lastError.Load().(string)
-	return Status{Enabled: true, Connected: runtime.connected.Load(), Subscribed: runtime.subscribed.Load(), LastError: last, OutboxPending: pending}
+	return Status{Enabled: true, Connected: runtime.connected.Load(), Subscribed: runtime.subscribed.Load(), LastError: last, OutboxPending: pending, OutboxPaused: paused}
 }
 
 func (runtime *Runtime) Close(ctx context.Context) error {

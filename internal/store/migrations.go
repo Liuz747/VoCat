@@ -576,6 +576,12 @@ func migrationStatements(version int) []string {
 				updated_at INTEGER NOT NULL
 			)`,
 		}
+	case 29:
+		return []string{
+			`ALTER TABLE node_mqtt_outbox ADD COLUMN replay_requested INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE node_mqtt_outbox ADD COLUMN paused_at INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE node_mqtt_outbox ADD COLUMN pause_reason TEXT NOT NULL DEFAULT ''`,
+		}
 	default:
 		return nil
 	}

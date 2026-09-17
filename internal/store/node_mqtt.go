@@ -28,15 +28,16 @@ type NodeMQTTTask struct {
 }
 
 type NodeMQTTOutboxItem struct {
-	Kind          string
-	BusinessID    string
-	Seq           int
-	Node          string
-	Payload       json.RawMessage
-	Attempts      int
-	NextAttemptAt time.Time
-	CreatedAt     time.Time
-	AckedAt       time.Time
+	Kind             string
+	BusinessID       string
+	Seq              int
+	Node             string
+	Payload          json.RawMessage
+	Attempts         int
+	NextAttemptAt    time.Time
+	CreatedAt        time.Time
+	AckedAt          time.Time
+	ReplayGeneration int
 }
 
 // AcceptNodeMQTTTask atomically records a new command and its first task
@@ -212,8 +213,8 @@ func (s *Store) AdvanceNodeMQTTTask(ctx context.Context, id, state string, resul
 }
 
 func (s *Store) RequeueLatestNodeMQTTTask(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE node_mqtt_outbox SET acked_at=0,next_attempt_at=?,attempts=0
-		WHERE kind='task' AND business_id=? AND seq=(SELECT latest_seq FROM node_mqtt_tasks WHERE id=?)`, time.Now().UTC().Unix(), id, id)
+	_, err := s.db.ExecContext(ctx, `UPDATE node_mqtt_outbox SET replay_requested=replay_requested+1,next_attempt_at=?,attempts=0
+		WHERE paused_at=0 AND kind='task' AND business_id=? AND seq=(SELECT latest_seq FROM node_mqtt_tasks WHERE id=?)`, time.Now().UTC().Unix(), id, id)
 	return err
 }
 
@@ -226,8 +227,8 @@ func (s *Store) PendingNodeMQTTOutbox(ctx context.Context, node string, now time
 	if limit <= 0 || limit > 100 {
 		limit = 100
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT kind,business_id,seq,node,payload_json,attempts,next_attempt_at,created_at,acked_at
-		FROM node_mqtt_outbox WHERE node=? AND acked_at=0 AND next_attempt_at<=? ORDER BY created_at,kind,business_id,seq LIMIT ?`, strings.TrimSpace(node), now.Unix(), limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT kind,business_id,seq,node,payload_json,attempts,next_attempt_at,created_at,acked_at,replay_requested
+		FROM node_mqtt_outbox WHERE node=? AND paused_at=0 AND (acked_at=0 OR replay_requested>0) AND next_attempt_at<=? ORDER BY created_at,kind,business_id,seq LIMIT ?`, strings.TrimSpace(node), now.Unix(), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -244,7 +245,7 @@ func (s *Store) PendingNodeMQTTOutbox(ctx context.Context, node string, now time
 }
 
 func (s *Store) MarkNodeMQTTOutboxAttempt(ctx context.Context, kind, id string, seq int, next time.Time) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE node_mqtt_outbox SET attempts=attempts+1,next_attempt_at=? WHERE kind=? AND business_id=? AND seq=? AND acked_at=0`, next.Unix(), kind, id, seq)
+	_, err := s.db.ExecContext(ctx, `UPDATE node_mqtt_outbox SET attempts=attempts+1,next_attempt_at=? WHERE kind=? AND business_id=? AND seq=? AND paused_at=0 AND (acked_at=0 OR replay_requested>0)`, next.Unix(), kind, id, seq)
 	return err
 }
 
@@ -252,7 +253,7 @@ func (s *Store) MarkNodeMQTTOutboxAttempt(ctx context.Context, kind, id string, 
 // after a broker reconnect. Business ACKs, rather than MQTT PUBACKs, remain
 // the authority for removing an item from the retry set.
 func (s *Store) WakeNodeMQTTOutbox(ctx context.Context, node string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE node_mqtt_outbox SET next_attempt_at=? WHERE node=? AND acked_at=0`, time.Now().UTC().Unix(), strings.TrimSpace(node))
+	_, err := s.db.ExecContext(ctx, `UPDATE node_mqtt_outbox SET next_attempt_at=? WHERE node=? AND paused_at=0 AND (acked_at=0 OR replay_requested>0)`, time.Now().UTC().Unix(), strings.TrimSpace(node))
 	return err
 }
 
@@ -267,7 +268,28 @@ func (s *Store) AckNodeMQTTOutbox(ctx context.Context, node, kind, id string, se
 
 func (s *Store) CountPendingNodeMQTTOutbox(ctx context.Context, node string) (int, error) {
 	var count int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM node_mqtt_outbox WHERE node=? AND acked_at=0`, strings.TrimSpace(node)).Scan(&count)
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM node_mqtt_outbox WHERE node=? AND acked_at=0 AND paused_at=0`, strings.TrimSpace(node)).Scan(&count)
+	return count, err
+}
+
+// A previously confirmed result may be replayed, but that does not undo the
+// receiver's earlier durable ACK. PUBACK completes only this replay request.
+func (s *Store) CompleteNodeMQTTReplay(ctx context.Context, node, kind, id string, seq, generation int) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE node_mqtt_outbox SET replay_requested=0 WHERE node=? AND kind=? AND business_id=? AND seq=? AND replay_requested=?`, node, kind, id, seq, generation)
+	return err
+}
+
+// Recheck immediately before each publish: an earlier batch read must not
+// override a later administrative pause or an ACK received while publishing.
+func (s *Store) NodeMQTTOutboxDeliverable(ctx context.Context, node, kind, id string, seq int) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM node_mqtt_outbox WHERE node=? AND kind=? AND business_id=? AND seq=? AND paused_at=0 AND (acked_at=0 OR replay_requested>0)`, node, kind, id, seq).Scan(&count)
+	return count == 1, err
+}
+
+func (s *Store) CountPausedNodeMQTTOutbox(ctx context.Context, node string) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM node_mqtt_outbox WHERE node=? AND acked_at=0 AND paused_at>0`, node).Scan(&count)
 	return count, err
 }
 
@@ -355,7 +377,7 @@ func scanNodeMQTTOutbox(row rowScanner) (NodeMQTTOutboxItem, error) {
 	var value NodeMQTTOutboxItem
 	var payload string
 	var next, created, acked int64
-	if err := row.Scan(&value.Kind, &value.BusinessID, &value.Seq, &value.Node, &payload, &value.Attempts, &next, &created, &acked); err != nil {
+	if err := row.Scan(&value.Kind, &value.BusinessID, &value.Seq, &value.Node, &payload, &value.Attempts, &next, &created, &acked, &value.ReplayGeneration); err != nil {
 		return value, err
 	}
 	value.Payload = json.RawMessage(payload)
