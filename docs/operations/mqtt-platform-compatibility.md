@@ -9,11 +9,14 @@ business receiver. Its source at `79024d0` was inspected, not modified.
 blank modules. `target.slot` in phone records is that same module IMEI. Twenty-one
 profiles in one module are twenty-one phone records sharing one slot.
 
-The default `phones.list` now returns only actual profiles with nonempty ICCIDs.
-Blank-card placeholder rows fail PingCode's required-ICCID validation and must
-not be sent in its default phone query. For diagnostic callers needing the old
-blank-card rows, set `params.include_empty_slots=true` on every page. Pagination
-uses one frozen snapshot and rejects changes to this option or `page_size`.
+As explicitly requested by the operator on 2026-09-17, `phones.list` includes
+blank-card rows by default, exposing their real module IMEI in `target.slot`.
+Set `params.include_empty_slots=false` on every page to return only actual
+profiles with nonempty ICCIDs. Pagination uses one frozen snapshot and rejects
+changes to this option or `page_size`; omitting the option means true on every page.
+Blank-card rows still fail the inspected PingCode backend's required-ICCID
+validation. This default change does not fix that backend validation or create
+platform slot records; the operator requested deployment with that limitation known.
 
 Count physical slots with `inventory.get`, or deduplicate slot identities across
 the entire relevant snapshot. Adding per-page distinct counts can count a module

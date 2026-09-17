@@ -66,6 +66,12 @@ budget; continuation pages reuse the same collected snapshot and do not reread
 cards. Reusing a task ID replays the old task; use a new ID, current timestamps,
 and no cursor for a new hardware observation.
 
+Blank-card rows are included by default (operator instruction, 2026-09-17).
+To exclude them, explicitly set `params.include_empty_slots=false` on every
+page. Omitting the option on initial and continuation requests includes them.
+The inspected PingCode backend still rejects empty ICCIDs; this default does
+not establish platform ingestion compatibility.
+
 This change is scoped to `phones.list`; `phones.check` and internal target
 lookup still have their existing saved-configuration/cache behavior. A blank-card row
 never supplies a usable phone target. `inventory.get` remains the dedicated

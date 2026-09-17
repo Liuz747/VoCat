@@ -257,6 +257,7 @@ func (service *nodeActionService) listPhones(ctx context.Context, command nodemq
 		Cursor            string `json:"cursor"`
 		IncludeEmptySlots bool   `json:"include_empty_slots"`
 	}
+	params.IncludeEmptySlots = true
 	if err := decodeNodeParams(command.Params, &params); err != nil {
 		return nil, reject("INVALID_ARGUMENT", err.Error())
 	}
@@ -277,8 +278,8 @@ func (service *nodeActionService) listPhones(ctx context.Context, command nodemq
 		if failure != nil {
 			return nil, failure
 		}
-		// PhoneRecord consumers require a real ICCID. Blank modules belong to
-		// inventory.get; preserve the operator's diagnostic view as an opt-in.
+		// Include blank modules by default so their IMEIs remain visible.
+		// Consumers requiring real ICCIDs can explicitly opt out.
 		if !params.IncludeEmptySlots {
 			profiles := make([]nodePhoneRecord, 0, len(collection.items))
 			for _, item := range collection.items {
