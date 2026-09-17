@@ -892,15 +892,36 @@ func (service *nodeActionService) ensureTunnel(ctx context.Context, command node
 	if _, available, _, _ := service.tunnelStatus(config.ID, iccid); available {
 		return service.tunnelResult(config.ID, iccid, "registered", false), nil
 	}
-	if service.multisim == nil || !service.multisim.Owns(config.ID) {
-		return nil, reject("UNSUPPORTED_ACTION", "该设备没有运行中的多隧道组")
+	if service.multisim == nil {
+		return nil, reject("UNSUPPORTED_ACTION", "多隧道运行时不可用")
+	}
+	// Converting a single-line device must keep its already usable profile.
+	// Confirm that profile is still on this card before carrying it into the
+	// new group. A historical stopped group is not an inventory to re-enable.
+	var keep []device.EsimProfile
+	if !service.multisim.Owns(config.ID) && service.vowifi != nil {
+		if single, err := service.vowifi.State(config.ID); err == nil && single.IMSReady && single.SMSReady && normalizeICCID(single.ICCID) != iccid {
+			records, failure := service.livePhoneRecords(ctx, config, record.Target.Slot)
+			if failure != nil {
+				return nil, failure
+			}
+			for _, current := range records {
+				if current.Target.ICCID == normalizeICCID(single.ICCID) {
+					keep = append(keep, device.EsimProfile{ICCID: current.Target.ICCID, AID: current.AID})
+					break
+				}
+			}
+			if len(keep) == 0 {
+				return nil, reject("IDENTITY_PENDING", "原在线号码已不在当前卡上，请重新核对卡片")
+			}
+		}
 	}
 	release, lockErr := service.lockResource(ctx, "device:"+config.ID)
 	if lockErr != nil {
 		return nil, reject("SLOT_BUSY", "目标卡槽正在执行其他操作")
 	}
 	group := service.multisim.State(config.ID)
-	if group.Phase != "running" || group.Busy {
+	if service.multisim.Owns(config.ID) && (group.Phase != "running" || group.Busy) {
 		release()
 		return nil, reject("SLOT_BUSY", "多隧道组尚未就绪")
 	}
@@ -915,7 +936,7 @@ func (service *nodeActionService) ensureTunnel(ctx context.Context, command node
 	if exists {
 		startErr = service.multisim.Reconnect(config.ID, iccid)
 	} else {
-		startErr = service.ensureProfileConfigured(ctx, config.ID, device.EsimProfile{ICCID: iccid, AID: record.AID})
+		startErr = service.ensureProfileConfigured(ctx, config.ID, device.EsimProfile{ICCID: iccid, AID: record.AID}, keep...)
 	}
 	release()
 	service.clearPhoneCache()
@@ -1272,7 +1293,7 @@ func (service *nodeActionService) profileRuntimeActive(deviceID, iccid string) b
 
 // ensureProfileConfigured persists automatic startup before applying it. A first
 // download creates a group; downloads into a running group add only their line.
-func (service *nodeActionService) ensureProfileConfigured(ctx context.Context, deviceID string, profile device.EsimProfile) error {
+func (service *nodeActionService) ensureProfileConfigured(ctx context.Context, deviceID string, profile device.EsimProfile, keep ...device.EsimProfile) error {
 	if service.multisim == nil {
 		return errors.New("multi-SIM runtime is unavailable")
 	}
@@ -1283,28 +1304,36 @@ func (service *nodeActionService) ensureProfileConfigured(ctx context.Context, d
 	}
 	previous := cfg
 	previous.Profiles = append([]store.MultiSIMProfile(nil), cfg.Profiles...)
-	if missing || !cfg.Enabled {
-		// Writing a new profile does not re-enable previously stopped lines.
+	changed := missing || !cfg.Enabled
+	if changed {
+		// Only explicitly requested profiles and currently usable single lines
+		// are enabled; old stopped group membership is never resurrected.
 		cfg = store.MultiSIMConfig{DeviceID: deviceID, Enabled: true}
 	}
-	found := false
-	for _, existing := range cfg.Profiles {
-		if normalizeICCID(existing.ICCID) == profile.ICCID {
-			found = true
-			break
+	for _, requested := range append(keep, profile) {
+		found := false
+		for _, existing := range cfg.Profiles {
+			if normalizeICCID(existing.ICCID) == normalizeICCID(requested.ICCID) {
+				found = true
+				break
+			}
 		}
+		if found {
+			continue
+		}
+		if strings.TrimSpace(requested.AID) == "" {
+			return errors.New("profile ISD-R AID is unavailable")
+		}
+		cfg.Profiles = append(cfg.Profiles, store.MultiSIMProfile{ICCID: normalizeICCID(requested.ICCID), AID: requested.AID, Name: firstNonEmpty(requested.Name, requested.ServiceProvider)})
+		changed = true
 	}
-	if !found {
-		if strings.TrimSpace(profile.AID) == "" {
-			return errors.New("downloaded profile ISD-R AID is unavailable")
-		}
-		cfg.Profiles = append(cfg.Profiles, store.MultiSIMProfile{ICCID: profile.ICCID, AID: profile.AID, Name: firstNonEmpty(profile.Name, profile.ServiceProvider)})
+	if changed {
 		if _, err := service.database.SaveMultiSIMConfig(ctx, cfg); err != nil {
 			return err
 		}
 	}
 	if err := service.multisim.Apply(ctx, runtimeMultiSIMConfigForNode(cfg)); err != nil {
-		if !found {
+		if changed {
 			rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancel()
 			var rollbackErr error
