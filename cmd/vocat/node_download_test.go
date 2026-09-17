@@ -119,26 +119,15 @@ func TestNodeDownloadRequiresReadbackBeforeAddingLine(t *testing.T) {
 
 func TestNodeExplicitTargetFindsWrittenProfileOutsideGroup(t *testing.T) {
 	ctx := context.Background()
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	if err = db.UpsertDevice(ctx, store.Device{ID: "record", Name: "test", ModemIMEI: "123456789012345"}); err != nil {
-		t.Fatal(err)
-	}
-	locked := false
-	f := &nodeDownloadController{t: t, locked: &locked, info: device.EsimInfo{AID: "A000", Profiles: []device.EsimProfile{{ICCID: testDownloadICCID, AID: "A001"}}}}
-	service := &nodeActionService{database: db, esim: f, phoneCache: phoneCollection{generatedAt: time.Now()}, readCard: func(ctx context.Context, _ string, op func(context.Context, string) error) error {
-		locked = true
-		defer func() { locked = false }()
-		return op(ctx, "physical")
-	}}
-	record, _, failure := service.resolveCommandTarget(ctx, nodemqtt.Target{Device: "record", Slot: "123456789012345", ICCID: testDownloadICCID, BindingVersion: 1})
+	service, devices, reader := phoneHardwareFixture(t, 1)
+	physical := devices.entries[0].ID
+	imei := devices.entries[0].Snapshot.IMEI
+	reader.cards[physical] = device.EsimInfo{AID: "A000", Profiles: []device.EsimProfile{{ICCID: testDownloadICCID, AID: "A001"}}}
+	record, _, failure := service.resolveCommandTarget(ctx, nodemqtt.Target{Device: imei, Slot: imei, ICCID: testDownloadICCID, BindingVersion: 1})
 	if failure != nil || record.Target.ICCID != testDownloadICCID || record.AID != "A000" {
 		t.Fatalf("record=%+v error=%+v", record, failure)
 	}
-	if _, err = db.MultiSIMConfig(ctx, "record"); !errors.Is(err, store.ErrNotFound) {
+	if _, err := service.database.MultiSIMConfig(ctx, imei); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("target lookup modified config: %v", err)
 	}
 }

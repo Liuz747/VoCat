@@ -352,11 +352,7 @@ func (service *nodeActionService) checkPhone(ctx context.Context, command nodemq
 	if err := requireEmptyParams(command.Params); err != nil {
 		return nil, reject("INVALID_ARGUMENT", err.Error())
 	}
-	collection, err := service.currentPhones(ctx)
-	if err != nil {
-		return nil, actionFailure(err, "POOL_OFFLINE")
-	}
-	record, lookupErr := service.resolveRecord(ctx, *command.Target, collection.items)
+	record, _, lookupErr := service.resolveCommandTarget(ctx, *command.Target)
 	if lookupErr != nil {
 		return nil, lookupErr
 	}
@@ -1189,34 +1185,11 @@ func (service *nodeActionService) resolveCommandTarget(ctx context.Context, targ
 	if targetErr != nil {
 		return nodePhoneRecord{}, store.Device{}, targetErr
 	}
-	collection, err := service.currentPhones(ctx)
-	if err != nil {
-		return nodePhoneRecord{}, store.Device{}, actionFailure(err, "POOL_OFFLINE")
+	records, failure := service.livePhoneRecords(ctx, config, target.Slot)
+	if failure != nil {
+		return nodePhoneRecord{}, config, failure
 	}
-	record, resolveErr := service.resolveRecord(ctx, target, collection.items)
-	if resolveErr == nil || target.ICCID == "" || (resolveErr.Code != "PROFILE_NOT_FOUND" && resolveErr.Code != "PHONE_NOT_FOUND") {
-		return record, config, resolveErr
-	}
-	// A downloaded profile need not be part of the desired running group.
-	// Explicit ICCID operations read the card before declaring it missing.
-	profiles, readErr := service.deviceProfiles(ctx, config, true)
-	if readErr != nil {
-		return nodePhoneRecord{}, config, actionFailure(readErr, "POOL_OFFLINE")
-	}
-	var records []nodePhoneRecord
-	for _, profile := range profiles {
-		iccid := normalizeICCID(profile.ICCID)
-		if iccid != normalizeICCID(target.ICCID) {
-			continue
-		}
-		phone, _ := service.database.PhoneNumberForICCID(ctx, iccid)
-		var phonePointer *string
-		if nodemqtt.ValidE164(phone) {
-			phonePointer = &phone
-		}
-		records = append(records, nodePhoneRecord{Target: nodeActionTarget{Device: config.ID, Slot: target.Slot, ICCID: iccid, Phone: phonePointer, BindingVersion: 1}, AID: profile.AID, ProfileState: nodeProfileState(profile)})
-	}
-	record, resolveErr = service.resolveRecord(ctx, target, records)
+	record, resolveErr := service.resolveRecord(ctx, target, records)
 	return record, config, resolveErr
 }
 

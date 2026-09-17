@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"vocat/internal/device"
+	"vocat/internal/modem"
 	"vocat/internal/nodemqtt"
 	"vocat/internal/store"
 )
@@ -239,5 +240,77 @@ func TestPhonesListBlankOnlyAndCursorModeIsolation(t *testing.T) {
 	params, _ := json.Marshal(map[string]any{"page_size": 1, "cursor": first["cursor"], "include_empty_slots": false})
 	if _, err := s.listPhones(context.Background(), nodemqtt.Command{Params: params}); err == nil || err.Code != "CURSOR_EXPIRED" {
 		t.Fatalf("cursor crossed listing modes: %v", err)
+	}
+}
+
+func TestPhonesCheckFollowsSwappedCardWithoutSavedGroup(t *testing.T) {
+	s, d, f := phoneHardwareFixture(t, 2)
+	ctx := context.Background()
+	iccid := f.cards[d.entries[0].ID].Profiles[0].ICCID
+	oldTarget := nodemqtt.Target{Device: d.entries[0].Snapshot.IMEI, Slot: d.entries[0].Snapshot.IMEI, ICCID: iccid, BindingVersion: 1}
+	newTarget := nodemqtt.Target{Device: d.entries[1].Snapshot.IMEI, Slot: d.entries[1].Snapshot.IMEI, ICCID: iccid, BindingVersion: 1}
+	// Both the desired group and the short-lived cache still name the old slot.
+	_, err := s.database.SaveMultiSIMConfig(ctx, store.MultiSIMConfig{DeviceID: oldTarget.Device, Profiles: []store.MultiSIMProfile{{ICCID: iccid}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.phoneCache = phoneCollection{generatedAt: time.Now(), items: []nodePhoneRecord{{Target: nodeActionTarget{Device: oldTarget.Device, Slot: oldTarget.Slot, ICCID: iccid, BindingVersion: 1}, Available: true, TunnelState: "registered"}}}
+	f.cards[d.entries[1].ID] = f.cards[d.entries[0].ID]
+	f.cards[d.entries[0].ID] = device.EsimInfo{AID: "A0000005591010"}
+	r, failure := s.checkPhone(ctx, nodemqtt.Command{Target: &newTarget, Params: json.RawMessage(`{}`)})
+	if failure != nil {
+		t.Fatalf("new slot rejected: %+v", failure)
+	}
+	if r.(map[string]any)["available"] != false || r.(map[string]any)["tunnel_state"] != "stopped" {
+		t.Fatalf("invented tunnel readiness: %v", r)
+	}
+	if f.reads != 1 {
+		t.Fatalf("targeted check read %d cards", f.reads)
+	}
+	if _, failure = s.checkPhone(ctx, nodemqtt.Command{Target: &oldTarget, Params: json.RawMessage(`{}`)}); failure == nil || failure.Code != "PROFILE_NOT_FOUND" {
+		t.Fatalf("stale old binding accepted: %+v", failure)
+	}
+}
+
+type absentPhoneReader struct {
+	*phoneCardReaderFake
+	absentID   string
+	afterProbe func()
+}
+
+func (f *absentPhoneReader) ExecuteAT(_ context.Context, id, command string) (modem.Response, error) {
+	if command != "AT+CPIN?" {
+		f.t.Fatalf("unexpected presence command %q", command)
+	}
+	if f.afterProbe != nil {
+		f.afterProbe()
+	}
+	if id == f.absentID {
+		return modem.Response{}, &modem.CommandError{Final: "+CME ERROR: 10"}
+	}
+	return modem.Response{Lines: []string{"+CPIN: READY"}, Final: "OK"}, nil
+}
+
+func TestPhonesListReportsConfirmedAbsentSIMWithoutReadingAPDU(t *testing.T) {
+	s, d, f := phoneHardwareFixture(t, 2)
+	f.errAt = d.entries[0].ID
+	f.err = errors.New("no card APDU must not be attempted")
+	s.esim = &absentPhoneReader{phoneCardReaderFake: f, absentID: d.entries[0].ID}
+	r := callPhones(t, s, 50, "")
+	items := r["items"].([]any)
+	if len(items) != 2 || f.reads != 1 {
+		t.Fatalf("items=%v reads=%d", items, f.reads)
+	}
+	row := items[0].(map[string]any)
+	if row["reason"] != "未检测到 SIM 卡" || row["available"] != false || row["target"].(map[string]any)["iccid"] != "" {
+		t.Fatalf("absence misreported as blank card: %v", row)
+	}
+}
+
+func TestPhonesListRejectsReenumerationDuringAbsenceProbe(t *testing.T) {
+	s, d, f := phoneHardwareFixture(t, 1)
+	s.esim = &absentPhoneReader{phoneCardReaderFake: f, absentID: d.entries[0].ID, afterProbe: func() { d.entries[0].Candidate.USBGeneration = "changed" }}
+	if _, failure := s.listPhones(context.Background(), nodemqtt.Command{Params: json.RawMessage(`{}`)}); failure == nil || failure.Code != "IDENTITY_PENDING" {
+		t.Fatalf("identity change accepted: %+v", failure)
 	}
 }
